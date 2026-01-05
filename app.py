@@ -62,4 +62,3 @@ if ticker:
     else:
         st.error("Ticker not found. Try something like AAPL, BTC-USD, or TSLA.")
 
-st.caption("Note: Daily signals can change quickly. Check this app after the market closes.")
