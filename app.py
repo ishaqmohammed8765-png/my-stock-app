@@ -47,6 +47,25 @@ def calculate_rsi(data, period=14):
     rsi = 100 - (100 / (1 + rs))
     return rsi
 
+def calculate_vwap(data):
+    """Calculate Volume Weighted Average Price"""
+    typical_price = (data['High'] + data['Low'] + data['Close']) / 3
+    vwap = (typical_price * data['Volume']).cumsum() / data['Volume'].cumsum()
+    return vwap
+
+def calculate_rvol(current_volume, historical_data):
+    """Calculate Relative Volume (RVOL)"""
+    if historical_data is None or historical_data.empty:
+        return None
+    
+    # Calculate average volume
+    avg_volume = historical_data['Volume'].mean()
+    
+    if avg_volume > 0 and current_volume:
+        rvol = current_volume / avg_volume
+        return rvol
+    return None
+
 def calculate_sma(data, period):
     """Calculate Simple Moving Average"""
     return data['Close'].rolling(window=period).mean()
@@ -152,7 +171,7 @@ def get_verdict(ema_8, ema_20, rsi):
 # ============ DATA FETCHING ============
 @st.cache_data(ttl=5, show_spinner=False)
 def fetch_finnhub_price(ticker):
-    """Fetch real-time price from Finnhub"""
+    """Fetch real-time price and volume from Finnhub"""
     try:
         url = f"https://finnhub.io/api/v1/quote?symbol={ticker}&token={FINNHUB_API_KEY}"
         response = requests.get(url, timeout=5)
@@ -161,19 +180,20 @@ def fetch_finnhub_price(ticker):
             data = response.json()
             
             if data.get('c', 0) == 0 and data.get('pc', 0) == 0:
-                return None, None, None, f"Ticker '{ticker}' not found"
+                return None, None, None, None, f"Ticker '{ticker}' not found"
             
-            current_price = data.get('c')
-            change = data.get('d')
-            percent_change = data.get('dp')
+            current_price = data.get('c')  # Current price
+            change = data.get('d')  # Change
+            percent_change = data.get('dp')  # Percent change
+            volume = data.get('v')  # Volume
             
-            return current_price, change, percent_change, None
+            return current_price, change, percent_change, volume, None
         elif response.status_code == 429:
-            return None, None, None, "Rate limit reached. Please wait."
+            return None, None, None, None, "Rate limit reached. Please wait."
         else:
-            return None, None, None, f"API error: {response.status_code}"
+            return None, None, None, None, f"API error: {response.status_code}"
     except Exception as e:
-        return None, None, None, f"Error: {str(e)}"
+        return None, None, None, None, f"Error: {str(e)}"
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_yfinance_historical(ticker):
@@ -195,6 +215,7 @@ def fetch_yfinance_historical(ticker):
         data_5d['EMA_20'] = data_5d['Close'].ewm(span=20, adjust=False).mean()
         data_5d['RSI'] = calculate_rsi(data_5d, period=14)
         data_5d['OBV'] = calculate_obv(data_5d)
+        data_5d['VWAP'] = calculate_vwap(data_5d)
         
         # Calculate SMAs on daily data
         if not data_1y.empty:
@@ -260,6 +281,14 @@ def create_price_chart_with_sma(data_5d, data_1y, ticker):
         line=dict(color='#1E90FF', width=2)
     ))
     
+    # Add VWAP for day trading
+    fig.add_trace(go.Scatter(
+        x=data_5d.index,
+        y=data_5d['VWAP'],
+        name='VWAP',
+        line=dict(color='#00FF00', width=2.5, dash='dot')
+    ))
+    
     # Add SMAs if daily data available
     if data_1y is not None and not data_1y.empty:
         # Only show last 5 days of SMA data to match the chart timeframe
@@ -280,7 +309,7 @@ def create_price_chart_with_sma(data_5d, data_1y, ticker):
         ))
     
     fig.update_layout(
-        title=f'{ticker.upper()} - Price with Technical Indicators',
+        title=f'{ticker.upper()} - Price with EMAs, VWAP & SMAs',
         yaxis_title='Price ($)',
         xaxis_title='Time',
         template='plotly_dark',
@@ -367,12 +396,21 @@ with st.sidebar.form("trading_form", clear_on_submit=False):
 
 st.sidebar.markdown("---")
 st.sidebar.success("🔐 Secure API Connection")
+st.sidebar.info(
+    "**Day Trading Features:**\n"
+    "✅ VWAP (Volume Weighted Avg)\n"
+    "✅ RVOL (Relative Volume)\n"
+    "✅ Real-time volume data\n"
+    "✅ Persistent calculations\n\n"
+    "Results stay visible when\n"
+    "switching between tabs!"
+)
 
 # ============ MAIN CONTENT ============
 if calculate_button and ticker:
     with st.spinner(f"⚡ Fetching data for {ticker.upper()}..."):
-        # Fetch real-time price
-        current_price, change, percent_change, price_error = fetch_finnhub_price(ticker.upper())
+        # Fetch real-time price with volume
+        current_price, change, percent_change, current_volume, price_error = fetch_finnhub_price(ticker.upper())
         
         # Fetch historical data
         data_5d, data_1y, hist_error = fetch_yfinance_historical(ticker.upper())
@@ -383,223 +421,312 @@ if calculate_button and ticker:
     if price_error:
         st.warning(f"⚠️ {price_error}")
     elif current_price:
-        # Display current price at top
-        st.markdown("### 💰 Real-Time Price")
-        col_price1, col_price2, col_price3, col_price4 = st.columns(4)
+        # Calculate RVOL if we have volume data
+        rvol = calculate_rvol(current_volume, data_5d) if current_volume and data_5d is not None else None
         
-        with col_price1:
-            st.metric(
-                f"{ticker.upper()} Price",
-                f"${current_price:.4f}"
-            )
-        
-        with col_price2:
-            st.metric(
-                "Change",
-                f"${change:.4f}" if change else "N/A",
-                delta=f"{percent_change:.2f}%" if percent_change else None
-            )
-        
-        with col_price3:
-            suggested_stop = current_price * (1 - stop_loss_pct / 100)
-            st.metric(
-                "Suggested Stop Loss",
-                f"${suggested_stop:.4f}",
-                delta=f"-{stop_loss_pct}%"
-            )
-        
-        with col_price4:
-            # Calculate 10-day average volume from historical data
-            if data_5d is not None:
-                avg_volume = data_5d['Volume'].tail(10).mean()
+        # Calculate all metrics and store in session_state
+        if data_5d is not None:
+            ema_8 = float(data_5d['EMA_8'].iloc[-1])
+            ema_20 = float(data_5d['EMA_20'].iloc[-1])
+            rsi = float(data_5d['RSI'].iloc[-1])
+            
+            pivot, support, resistance = calculate_pivot_points(data_5d, current_price)
+            probability, z_score, volatility = calculate_probability(data_5d, current_price, resistance)
+            calc = calculate_investment_risk(current_price, resistance, investment_amount, stop_loss_pct, slippage_pct)
+            verdict, verdict_type = get_verdict(ema_8, ema_20, rsi)
+            
+            # Store in session_state for persistence across tabs
+            st.session_state['ticker'] = ticker.upper()
+            st.session_state['current_price'] = current_price
+            st.session_state['change'] = change
+            st.session_state['percent_change'] = percent_change
+            st.session_state['current_volume'] = current_volume
+            st.session_state['rvol'] = rvol
+            st.session_state['ema_8'] = ema_8
+            st.session_state['ema_20'] = ema_20
+            st.session_state['rsi'] = rsi
+            st.session_state['support'] = support
+            st.session_state['resistance'] = resistance
+            st.session_state['pivot'] = pivot
+            st.session_state['probability'] = probability
+            st.session_state['z_score'] = z_score
+            st.session_state['volatility'] = volatility
+            st.session_state['calc'] = calc
+            st.session_state['verdict'] = verdict
+            st.session_state['verdict_type'] = verdict_type
+            st.session_state['data_5d'] = data_5d
+            st.session_state['data_1y'] = data_1y
+            st.session_state['news_items'] = news_items
+            st.session_state['news_error'] = news_error
+            st.session_state['stop_loss_pct'] = stop_loss_pct
+            st.session_state['slippage_pct'] = slippage_pct
+            st.session_state['investment_amount'] = investment_amount
+
+# Display results from session_state
+if 'ticker' in st.session_state:
+    # Retrieve from session_state
+    ticker = st.session_state['ticker']
+    current_price = st.session_state['current_price']
+    change = st.session_state.get('change')
+    percent_change = st.session_state.get('percent_change')
+    current_volume = st.session_state.get('current_volume')
+    rvol = st.session_state.get('rvol')
+    stop_loss_pct = st.session_state.get('stop_loss_pct', 5.0)
+    
+    # Display current price at top
+    st.markdown("### 💰 Real-Time Price")
+    col_price1, col_price2, col_price3, col_price4 = st.columns(4)
+    
+    with col_price1:
+        st.metric(
+            f"{ticker} Price",
+            f"${current_price:.4f}"
+        )
+    
+    with col_price2:
+        st.metric(
+            "Change",
+            f"${change:.4f}" if change else "N/A",
+            delta=f"{percent_change:.2f}%" if percent_change else None
+        )
+    
+    with col_price3:
+        suggested_stop = current_price * (1 - stop_loss_pct / 100)
+        st.metric(
+            "Suggested Stop Loss",
+            f"${suggested_stop:.4f}",
+            delta=f"-{stop_loss_pct}%"
+        )
+    
+    with col_price4:
+        # Display volume with RVOL
+        if current_volume:
+            vol_display = f"{current_volume:,.0f}"
+            if rvol:
                 st.metric(
-                    "Avg Volume (10d)",
-                    f"{avg_volume:,.0f}"
+                    "Volume (RVOL)",
+                    vol_display,
+                    delta=f"{rvol:.2f}x"
                 )
             else:
-                st.metric("Avg Volume", "N/A")
-        
-        st.markdown("---")
-        
-        # ============ TABS FOR ORGANIZATION ============
-        tab1, tab2, tab3 = st.tabs(["📊 Calculator", "📈 Analysis", "📰 News"])
-        
-        # TAB 1: CALCULATOR
-        with tab1:
+                st.metric("Volume", vol_display)
+        else:
+            # Fallback to historical average
+            data_5d = st.session_state.get('data_5d')
             if data_5d is not None:
-                ema_8 = float(data_5d['EMA_8'].iloc[-1])
-                ema_20 = float(data_5d['EMA_20'].iloc[-1])
-                rsi = float(data_5d['RSI'].iloc[-1])
-                
-                pivot, support, resistance = calculate_pivot_points(data_5d, current_price)
-                probability, z_score, volatility = calculate_probability(data_5d, current_price, resistance)
-                calc = calculate_investment_risk(current_price, resistance, investment_amount, stop_loss_pct, slippage_pct)
-                verdict, verdict_type = get_verdict(ema_8, ema_20, rsi)
-                
-                # VERDICT
-                st.markdown("## 🎯 Trading Signal")
-                if verdict_type == "success":
-                    st.success(f"# {verdict}")
-                elif verdict_type == "error":
-                    st.error(f"# {verdict}")
+                avg_volume = data_5d['Volume'].tail(10).mean()
+                st.metric("Avg Volume (10d)", f"{avg_volume:,.0f}")
+            else:
+                st.metric("Volume", "N/A")
+    
+    st.markdown("---")
+    
+    # ============ TABS FOR ORGANIZATION ============
+    tab1, tab2, tab3 = st.tabs(["📊 Calculator", "📈 Analysis", "📰 News"])
+    
+    # TAB 1: CALCULATOR (Always visible with session_state)
+    with tab1:
+        verdict = st.session_state.get('verdict')
+        verdict_type = st.session_state.get('verdict_type')
+        support = st.session_state.get('support')
+        resistance = st.session_state.get('resistance')
+        calc = st.session_state.get('calc')
+        probability = st.session_state.get('probability')
+        z_score = st.session_state.get('z_score')
+        volatility = st.session_state.get('volatility')
+        slippage_pct = st.session_state.get('slippage_pct', 2.0)
+        
+        if verdict and calc:
+            # VERDICT
+            st.markdown("## 🎯 Trading Signal")
+            if verdict_type == "success":
+                st.success(f"# {verdict}")
+            elif verdict_type == "error":
+                st.error(f"# {verdict}")
+            else:
+                st.info(f"# {verdict}")
+            
+            st.markdown("---")
+            
+            # PRICE TARGETS
+            st.markdown("### 🎯 Price Targets")
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                st.metric("Buy Target (S1)", f"${support:.4f}",
+                         delta=f"{((support - current_price) / current_price * 100):.2f}%")
+            with col2:
+                st.metric("Current", f"${current_price:.4f}")
+            with col3:
+                st.metric("Sell Target (R1)", f"${resistance:.4f}",
+                         delta=f"{((resistance - current_price) / current_price * 100):.2f}%")
+            
+            st.markdown("---")
+            
+            # INVESTMENT BREAKDOWN
+            st.markdown("### 🧮 Investment Breakdown")
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                st.metric("📦 Shares", f"{calc['shares']:.2f}")
+            
+            with col2:
+                if calc['risk_percentage'] <= 5:
+                    st.success(f"## {calc['risk_percentage']:.1f}%")
+                elif calc['risk_percentage'] <= 10:
+                    st.warning(f"## {calc['risk_percentage']:.1f}%")
                 else:
-                    st.info(f"# {verdict}")
-                
-                st.markdown("---")
-                
-                # PRICE TARGETS
-                st.markdown("### 🎯 Price Targets")
-                col1, col2, col3 = st.columns(3)
-                
-                with col1:
-                    st.metric("Buy Target (S1)", f"${support:.4f}",
-                             delta=f"{((support - current_price) / current_price * 100):.2f}%")
-                with col2:
-                    st.metric("Current", f"${current_price:.4f}")
-                with col3:
-                    st.metric("Sell Target (R1)", f"${resistance:.4f}",
-                             delta=f"{((resistance - current_price) / current_price * 100):.2f}%")
-                
-                st.markdown("---")
-                
-                # INVESTMENT BREAKDOWN
-                st.markdown("### 🧮 Investment Breakdown")
-                col1, col2, col3, col4 = st.columns(4)
-                
-                with col1:
-                    st.metric("📦 Shares", f"{calc['shares']:.2f}")
-                
-                with col2:
-                    if calc['risk_percentage'] <= 5:
-                        st.success(f"## {calc['risk_percentage']:.1f}%")
-                    elif calc['risk_percentage'] <= 10:
-                        st.warning(f"## {calc['risk_percentage']:.1f}%")
-                    else:
-                        st.error(f"## {calc['risk_percentage']:.1f}%")
-                    st.markdown("**Risk %**")
-                    st.caption(f"${calc['total_risk']:.2f} at risk")
-                
-                with col3:
-                    st.metric("💰 Net Profit", f"${calc['net_profit']:.2f}")
-                    st.caption(f"After {slippage_pct}% slippage")
-                
-                with col4:
-                    rr = calc['net_profit'] / calc['total_risk'] if calc['total_risk'] > 0 else 0
-                    if rr >= 2:
-                        st.success(f"**{rr:.2f}:1**")
-                    elif rr >= 1:
-                        st.warning(f"**{rr:.2f}:1**")
-                    else:
-                        st.error(f"**{rr:.2f}:1**")
-                    st.caption("R/R Ratio")
-                
-                st.markdown("---")
-                
-                # CONVICTION SCORE
-                st.markdown("### 🎲 Conviction Score")
-                col1, col2, col3 = st.columns(3)
-                
-                with col1:
-                    if probability >= 70:
-                        st.success(f"# {probability:.1f}%")
-                        st.markdown("### 🟢 High")
-                    elif probability >= 50:
-                        st.warning(f"# {probability:.1f}%")
-                        st.markdown("### 🟡 Medium")
-                    else:
-                        st.error(f"# {probability:.1f}%")
-                        st.markdown("### 🔴 Low")
-                
-                with col2:
-                    st.metric("Z-Score", f"{z_score:.2f}σ")
-                
-                with col3:
-                    st.metric("Volatility", f"{volatility*100:.2f}%")
+                    st.error(f"## {calc['risk_percentage']:.1f}%")
+                st.markdown("**Risk %**")
+                st.caption(f"${calc['total_risk']:.2f} at risk")
+            
+            with col3:
+                st.metric("💰 Net Profit", f"${calc['net_profit']:.2f}")
+                st.caption(f"After {slippage_pct}% slippage")
+            
+            with col4:
+                rr = calc['net_profit'] / calc['total_risk'] if calc['total_risk'] > 0 else 0
+                if rr >= 2:
+                    st.success(f"**{rr:.2f}:1**")
+                elif rr >= 1:
+                    st.warning(f"**{rr:.2f}:1**")
+                else:
+                    st.error(f"**{rr:.2f}:1**")
+                st.caption("R/R Ratio")
+            
+            st.markdown("---")
+            
+            # CONVICTION SCORE
+            st.markdown("### 🎲 Conviction Score")
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                if probability >= 70:
+                    st.success(f"# {probability:.1f}%")
+                    st.markdown("### 🟢 High")
+                elif probability >= 50:
+                    st.warning(f"# {probability:.1f}%")
+                    st.markdown("### 🟡 Medium")
+                else:
+                    st.error(f"# {probability:.1f}%")
+                    st.markdown("### 🔴 Low")
+            
+            with col2:
+                st.metric("Z-Score", f"{z_score:.2f}σ")
+            
+            with col3:
+                st.metric("Volatility", f"{volatility*100:.2f}%")
+        else:
+            st.warning("⚠️ Calculator data unavailable. Historical data may be missing.")
+    
+    # TAB 2: ANALYSIS
+    with tab2:
+        data_5d = st.session_state.get('data_5d')
+        data_1y = st.session_state.get('data_1y')
         
-        # TAB 2: ANALYSIS
-        with tab2:
-            if data_5d is not None:
-                st.markdown("### 📈 Price Chart with Technical Indicators")
-                fig_price = create_price_chart_with_sma(data_5d, data_1y, ticker)
-                st.plotly_chart(fig_price, use_container_width=True)
-                
-                st.markdown("### 📊 RSI Momentum Indicator")
-                fig_rsi = create_rsi_chart(data_5d, ticker)
-                st.plotly_chart(fig_rsi, use_container_width=True)
-                
-                # Technical Summary
-                st.markdown("### 📋 Technical Summary")
-                col1, col2, col3, col4 = st.columns(4)
+        if data_5d is not None:
+            st.markdown("### 📈 Price Chart with VWAP & Technical Indicators")
+            st.caption("Green dotted line = VWAP (Volume Weighted Average Price)")
+            fig_price = create_price_chart_with_sma(data_5d, data_1y, ticker)
+            st.plotly_chart(fig_price, use_container_width=True)
+            
+            st.markdown("### 📊 RSI Momentum Indicator")
+            fig_rsi = create_rsi_chart(data_5d, ticker)
+            st.plotly_chart(fig_rsi, use_container_width=True)
+            
+            # Technical Summary
+            st.markdown("### 📋 Technical Summary")
+            col1, col2, col3, col4 = st.columns(4)
+            
+            ema_8 = st.session_state.get('ema_8')
+            ema_20 = st.session_state.get('ema_20')
+            rsi = st.session_state.get('rsi')
+            
+            with col1:
+                st.metric("EMA 8", f"${ema_8:.4f}")
+            with col2:
+                st.metric("EMA 20", f"${ema_20:.4f}")
+            with col3:
+                st.metric("RSI (14)", f"{rsi:.2f}")
+            with col4:
+                obv = data_5d['OBV'].iloc[-20:]
+                trend = "📈 Bullish" if obv.iloc[-1] > obv.iloc[0] else "📉 Bearish"
+                st.metric("Volume", trend)
+            
+            # VWAP Analysis
+            st.markdown("### 💹 VWAP Analysis (Day Trading)")
+            vwap_latest = data_5d['VWAP'].iloc[-1]
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.metric("VWAP", f"${vwap_latest:.4f}")
+            with col2:
+                if current_price > vwap_latest:
+                    st.success("✅ Price above VWAP (Bullish)")
+                else:
+                    st.error("⚠️ Price below VWAP (Bearish)")
+            
+            # SMA Analysis
+            if data_1y is not None and not data_1y.empty:
+                st.markdown("### 📊 Long-Term Moving Averages")
+                col1, col2 = st.columns(2)
                 
                 with col1:
-                    st.metric("EMA 8", f"${float(data_5d['EMA_8'].iloc[-1]):.4f}")
-                with col2:
-                    st.metric("EMA 20", f"${float(data_5d['EMA_20'].iloc[-1]):.4f}")
-                with col3:
-                    st.metric("RSI (14)", f"{float(data_5d['RSI'].iloc[-1]):.2f}")
-                with col4:
-                    obv = data_5d['OBV'].iloc[-20:]
-                    trend = "📈 Bullish" if obv.iloc[-1] > obv.iloc[0] else "📉 Bearish"
-                    st.metric("Volume", trend)
+                    sma_50 = data_1y['SMA_50'].iloc[-1]
+                    if not pd.isna(sma_50):
+                        st.metric("SMA 50", f"${sma_50:.4f}")
+                        if current_price > sma_50:
+                            st.success("✅ Price above SMA 50 (Bullish)")
+                        else:
+                            st.error("⚠️ Price below SMA 50 (Bearish)")
                 
-                # SMA Analysis
-                if data_1y is not None and not data_1y.empty:
-                    st.markdown("### 📊 Long-Term Moving Averages")
-                    col1, col2 = st.columns(2)
+                with col2:
+                    sma_200 = data_1y['SMA_200'].iloc[-1]
+                    if not pd.isna(sma_200):
+                        st.metric("SMA 200", f"${sma_200:.4f}")
+                        if current_price > sma_200:
+                            st.success("✅ Price above SMA 200 (Bullish)")
+                        else:
+                            st.error("⚠️ Price below SMA 200 (Bearish)")
+        else:
+            st.warning("⚠️ Historical data unavailable for analysis")
+    
+    # TAB 3: NEWS
+    with tab3:
+        st.markdown("### 📰 Latest Market News")
+        
+        news_items = st.session_state.get('news_items', [])
+        news_error = st.session_state.get('news_error')
+        
+        if news_error:
+            st.warning(f"⚠️ {news_error}")
+        elif news_items:
+            for i, news in enumerate(news_items, 1):
+                with st.container():
+                    st.markdown(f"#### {i}. {news.get('headline', 'No headline')}")
+                    
+                    col1, col2 = st.columns([3, 1])
                     
                     with col1:
-                        sma_50 = data_1y['SMA_50'].iloc[-1]
-                        if not pd.isna(sma_50):
-                            st.metric("SMA 50", f"${sma_50:.4f}")
-                            if current_price > sma_50:
-                                st.success("✅ Price above SMA 50 (Bullish)")
-                            else:
-                                st.error("⚠️ Price below SMA 50 (Bearish)")
+                        summary = news.get('summary', 'No summary available')
+                        if len(summary) > 200:
+                            summary = summary[:200] + "..."
+                        st.markdown(summary)
                     
                     with col2:
-                        sma_200 = data_1y['SMA_200'].iloc[-1]
-                        if not pd.isna(sma_200):
-                            st.metric("SMA 200", f"${sma_200:.4f}")
-                            if current_price > sma_200:
-                                st.success("✅ Price above SMA 200 (Bullish)")
-                            else:
-                                st.error("⚠️ Price below SMA 200 (Bearish)")
-            else:
-                st.warning("⚠️ Historical data unavailable for analysis")
-        
-        # TAB 3: NEWS
-        with tab3:
-            st.markdown("### 📰 Latest Market News")
-            
-            if news_error:
-                st.warning(f"⚠️ {news_error}")
-            elif news_items:
-                for i, news in enumerate(news_items, 1):
-                    with st.container():
-                        st.markdown(f"#### {i}. {news.get('headline', 'No headline')}")
-                        
-                        col1, col2 = st.columns([3, 1])
-                        
-                        with col1:
-                            summary = news.get('summary', 'No summary available')
-                            if len(summary) > 200:
-                                summary = summary[:200] + "..."
-                            st.markdown(summary)
-                        
-                        with col2:
-                            news_url = news.get('url', '#')
-                            news_date = datetime.fromtimestamp(news.get('datetime', 0)).strftime('%Y-%m-%d %H:%M')
-                            st.caption(f"📅 {news_date}")
-                            st.link_button("Read More", news_url, use_container_width=True)
-                        
-                        st.markdown("---")
-            else:
-                st.info("📭 No recent news available for this ticker")
+                        news_url = news.get('url', '#')
+                        news_date = datetime.fromtimestamp(news.get('datetime', 0)).strftime('%Y-%m-%d %H:%M')
+                        st.caption(f"📅 {news_date}")
+                        st.link_button("Read More", news_url, use_container_width=True)
+                    
+                    st.markdown("---")
+        else:
+            st.info("📭 No recent news available for this ticker")
 
-else:
+elif 'ticker' not in st.session_state:
     st.info("👈 **Configure your settings and click Analyze**")
     
-    st.markdown("### 🚀 Professional Features")
+    st.markdown("### 🚀 Day Trading Features")
     col1, col2, col3 = st.columns(3)
     
     with col1:
@@ -609,12 +736,14 @@ else:
         - Investment breakdown
         - Risk analysis
         - Conviction scoring
+        - Persistent results
         """)
     
     with col2:
         st.markdown("""
         **📈 Analysis**
-        - Candlestick charts
+        - VWAP indicator
+        - RVOL (Relative Volume)
         - EMA 8 & 20
         - SMA 50 & 200
         - RSI momentum
