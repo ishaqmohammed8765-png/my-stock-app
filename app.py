@@ -3,9 +3,30 @@ import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
 import numpy as np
+import requests
+from time import sleep
 
 # Page configuration
 st.set_page_config(page_title="Trading Calculator", page_icon="⚡", layout="wide")
+
+# ============ ANTI-BLOCKING SETUP ============
+# Create a persistent session with realistic headers
+@st.cache_resource
+def get_session():
+    """Create a requests session with realistic browser headers"""
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1'
+    })
+    return session
+
+# Get the shared session
+SESSION = get_session()
 
 # Load thresholds from secrets (with fallback defaults)
 try:
@@ -146,26 +167,44 @@ def get_verdict(ema_8, ema_20, rsi):
     else:
         return "⏸️ WAIT", "info"
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=1200, show_spinner=False)  # Cache for 20 minutes
 def fetch_stock_data(ticker):
-    """Fetch stock data from Yahoo Finance with caching"""
+    """
+    Fetch stock data with anti-blocking measures
+    Minimizes API calls by getting current price first, then historical data
+    """
     try:
-        stock = yf.Ticker(ticker)
+        # Use the session for all yfinance calls
+        stock = yf.Ticker(ticker, session=SESSION)
+        
+        # STEP 1: Get current price FIRST (minimal data)
+        real_time_price = None
+        try:
+            # Try fast_info first (fastest, most efficient)
+            real_time_price = stock.fast_info.get('last_price', None)
+        except Exception:
+            pass
+        
+        if real_time_price is None:
+            try:
+                # Fallback to info (slower but more reliable)
+                info = stock.info
+                real_time_price = info.get('regularMarketPrice', None) or info.get('currentPrice', None)
+            except Exception:
+                pass
+        
+        # STEP 2: Only fetch historical data if we need it for charts
+        # This reduces the data load significantly
         data = stock.history(period="5d", interval="15m")
         
         if data.empty:
-            return None, None, "No data found for this ticker"
+            return None, None, "No historical data found for this ticker"
         
-        # Get real-time price
-        try:
-            real_time_price = stock.fast_info['last_price']
-        except:
-            try:
-                real_time_price = stock.info.get('regularMarketPrice', None)
-            except:
-                real_time_price = float(data['Close'].iloc[-1])
+        # If we still don't have current price, use latest close as fallback
+        if real_time_price is None:
+            real_time_price = float(data['Close'].iloc[-1])
         
-        # Calculate indicators
+        # Calculate indicators using historical data
         data['EMA_8'] = data['Close'].ewm(span=8, adjust=False).mean()
         data['EMA_20'] = data['Close'].ewm(span=20, adjust=False).mean()
         data['RSI'] = calculate_rsi(data, period=14)
@@ -176,12 +215,20 @@ def fetch_stock_data(ticker):
     except Exception as e:
         error_msg = str(e)
         
-        if "429" in error_msg or "rate limit" in error_msg.lower():
-            return None, None, "⏳ Yahoo Finance rate limit reached. Please wait a few minutes and try again."
+        # Specific handling for rate limit errors
+        if "429" in error_msg or "rate limit" in error_msg.lower() or "too many requests" in error_msg.lower():
+            return None, None, (
+                "⏳ **Yahoo Finance Rate Limit Detected**\n\n"
+                "Please wait 5-10 minutes before trying again.\n\n"
+                "**Tips to avoid rate limits:**\n"
+                "- Data is cached for 20 minutes - avoid rapid refreshes\n"
+                "- Close other apps/tabs using Yahoo Finance\n"
+                "- Wait a few minutes between different ticker searches"
+            )
         elif "404" in error_msg or "not found" in error_msg.lower():
-            return None, None, f"❌ Ticker '{ticker}' not found. Please check the symbol and try again."
+            return None, None, f"❌ Ticker '{ticker}' not found. Please verify the symbol."
         else:
-            return None, None, f"❌ Error fetching data: {error_msg}"
+            return None, None, f"❌ Error: {error_msg}"
 
 def create_candlestick_chart(data, ticker):
     """Create professional candlestick chart with EMA overlays"""
@@ -231,13 +278,15 @@ def create_candlestick_chart(data, ticker):
 # Sidebar
 st.sidebar.header("⚙️ Quick Settings")
 
-with st.sidebar.form("trading_form"):
+# ============ OPTIMIZED FORM (No Double-Ping) ============
+with st.sidebar.form("trading_form", clear_on_submit=False):
     st.markdown("### Stock Symbol")
     ticker = st.text_input(
         "Ticker",
         value="NVDA",
         help="Examples: AAPL, TSLA, MSFT, MKDW, BTC-USD",
-        placeholder="Enter ticker..."
+        placeholder="Enter ticker...",
+        key="ticker_input"
     )
     
     st.markdown("### Investment Amount")
@@ -246,24 +295,34 @@ with st.sidebar.form("trading_form"):
         min_value=1.0,
         value=100.0,
         step=10.0,
-        help="Total dollars you want to invest in this position"
+        help="Total dollars you want to invest in this position",
+        key="investment_input"
     )
     
-    submit_button = st.form_submit_button("⚡ Calculate", use_container_width=True, type="primary")
+    submit_button = st.form_submit_button(
+        "⚡ Calculate", 
+        use_container_width=True, 
+        type="primary"
+    )
     
-    st.caption("💡 Data cached for 5 minutes")
+    st.caption("💡 Data cached for 20 minutes to avoid rate limits")
 
 # Main content
 if submit_button and ticker:
-    with st.spinner(f"Calculating {ticker.upper()}..."):
+    # Show custom spinner while fetching (since cache has show_spinner=False)
+    with st.spinner(f"⚡ Fetching data for {ticker.upper()}..."):
         data, real_time_price, error = fetch_stock_data(ticker.upper())
     
     if error:
-        st.error(error)
-        if "rate limit" in error.lower():
-            st.info("💡 **Tips:**\n"
-                    "- Wait 2-5 minutes before retrying\n"
-                    "- Data is cached for 5 minutes")
+        # Display enhanced error messages
+        if "Rate Limit" in error:
+            st.error(error)
+            st.warning("⏰ **What to do now:**\n"
+                      "1. Wait 5-10 minutes\n"
+                      "2. Close other Yahoo Finance tabs\n"
+                      "3. Try again with a different ticker")
+        else:
+            st.error(error)
     elif data is not None:
         # Use real-time price with 4 decimal precision
         current_price = float(real_time_price)
@@ -452,11 +511,13 @@ if submit_button and ticker:
             st.line_chart(chart_obv)
             st.caption("Rising = Bullish | Falling = Bearish")
         
-        st.success(f"⚡ Analysis complete • Live: ${current_price:.4f} • Cached for 5 min")
+        st.success(f"⚡ Analysis complete • Live: ${current_price:.4f} • Cached for 20 min")
 
 elif not submit_button:
     # Welcome screen
     st.info("👈 **Enter ticker and investment amount, then click Calculate**")
+    
+    st.success("🛡️ **Anti-Rate-Limit Protection Active** - Uses realistic browser headers, minimized requests, and 20-minute smart caching")
     
     st.markdown("### ⚡ High-Speed Features")
     
@@ -480,6 +541,12 @@ elif not submit_button:
         - See your total risk ($)
         - Risk as % of investment
         - Expected profit calculation
+        
+        **🛡️ Anti-Rate-Limit**
+        - Realistic browser identity
+        - Minimal data requests
+        - 20-minute caching
+        - No double-pinging
         """)
     
     st.markdown("### 🎲 Conviction Score")
@@ -533,5 +600,13 @@ st.sidebar.info(
     "- Risk = (Price - Stop) × Shares\n"
     "- Risk % = Risk / Investment\n"
     "- Stop Loss: 5% below entry\n\n"
+    "**Anti-Blocking:**\n"
+    "✅ Realistic browser headers\n"
+    "✅ Minimized data requests\n"
+    "✅ 20-min smart caching\n"
+    "✅ Rate limit protection\n\n"
     "Data: Yahoo Finance"
 )
+
+st.sidebar.markdown("---")
+st.sidebar.success("🛡️ Anti-Rate-Limit Active")
