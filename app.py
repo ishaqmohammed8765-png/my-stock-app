@@ -5,28 +5,53 @@ import numpy as np
 import requests
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from scipy import stats
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+from scipy import stats
 
-# ================== PAGE CONFIG ==================
-st.set_page_config(page_title="Professional Day Trading Dashboard", page_icon="📊", layout="wide")
-st.title("📊 Professional Day Trading Dashboard")
-st.markdown("Real-time data • Technical analysis • Market news")
+# ============ PAGE CONFIG ============
+st.set_page_config(page_title="Day Trading Dashboard", page_icon="📊", layout="wide")
 
-# ================== API KEY HANDLING ==================
-FINNHUB_API_KEY = st.secrets.get("FINNHUB_API_KEY", None)
-if not FINNHUB_API_KEY:
-    FINNHUB_API_KEY = st.sidebar.text_input(
-        "Enter Finnhub API Key", type="password", help="Required for real-time quotes/news."
-    )
-if not FINNHUB_API_KEY:
-    st.warning("Finnhub API key is required. Enter it in the sidebar.")
+# ============ API KEY ============
+api_key = st.secrets.get("FINNHUB_API_KEY", None)
+if not api_key:
+    api_key = st.sidebar.text_input("Finnhub API Key", type="password")
+if not api_key:
+    st.warning("Enter your Finnhub API key to proceed.")
     st.stop()
 
-# ================== HELPER FUNCTIONS ==================
-def calculate_rsi_wilder(data, period=14):
-    delta = data['Close'].diff()
+# ============ SIDEBAR SETTINGS ============
+st.sidebar.header("⚙️ Trading Settings")
+ticker = st.sidebar.text_input("Ticker", value="NVDA").upper()
+investment_amount = st.sidebar.number_input("💵 Investment ($)", value=100.0, min_value=1.0, step=10.0)
+stop_loss_pct = st.sidebar.number_input("🛡️ Stop Loss (%)", value=5.0, min_value=1.0, max_value=20.0, step=0.5)
+slippage_pct = st.sidebar.slider("📉 Slippage (%)", 0.0, 10.0, 2.0, 0.5)
+analyze = st.sidebar.button("⚡ Analyze")
+
+# ============ HELPER FUNCTIONS ============
+
+def fetch_finnhub_quote(ticker, api_key):
+    try:
+        url = f"https://finnhub.io/api/v1/quote?symbol={ticker}&token={api_key}"
+        resp = requests.get(url, timeout=5)
+        data = resp.json()
+        if not data.get("c"):
+            return None
+        return data
+    except:
+        return None
+
+def fetch_yfinance_data(ticker):
+    try:
+        df_15m = yf.Ticker(ticker).history(period="5d", interval="15m")
+        df_1y = yf.Ticker(ticker).history(period="1y", interval="1d")
+        if df_15m.empty:
+            return None, None
+        return df_15m, df_1y
+    except:
+        return None, None
+
+def calculate_rsi(df, period=14):
+    delta = df['Close'].diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
     avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
@@ -35,183 +60,102 @@ def calculate_rsi_wilder(data, period=14):
     rsi = 100 - (100 / (1 + rs))
     return rsi
 
-def calculate_obv_vectorized(data):
-    return (np.sign(data['Close'].diff()) * data['Volume']).fillna(0).cumsum()
+def calculate_obv(df):
+    return (np.sign(df['Close'].diff()) * df['Volume']).fillna(0).cumsum()
 
-def calculate_vwap(data):
-    tp = (data['High'] + data['Low'] + data['Close']) / 3
-    return (tp * data['Volume']).cumsum() / data['Volume'].cumsum()
+def calculate_vwap(df):
+    tp = (df['High'] + df['Low'] + df['Close']) / 3
+    return (tp * df['Volume']).cumsum() / df['Volume'].cumsum()
 
-def calculate_pivot_points(data, current_price):
-    high = float(data['High'].iloc[-1])
-    low = float(data['Low'].iloc[-1])
-    close = current_price
-    pivot = (high + low + close) / 3
-    support = (2 * pivot) - high
-    resistance = (2 * pivot) - low
+def calculate_macd(df):
+    ema12 = df['Close'].ewm(span=12, adjust=False).mean()
+    ema26 = df['Close'].ewm(span=26, adjust=False).mean()
+    macd = ema12 - ema26
+    signal = macd.ewm(span=9, adjust=False).mean()
+    hist = macd - signal
+    return macd, signal, hist
+
+def calculate_pivot(df, current_price):
+    high, low = df['High'].iloc[-1], df['Low'].iloc[-1]
+    pivot = (high + low + current_price)/3
+    support = 2*pivot - high
+    resistance = 2*pivot - low
     return pivot, support, resistance
 
-def calculate_probability(data, current_price, target_price):
-    daily = data['Close'].resample('D').last().dropna()
-    daily_returns = daily.pct_change().dropna() if len(daily) >= 20 else daily.tail(20).pct_change().dropna()
-    vol = daily_returns.std()
-    expected_return = (target_price - current_price) / current_price
-    z_score = expected_return / vol if vol > 0 else 0
-    prob = stats.norm.cdf(abs(z_score)) * 100 if z_score > 0 else (1 - stats.norm.cdf(abs(z_score))) * 100
-    prob = min(prob, 95.0)
-    return prob, z_score, vol
+def calculate_rvol(current_volume, df_15m):
+    df_today = df_15m.tz_convert('America/New_York').between_time("09:30", "16:00")
+    avg_volume = df_today['Volume'].mean()
+    if avg_volume and current_volume:
+        return current_volume / avg_volume
+    return None
 
-def calculate_investment_risk(current_price, sell_target, investment_amount, stop_loss_pct, slippage_pct):
-    shares = investment_amount / current_price if current_price > 0 else 0
-    stop_loss_price = current_price * (1 - stop_loss_pct / 100)
-    risk_per_share = current_price - stop_loss_price
-    total_risk = risk_per_share * shares
-    profit_per_share = sell_target - current_price
-    gross_profit = profit_per_share * shares
-    slippage_cost = gross_profit * (slippage_pct / 100)
-    net_profit = gross_profit - slippage_cost
-    risk_pct = (total_risk / investment_amount * 100) if investment_amount > 0 else 0
-    return {
-        'shares': shares,
-        'stop_loss_price': stop_loss_price,
-        'total_risk': total_risk,
-        'risk_percentage': risk_pct,
-        'gross_profit': gross_profit,
-        'slippage_cost': slippage_cost,
-        'net_profit': net_profit
-    }
-
-def get_verdict(ema_8, ema_20, rsi, rsi_buy=35, rsi_sell=65):
-    if ema_8 > ema_20 and rsi < rsi_buy:
+def get_trading_verdict(ema_8, ema_20, rsi):
+    RSI_STRONG_BUY, RSI_BUY_MAX, RSI_SELL_MIN, RSI_STRONG_SELL = 35, 50, 50, 65
+    if ema_8 > ema_20 and rsi < RSI_STRONG_BUY:
         return "🚀 STRONG BUY", "success"
-    elif ema_8 > ema_20 and rsi < 50:
+    elif ema_8 > ema_20 and RSI_STRONG_BUY <= rsi <= RSI_BUY_MAX:
         return "✅ BUY", "success"
-    elif ema_8 < ema_20 and rsi > rsi_sell:
+    elif ema_8 < ema_20 and rsi > RSI_STRONG_SELL:
         return "🔻 STRONG SELL", "error"
-    elif ema_8 < ema_20 and rsi > 50:
+    elif ema_8 < ema_20 and RSI_SELL_MIN <= rsi <= RSI_STRONG_SELL:
         return "⚠️ SELL", "error"
     else:
         return "⏸️ WAIT", "info"
 
-# ================== FETCH FUNCTIONS ==================
-@st.cache_data(ttl=5)
-def fetch_finnhub_price(ticker: str):
-    try:
-        url = f"https://finnhub.io/api/v1/quote?symbol={ticker}&token={FINNHUB_API_KEY}"
-        resp = requests.get(url, timeout=5)
-        if resp.status_code != 200:
-            return None, f"API error: {resp.status_code}"
-        data = resp.json()
-        if not data.get('c'):
-            return None, f"Ticker '{ticker}' not found"
-        return data, None
-    except Exception as e:
-        return None, str(e)
-
-@st.cache_data(ttl=3600)
-def fetch_yfinance_15m(ticker: str):
-    try:
-        stock = yf.Ticker(ticker)
-        df = stock.history(period="5d", interval="15m")
-        if df.empty:
-            return None, "No historical data returned from yfinance."
-        df = df.tz_localize('UTC').tz_convert('America/New_York')
-        df['EMA_8'] = df['Close'].ewm(span=8, adjust=False).mean()
-        df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
-        df['RSI'] = calculate_rsi_wilder(df)
-        df['OBV'] = calculate_obv_vectorized(df)
-        df['VWAP'] = calculate_vwap(df)
-        return df, None
-    except Exception as e:
-        return None, str(e)
-
-@st.cache_data(ttl=300)
-def fetch_finnhub_news(ticker: str):
-    try:
-        today = datetime.now(tz=ZoneInfo("America/New_York"))
-        week_ago = today - timedelta(days=7)
-        url = f"https://finnhub.io/api/v1/company-news?symbol={ticker}&from={week_ago.strftime('%Y-%m-%d')}&to={today.strftime('%Y-%m-%d')}&token={FINNHUB_API_KEY}"
-        resp = requests.get(url, timeout=10)
-        if resp.status_code != 200:
-            return [], f"API error: {resp.status_code}"
-        news_data = resp.json()
-        return news_data[:5] if news_data else [], None
-    except Exception as e:
-        return [], str(e)
-
-# ================== SIDEBAR INPUTS ==================
-st.sidebar.header("⚙️ Trading Settings")
-ticker = st.sidebar.text_input("Ticker Symbol", value="NVDA").upper()
-investment_amount = st.sidebar.number_input("💵 Investment ($)", min_value=1.0, value=100.0, step=10.0)
-stop_loss_pct = st.sidebar.number_input("🛡️ Stop Loss (%)", min_value=1.0, max_value=20.0, value=5.0, step=0.5)
-slippage_pct = st.sidebar.slider("📉 Slippage (%)", 0.0, 10.0, 2.0, step=0.5)
-calculate_button = st.sidebar.button("⚡ Analyze")
-
-# ================== MAIN LOGIC ==================
-if calculate_button and ticker:
+# ============ MAIN ANALYSIS ============
+if analyze and ticker:
     with st.spinner(f"Fetching data for {ticker}..."):
-        price_data, price_err = fetch_finnhub_price(ticker)
-        hist_data, hist_err = fetch_yfinance_15m(ticker)
-        news_items, news_err = fetch_finnhub_news(ticker)
+        quote = fetch_finnhub_quote(ticker, api_key)
+        if not quote:
+            st.error("Failed to fetch real-time quote.")
+            st.stop()
 
-    if price_err:
-        st.error(price_err)
-        st.stop()
-    if hist_err:
-        st.error(hist_err)
-        st.stop()
+        df_15m, df_1y = fetch_yfinance_data(ticker)
+        if df_15m is None:
+            st.error("Failed to fetch historical data.")
+            st.stop()
 
-    current_price = price_data['c']
-    ema_8 = hist_data['EMA_8'].iloc[-1]
-    ema_20 = hist_data['EMA_20'].iloc[-1]
-    rsi = hist_data['RSI'].iloc[-1]
-    pivot, support, resistance = calculate_pivot_points(hist_data, current_price)
-    probability, z_score, volatility = calculate_probability(hist_data, current_price, resistance)
-    calc = calculate_investment_risk(current_price, resistance, investment_amount, stop_loss_pct, slippage_pct)
-    verdict, verdict_type = get_verdict(ema_8, ema_20, rsi)
+        df_15m['EMA_8'] = df_15m['Close'].ewm(span=8, adjust=False).mean()
+        df_15m['EMA_20'] = df_15m['Close'].ewm(span=20, adjust=False).mean()
+        df_15m['RSI'] = calculate_rsi(df_15m)
+        df_15m['OBV'] = calculate_obv(df_15m)
+        df_15m['VWAP'] = calculate_vwap(df_15m)
+        df_15m['MACD'], df_15m['MACD_SIGNAL'], df_15m['MACD_HIST'] = calculate_macd(df_15m)
 
-    # ================== DISPLAY ==================
-    st.subheader("💰 Real-Time Price & Indicators")
-    st.metric(f"{ticker} Price", f"${current_price:.2f}")
-    st.metric("EMA 8", f"${ema_8:.2f}")
-    st.metric("EMA 20", f"${ema_20:.2f}")
-    st.metric("RSI (14)", f"{rsi:.2f}")
-    st.markdown(f"Pivot: ${pivot:.2f} | Support: ${support:.2f} | Resistance: ${resistance:.2f}")
-    
-    st.subheader("🎯 Trading Verdict")
-    if verdict_type == "success":
-        st.success(f"# {verdict}")
-    elif verdict_type == "error":
-        st.error(f"# {verdict}")
-    else:
-        st.info(f"# {verdict}")
+        current_price = quote['c']
+        current_volume = quote['v']
+        ema_8, ema_20, rsi = df_15m['EMA_8'].iloc[-1], df_15m['EMA_20'].iloc[-1], df_15m['RSI'].iloc[-1]
 
-    st.subheader("🧮 Investment Breakdown")
-    st.metric("Shares", f"{calc['shares']:.2f}")
-    st.metric("Stop Loss Price", f"${calc['stop_loss_price']:.2f}")
-    st.metric("Net Profit After Slippage", f"${calc['net_profit']:.2f}")
+        pivot, support, resistance = calculate_pivot(df_15m, current_price)
+        rvol = calculate_rvol(current_volume, df_15m)
+        verdict, verdict_type = get_trading_verdict(ema_8, ema_20, rsi)
 
-    st.subheader("📈 Charts")
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
-                        vertical_spacing=0.1, subplot_titles=(f"{ticker} Price & EMAs", "RSI"))
-    fig.add_trace(go.Candlestick(x=hist_data.index, open=hist_data['Open'], high=hist_data['High'],
-                                 low=hist_data['Low'], close=hist_data['Close'], name="Price"), row=1, col=1)
-    fig.add_trace(go.Scatter(x=hist_data.index, y=hist_data['EMA_8'], name="EMA 8", line=dict(color='gold')), row=1, col=1)
-    fig.add_trace(go.Scatter(x=hist_data.index, y=hist_data['EMA_20'], name="EMA 20", line=dict(color='blue')), row=1, col=1)
-    fig.add_trace(go.Scatter(x=hist_data.index, y=hist_data['RSI'], name="RSI", line=dict(color='cyan')), row=2, col=1)
-    fig.update_layout(height=700, template='plotly_dark', xaxis_rangeslider_visible=False)
+    # ============ DISPLAY ============
+    st.subheader(f"{ticker} Real-Time Metrics")
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Price", f"${current_price:.2f}")
+    col2.metric("EMA 8", f"${ema_8:.2f}")
+    col3.metric("EMA 20", f"${ema_20:.2f}")
+    col4.metric("RSI", f"{rsi:.2f}")
+
+    st.markdown(f"## Trading Signal: {verdict}")
+
+    st.subheader("📊 Charts")
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(x=df_15m.index,
+                                 open=df_15m['Open'],
+                                 high=df_15m['High'],
+                                 low=df_15m['Low'],
+                                 close=df_15m['Close'],
+                                 name='Price'))
+    fig.add_trace(go.Scatter(x=df_15m.index, y=df_15m['EMA_8'], name='EMA 8', line=dict(color='gold')))
+    fig.add_trace(go.Scatter(x=df_15m.index, y=df_15m['EMA_20'], name='EMA 20', line=dict(color='blue')))
+    fig.add_trace(go.Scatter(x=df_15m.index, y=df_15m['VWAP'], name='VWAP', line=dict(color='green', dash='dot')))
     st.plotly_chart(fig, use_container_width=True)
 
-    st.subheader("📰 Latest News")
-    if news_err:
-        st.warning(news_err)
-    elif news_items:
-        for n in news_items:
-            st.markdown(f"**{n.get('headline', '')}**")
-            st.markdown(n.get('summary', '')[:200]+"...")
-            st.markdown(f"[Read More]({n.get('url','#')})")
-            st.markdown("---")
-    else:
-        st.info("No recent news available.")
-else:
-    st.info("👈 Configure your settings and click Analyze")
+    fig_rsi = go.Figure()
+    fig_rsi.add_trace(go.Scatter(x=df_15m.index, y=df_15m['RSI'], name='RSI', line=dict(color='cyan')))
+    fig_rsi.add_hline(y=70, line_dash="dash", line_color="red")
+    fig_rsi.add_hline(y=30, line_dash="dash", line_color="green")
+    st.plotly_chart(fig_rsi, use_container_width=True)
+
