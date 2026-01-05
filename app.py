@@ -7,7 +7,7 @@ import time
 st.set_page_config(page_title="Stock Signal Tracker", page_icon="📈", layout="wide")
 
 st.title("📈 Advanced Stock Signal Tracker")
-st.markdown("Track stock signals with EMA and RSI indicators")
+st.markdown("Complete trading analysis with price targets, volume, and master signals")
 
 def calculate_rsi(data, period=14):
     """Calculate Relative Strength Index (RSI)"""
@@ -17,6 +17,30 @@ def calculate_rsi(data, period=14):
     rs = gain / loss
     rsi = 100 - (100 / (1 + rs))
     return rsi
+
+def calculate_obv(data):
+    """Calculate On-Balance Volume (OBV)"""
+    obv = [0]
+    for i in range(1, len(data)):
+        if data['Close'].iloc[i] > data['Close'].iloc[i-1]:
+            obv.append(obv[-1] + data['Volume'].iloc[i])
+        elif data['Close'].iloc[i] < data['Close'].iloc[i-1]:
+            obv.append(obv[-1] - data['Volume'].iloc[i])
+        else:
+            obv.append(obv[-1])
+    return obv
+
+def calculate_pivot_points(data):
+    """Calculate Pivot Point, Support, and Resistance levels"""
+    high = float(data['High'].iloc[-1])
+    low = float(data['Low'].iloc[-1])
+    close = float(data['Close'].iloc[-1])
+    
+    pivot = (high + low + close) / 3
+    support = (2 * pivot) - high  # Buy Target
+    resistance = (2 * pivot) - low  # Sell Target
+    
+    return pivot, support, resistance
 
 @st.cache_data(ttl=300)  # Cache data for 5 minutes (300 seconds)
 def fetch_stock_data(ticker):
@@ -38,6 +62,9 @@ def fetch_stock_data(ticker):
         
         # Calculate RSI (14-period)
         data['RSI'] = calculate_rsi(data, period=14)
+        
+        # Calculate OBV
+        data['OBV'] = calculate_obv(data)
         
         return data, None
         
@@ -87,39 +114,97 @@ if submit_button and ticker:
         ema_20_latest = float(data['EMA_20'].iloc[-1])
         rsi_latest = float(data['RSI'].iloc[-1])
         
-        # Display metrics in columns
-        st.subheader(f"📊 {ticker.upper()} Overview")
-        col1, col2, col3, col4 = st.columns(4)
+        # Calculate Pivot Points
+        pivot, support, resistance = calculate_pivot_points(data)
         
-        with col1:
-            st.metric(label="Current Price", value=f"${current_price:.2f}")
-        with col2:
-            st.metric(label="EMA 8 (Fast)", value=f"${ema_8_latest:.2f}")
-        with col3:
-            st.metric(label="EMA 20 (Slow)", value=f"${ema_20_latest:.2f}")
-        with col4:
-            st.metric(label="RSI (14)", value=f"{rsi_latest:.2f}")
+        # Calculate OBV trend (comparing last 20 periods)
+        obv_recent = data['OBV'].iloc[-20:]
+        obv_trend = obv_recent.iloc[-1] > obv_recent.iloc[0]
+        volume_bullish = obv_trend
+        
+        # Determine signals
+        ema_bullish = ema_8_latest > ema_20_latest
+        ema_bearish = ema_8_latest < ema_20_latest
+        
+        # Master Signal Logic
+        if ema_bullish and rsi_latest < 60 and volume_bullish:
+            verdict = "🚀 STRONG BUY"
+            verdict_color = "success"
+        elif rsi_latest > 70:
+            verdict = "💰 TAKE PROFIT / SELL"
+            verdict_color = "warning"
+        elif ema_bearish and rsi_latest > 40:
+            verdict = "⚠️ WAIT / CAUTION"
+            verdict_color = "error"
+        else:
+            verdict = "📊 NEUTRAL - Monitor"
+            verdict_color = "info"
+        
+        # Display Master Verdict at the top
+        st.markdown("### 🎯 Master Signal")
+        if verdict_color == "success":
+            st.success(f"**{verdict}**")
+        elif verdict_color == "warning":
+            st.warning(f"**{verdict}**")
+        elif verdict_color == "error":
+            st.error(f"**{verdict}**")
+        else:
+            st.info(f"**{verdict}**")
         
         st.markdown("---")
         
-        # Display EMA signal
-        st.subheader("🎯 Trading Signals")
-        col_signal1, col_signal2 = st.columns(2)
+        # Top row: Current Price, Buy Target, Sell Target (side-by-side)
+        st.subheader(f"💲 {ticker.upper()} Price & Targets")
+        col_top1, col_top2, col_top3 = st.columns(3)
+        
+        with col_top1:
+            st.metric(label="📍 Current Price", value=f"${current_price:.2f}")
+        with col_top2:
+            st.metric(label="🎯 Suggested Entry (Support)", value=f"${support:.2f}")
+        with col_top3:
+            st.metric(label="🚪 Suggested Exit (Resistance)", value=f"${resistance:.2f}")
+        
+        st.markdown("---")
+        
+        # Display indicators in columns
+        st.subheader(f"📊 Technical Indicators")
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.metric(label="EMA 8 (Fast)", value=f"${ema_8_latest:.2f}")
+        with col2:
+            st.metric(label="EMA 20 (Slow)", value=f"${ema_20_latest:.2f}")
+        with col3:
+            st.metric(label="RSI (14)", value=f"{rsi_latest:.2f}")
+        with col4:
+            volume_status = "📈 Bullish" if volume_bullish else "📉 Bearish"
+            st.metric(label="Volume (OBV)", value=volume_status)
+        
+        st.markdown("---")
+        
+        # Display individual signals
+        st.subheader("🔍 Signal Breakdown")
+        col_signal1, col_signal2, col_signal3 = st.columns(3)
         
         with col_signal1:
             if ema_8_latest > ema_20_latest:
-                st.success("🟢 **BUY Signal**: EMA 8 > EMA 20")
+                st.success("🟢 **EMA Signal**: Bullish\n\nEMA 8 > EMA 20")
             else:
-                st.error("🔴 **WAIT Signal**: EMA 8 < EMA 20")
+                st.error("🔴 **EMA Signal**: Bearish\n\nEMA 8 < EMA 20")
         
-        # Display RSI signal
         with col_signal2:
             if rsi_latest > 70:
-                st.error("⚠️ **Overbought**: RSI above 70")
+                st.error("⚠️ **RSI**: Overbought\n\nRSI above 70")
             elif rsi_latest < 30:
-                st.success("✅ **Oversold**: RSI below 30")
+                st.success("✅ **RSI**: Oversold\n\nRSI below 30")
             else:
-                st.info(f"ℹ️ **Neutral**: RSI at {rsi_latest:.2f}")
+                st.info(f"ℹ️ **RSI**: Neutral\n\nRSI at {rsi_latest:.2f}")
+        
+        with col_signal3:
+            if volume_bullish:
+                st.success("📈 **Volume**: Bullish\n\nOBV is rising")
+            else:
+                st.warning("📉 **Volume**: Bearish\n\nOBV is falling")
         
         st.markdown("---")
         
@@ -138,9 +223,15 @@ if submit_button and ticker:
             'RSI': data['RSI']
         })
         st.line_chart(chart_data_rsi)
-        
-        # Add RSI reference lines info
         st.caption("RSI Reference: Above 70 = Overbought | Below 30 = Oversold")
+        
+        # OBV Chart
+        st.subheader("📊 On-Balance Volume (OBV)")
+        chart_data_obv = pd.DataFrame({
+            'OBV': data['OBV']
+        })
+        st.line_chart(chart_data_obv)
+        st.caption("Rising OBV indicates bullish volume, falling OBV indicates bearish volume")
         
         # Show cache status
         st.success(f"✅ Data loaded successfully and cached for 5 minutes")
@@ -153,15 +244,18 @@ elif not submit_button:
     st.markdown("""
     1. Enter a stock ticker symbol in the sidebar (e.g., AAPL, TSLA, NVDA)
     2. Click the **'Fetch Data'** button
-    3. View the trading signals and charts
-    4. Data is cached for 5 minutes to reduce API calls
+    3. View the **Master Signal** for quick decision-making
+    4. Check **Price Targets** for entry and exit points
+    5. Review individual signals and charts for detailed analysis
     """)
     
     st.markdown("### 📊 Features:")
     st.markdown("""
+    - **Master Signal**: Combined verdict from all indicators
+    - **Price Targets**: Pivot-based support/resistance levels
     - **EMA Signals**: Fast (8) and Slow (20) moving averages
     - **RSI Indicator**: 14-period Relative Strength Index
-    - **Real-time Analysis**: Overbought/Oversold detection
+    - **Volume Analysis**: On-Balance Volume (OBV) trend
     - **Smart Caching**: Reduces API calls and avoids rate limits
     """)
 
@@ -169,9 +263,11 @@ elif not submit_button:
 st.sidebar.markdown("---")
 st.sidebar.markdown("### About")
 st.sidebar.info(
-    "This app tracks stock signals using:\n"
-    "- **EMA 8 & 20**: Exponential Moving Averages\n"
-    "- **RSI 14**: Relative Strength Index\n\n"
+    "**Trading Signals:**\n"
+    "- **EMA 8 & 20**: Trend direction\n"
+    "- **RSI 14**: Momentum strength\n"
+    "- **OBV**: Volume confirmation\n"
+    "- **Pivot Points**: Entry/exit targets\n\n"
     "**Rate Limit Protection:**\n"
     "- Data cached for 5 minutes\n"
     "- Manual fetch button\n"
