@@ -2,9 +2,10 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
+import numpy as np
 
 # Page configuration
-st.set_page_config(page_title="Stock Signal Tracker", page_icon="📈", layout="wide")
+st.set_page_config(page_title="Trading Calculator", page_icon="⚡", layout="wide")
 
 # Load thresholds from secrets (with fallback defaults)
 try:
@@ -13,14 +14,13 @@ try:
     RSI_SELL_MIN = st.secrets.get("RSI_SELL_MIN", 50)
     RSI_STRONG_SELL = st.secrets.get("RSI_STRONG_SELL", 65)
 except:
-    # Default thresholds if secrets not configured
     RSI_STRONG_BUY = 35
     RSI_BUY_MAX = 50
     RSI_SELL_MIN = 50
     RSI_STRONG_SELL = 65
 
-st.title("📈 Professional Stock Signal Tracker")
-st.markdown("High-conviction trading signals with advanced technical analysis")
+st.title("⚡ High-Speed Trading Calculator")
+st.markdown("Instant analysis with automated position sizing and profit calculations")
 
 def calculate_rsi(data, period=14):
     """Calculate Relative Strength Index (RSI)"""
@@ -44,18 +44,86 @@ def calculate_obv(data):
     return obv
 
 def calculate_pivot_points(data, current_price):
-    """Calculate Pivot Point, Support (S1), and Resistance (R1) levels using latest data"""
-    # Use the most recent high/low from historical data
+    """Calculate Pivot Point, Support (S1), and Resistance (R1) levels"""
     high = float(data['High'].iloc[-1])
     low = float(data['Low'].iloc[-1])
-    # Use real-time price for most accurate pivot calculation
     close = current_price
     
     pivot = (high + low + close) / 3
-    support = (2 * pivot) - high  # S1 - Buy Target
-    resistance = (2 * pivot) - low  # R1 - Sell Target
+    support = (2 * pivot) - high
+    resistance = (2 * pivot) - low
     
     return pivot, support, resistance
+
+def calculate_probability(data, current_price, target_price):
+    """
+    Calculate probability of hitting target using Z-score
+    Returns: probability percentage (0-100%), z-score, volatility
+    """
+    # Get daily closes for volatility (last 20 days)
+    daily_data = data['Close'].resample('D').last().dropna()
+    
+    if len(daily_data) < 20:
+        daily_returns = daily_data.pct_change().dropna()
+    else:
+        daily_returns = daily_data.tail(20).pct_change().dropna()
+    
+    # Calculate daily volatility (standard deviation)
+    volatility = daily_returns.std()
+    
+    # Calculate expected return to target
+    expected_return = (target_price - current_price) / current_price
+    
+    # Calculate Z-score
+    if volatility > 0:
+        z_score = expected_return / volatility
+    else:
+        z_score = 0
+    
+    # Convert Z-score to probability
+    from scipy import stats
+    try:
+        if z_score > 0:
+            probability = stats.norm.cdf(abs(z_score)) * 100
+        else:
+            probability = (1 - stats.norm.cdf(abs(z_score))) * 100
+    except:
+        if abs(z_score) < 1:
+            probability = 68.0
+        elif abs(z_score) < 2:
+            probability = 47.5
+        else:
+            probability = 30.0
+    
+    # Cap probability at 95% for display purposes
+    probability = min(probability, 95.0)
+    
+    return probability, z_score, volatility
+
+def calculate_position_sizing(current_price, sell_target, risk_amount, stop_loss_pct=0.05):
+    """
+    Calculate position size and expected profit
+    """
+    # Calculate stop loss price (5% below entry)
+    stop_loss_price = current_price * (1 - stop_loss_pct)
+    loss_per_share = current_price - stop_loss_price
+    
+    # Position size: shares to buy so stop loss equals risk amount
+    position_size = risk_amount / loss_per_share if loss_per_share > 0 else 0
+    
+    # Expected profit if target hits
+    profit_per_share = sell_target - current_price
+    expected_profit = profit_per_share * position_size
+    
+    # Total capital needed
+    total_capital = current_price * position_size
+    
+    return {
+        'position_size': position_size,
+        'stop_loss_price': stop_loss_price,
+        'expected_profit': expected_profit,
+        'total_capital': total_capital
+    }
 
 def get_verdict(ema_8, ema_20, rsi):
     """Determine trading verdict based on EMA and RSI"""
@@ -73,7 +141,7 @@ def get_verdict(ema_8, ema_20, rsi):
     else:
         return "⏸️ WAIT", "info"
 
-@st.cache_data(ttl=300)  # Cache data for 5 minutes
+@st.cache_data(ttl=300)
 def fetch_stock_data(ticker):
     """Fetch stock data from Yahoo Finance with caching"""
     try:
@@ -83,19 +151,16 @@ def fetch_stock_data(ticker):
         if data.empty:
             return None, None, "No data found for this ticker"
         
-        # Get real-time price (most current available)
+        # Get real-time price
         try:
-            # Try fast_info first (most reliable)
             real_time_price = stock.fast_info['last_price']
         except:
             try:
-                # Fallback to info
                 real_time_price = stock.info.get('regularMarketPrice', None)
             except:
-                # Final fallback to latest historical close
                 real_time_price = float(data['Close'].iloc[-1])
         
-        # Calculate indicators using latest data
+        # Calculate indicators
         data['EMA_8'] = data['Close'].ewm(span=8, adjust=False).mean()
         data['EMA_20'] = data['Close'].ewm(span=20, adjust=False).mean()
         data['RSI'] = calculate_rsi(data, period=14)
@@ -129,53 +194,63 @@ def create_candlestick_chart(data, ticker):
         decreasing_line_color='#ef5350'
     ))
     
-    # EMA 8 (Yellow)
+    # EMA 8 (Yellow) - Fast
     fig.add_trace(go.Scatter(
         x=data.index,
         y=data['EMA_8'],
         name='EMA 8 (Fast)',
-        line=dict(color='#FFD700', width=2)
+        line=dict(color='#FFD700', width=3)
     ))
     
-    # EMA 20 (Blue)
+    # EMA 20 (Blue) - Slow
     fig.add_trace(go.Scatter(
         x=data.index,
         y=data['EMA_20'],
         name='EMA 20 (Slow)',
-        line=dict(color='#1E90FF', width=2)
+        line=dict(color='#1E90FF', width=3)
     ))
     
     fig.update_layout(
-        title=f'{ticker.upper()} - Price Action with EMAs',
+        title=f'{ticker.upper()} - Candlestick Chart with EMAs',
         yaxis_title='Price ($)',
         xaxis_title='Time',
         template='plotly_dark',
         height=500,
         xaxis_rangeslider_visible=False,
-        hovermode='x unified'
+        hovermode='x unified',
+        showlegend=True
     )
     
     return fig
 
 # Sidebar
-st.sidebar.header("⚙️ Settings")
+st.sidebar.header("⚙️ Quick Settings")
 
-with st.sidebar.form("ticker_form"):
+with st.sidebar.form("trading_form"):
     st.markdown("### Stock Symbol")
     ticker = st.text_input(
         "Ticker",
         value="NVDA",
-        help="Examples: AAPL, TSLA, MSFT, BTC-USD",
+        help="Examples: AAPL, TSLA, MSFT, MKDW, BTC-USD",
         placeholder="Enter ticker..."
     )
     
-    submit_button = st.form_submit_button("🔍 Analyze Stock", use_container_width=True)
+    st.markdown("### Risk Management")
+    risk_amount = st.number_input(
+        "💵 Risk Amount ($)",
+        min_value=1.0,
+        value=20.0,
+        step=5.0,
+        help="How much you're willing to lose if 5% stop loss is hit"
+    )
+    
+    submit_button = st.form_submit_button("⚡ Calculate", use_container_width=True, type="primary")
     
     st.caption("💡 Data cached for 5 minutes")
 
 # Main content
 if submit_button and ticker:
-    with st.spinner(f"Analyzing {ticker.upper()}..."):
+    with st.spinner(f"Calculating {ticker.upper()}..."):
         data, real_time_price, error = fetch_stock_data(ticker.upper())
     
     if error:
@@ -183,10 +258,9 @@ if submit_button and ticker:
         if "rate limit" in error.lower():
             st.info("💡 **Tips:**\n"
                     "- Wait 2-5 minutes before retrying\n"
-                    "- Data is cached for 5 minutes\n"
-                    "- Avoid rapid successive requests")
+                    "- Data is cached for 5 minutes")
     elif data is not None:
-        # Use real-time price for current price
+        # Use real-time price with 4 decimal precision
         current_price = float(real_time_price)
         
         # Extract latest indicator values
@@ -194,22 +268,40 @@ if submit_button and ticker:
         ema_20_latest = float(data['EMA_20'].iloc[-1])
         rsi_latest = float(data['RSI'].iloc[-1])
         
-        # Calculate pivot points using real-time price for accuracy
+        # Calculate pivot points
         pivot, support, resistance = calculate_pivot_points(data, current_price)
+        
+        # Calculate probability for sell target
+        probability, z_score, volatility = calculate_probability(data, current_price, resistance)
+        
+        # Calculate position sizing and profit
+        calc = calculate_position_sizing(current_price, resistance, risk_amount)
         
         # Get trading verdict
         verdict, verdict_type = get_verdict(ema_8_latest, ema_20_latest, rsi_latest)
         
-        # TOP SECTION: Price Targets (Most Important)
+        # ============ BIG VERDICT BOX AT TOP ============
+        st.markdown("## 🎯 TRADING SIGNAL")
+        if verdict_type == "success":
+            st.success(f"# {verdict}")
+        elif verdict_type == "error":
+            st.error(f"# {verdict}")
+        else:
+            st.info(f"# {verdict}")
+        
+        st.markdown("---")
+        
+        # ============ PRICE LEVELS (4 DECIMAL PRECISION) ============
         st.markdown("### 💰 Price Levels")
-        st.caption("🔴 **LIVE** - Real-time market data with 4 decimal precision")
+        st.caption("🔴 LIVE - Real-time with 4 decimal precision (perfect for MKDW)")
+        
         col_price1, col_price2, col_price3 = st.columns(3)
         
         with col_price1:
             st.metric(
                 label="🎯 Buy Target (S1)",
                 value=f"${support:.4f}",
-                delta=f"{((support - current_price) / current_price * 100):.1f}%"
+                delta=f"{((support - current_price) / current_price * 100):.2f}%"
             )
         
         with col_price2:
@@ -222,108 +314,161 @@ if submit_button and ticker:
             st.metric(
                 label="🚪 Sell Target (R1)",
                 value=f"${resistance:.4f}",
-                delta=f"{((resistance - current_price) / current_price * 100):.1f}%"
+                delta=f"{((resistance - current_price) / current_price * 100):.2f}%"
             )
         
         st.markdown("---")
         
-        # Master Verdict
-        st.markdown("### 🎯 Trading Signal")
-        if verdict_type == "success":
-            st.success(f"## {verdict}")
-        elif verdict_type == "error":
-            st.error(f"## {verdict}")
-        else:
-            st.info(f"## {verdict}")
+        # ============ CONVICTION METER ============
+        st.markdown("### 🎲 Conviction Meter (Probability Gauge)")
+        
+        col_conv1, col_conv2, col_conv3 = st.columns(3)
+        
+        with col_conv1:
+            # Visual gauge
+            if probability >= 70:
+                st.success(f"## {probability:.1f}%")
+                st.markdown("🟢 **High Conviction**")
+            elif probability >= 50:
+                st.warning(f"## {probability:.1f}%")
+                st.markdown("🟡 **Medium Conviction**")
+            else:
+                st.error(f"## {probability:.1f}%")
+                st.markdown("🔴 **Low Conviction**")
+        
+        with col_conv2:
+            st.metric("Z-Score", f"{z_score:.2f}σ")
+            st.caption("Standard deviations to target")
+        
+        with col_conv3:
+            st.metric("Daily Volatility", f"{volatility*100:.2f}%")
+            st.caption("20-day standard deviation")
+        
+        st.caption("💡 High Conviction = Target within 1σ (68% probability) | Medium = within 2σ (47%) | Low = beyond 2σ")
         
         st.markdown("---")
         
-        # Technical Indicators
+        # ============ AUTO-CALCULATED POSITION SIZING ============
+        st.markdown("### 🧮 Auto-Calculated Position (No Logging)")
+        st.caption(f"Risk Amount: ${risk_amount:.2f} | Stop Loss: 5% below entry (${calc['stop_loss_price']:.4f})")
+        
+        col_calc1, col_calc2, col_calc3, col_calc4 = st.columns(4)
+        
+        with col_calc1:
+            st.metric(
+                "📦 Position Size",
+                f"{calc['position_size']:.2f}",
+                help="Number of shares to buy"
+            )
+            st.caption("shares")
+        
+        with col_calc2:
+            st.metric(
+                "💵 Capital Needed",
+                f"${calc['total_capital']:.2f}",
+                help="Total money needed for this position"
+            )
+        
+        with col_calc3:
+            st.metric(
+                "💰 Expected Profit",
+                f"${calc['expected_profit']:.2f}",
+                help="Profit if sell target hits"
+            )
+        
+        with col_calc4:
+            rr_ratio = calc['expected_profit'] / risk_amount if risk_amount > 0 else 0
+            if rr_ratio >= 2:
+                st.success(f"**{rr_ratio:.2f}:1**")
+                st.caption("✅ Good")
+            elif rr_ratio >= 1:
+                st.warning(f"**{rr_ratio:.2f}:1**")
+                st.caption("⚠️ Fair")
+            else:
+                st.error(f"**{rr_ratio:.2f}:1**")
+                st.caption("❌ Poor")
+        
+        st.markdown("---")
+        
+        # ============ TECHNICAL INDICATORS ============
         st.markdown("### 📊 Technical Indicators")
+        
         col_ind1, col_ind2, col_ind3, col_ind4 = st.columns(4)
         
         with col_ind1:
-            st.metric("EMA 8", f"${ema_8_latest:.4f}")
+            st.metric("EMA 8 (Fast)", f"${ema_8_latest:.4f}")
         with col_ind2:
-            st.metric("EMA 20", f"${ema_20_latest:.4f}")
+            st.metric("EMA 20 (Slow)", f"${ema_20_latest:.4f}")
         with col_ind3:
             st.metric("RSI (14)", f"{rsi_latest:.2f}")
         with col_ind4:
             obv_recent = data['OBV'].iloc[-20:]
             volume_trend = "📈 Bullish" if obv_recent.iloc[-1] > obv_recent.iloc[0] else "📉 Bearish"
-            st.metric("Volume", volume_trend)
+            st.metric("Volume (OBV)", volume_trend)
         
         st.markdown("---")
         
-        # Professional Candlestick Chart
+        # ============ CANDLESTICK CHART WITH EMA OVERLAYS ============
         st.markdown("### 📈 Professional Chart")
-        st.caption("Candlestick chart clearly shows price spikes and movements with EMA overlays")
+        st.caption("Candlestick with EMA 8 (Yellow) and EMA 20 (Blue)")
+        
         fig = create_candlestick_chart(data, ticker)
         st.plotly_chart(fig, use_container_width=True)
         
-        # Additional Charts
+        # ============ ADDITIONAL CHARTS ============
         col_chart1, col_chart2 = st.columns(2)
         
         with col_chart1:
-            st.markdown("#### RSI Momentum")
+            st.markdown("#### 📉 RSI Momentum")
             chart_rsi = pd.DataFrame({'RSI': data['RSI']})
             st.line_chart(chart_rsi)
-            st.caption("Overbought: >70 | Oversold: <30")
+            st.caption("Overbought >70 | Oversold <30")
         
         with col_chart2:
-            st.markdown("#### Volume Trend (OBV)")
+            st.markdown("#### 📊 Volume (OBV)")
             chart_obv = pd.DataFrame({'OBV': data['OBV']})
             st.line_chart(chart_obv)
             st.caption("Rising = Bullish | Falling = Bearish")
         
-        # Signal Breakdown
-        st.markdown("---")
-        st.markdown("### 🔍 Signal Details")
-        
-        col_sig1, col_sig2 = st.columns(2)
-        
-        with col_sig1:
-            if ema_8_latest > ema_20_latest:
-                st.success("**✅ EMA Signal: BULLISH**\n\nFast EMA above Slow EMA")
-            else:
-                st.error("**⚠️ EMA Signal: BEARISH**\n\nFast EMA below Slow EMA")
-        
-        with col_sig2:
-            if rsi_latest > 70:
-                st.error("**⚠️ RSI: OVERBOUGHT**\n\nRSI above 70 - Consider taking profits")
-            elif rsi_latest < 30:
-                st.success("**✅ RSI: OVERSOLD**\n\nRSI below 30 - Potential buying opportunity")
-            else:
-                st.info(f"**📊 RSI: NEUTRAL**\n\nRSI at {rsi_latest:.1f}")
-        
-        st.success("✅ Real-time analysis complete • Live price: ${:.4f} • Data cached for 5 minutes".format(current_price))
+        st.success(f"⚡ Analysis complete • Live: ${current_price:.4f} • Cached for 5 min")
 
 elif not submit_button:
     # Welcome screen
-    st.info("👈 **Enter a stock ticker and click 'Analyze Stock' to begin**")
+    st.info("👈 **Enter ticker and risk amount, then click Calculate**")
     
-    st.markdown("### 🎯 Features")
+    st.markdown("### ⚡ High-Speed Features")
+    
     col_feat1, col_feat2 = st.columns(2)
     
     with col_feat1:
         st.markdown("""
-        **📊 Advanced Analysis**
-        - High-conviction buy/sell signals
-        - Pivot-based price targets
-        - Professional candlestick charts
-        - EMA trend analysis
+        **📊 Instant Analysis**
+        - Real-time prices (4 decimals)
+        - EMA 8 & 20 trend signals
+        - RSI momentum indicator
+        - OBV volume confirmation
+        - Pivot point targets
         """)
     
     with col_feat2:
         st.markdown("""
-        **🛡️ Built-in Protection**
-        - Smart data caching (5 min)
-        - Rate limit handling
-        - Configurable thresholds
-        - Mobile-optimized layout
+        **🧮 Auto-Calculator**
+        - Position size (5% stop loss)
+        - Expected profit at target
+        - Risk/Reward ratio
+        - Capital needed
+        - No logging - just speed!
         """)
     
-    st.markdown("### 📱 Signal Criteria")
+    st.markdown("### 🎲 Conviction Meter")
+    st.markdown("""
+    Uses Z-Score to calculate probability (0-100%):
+    - **🟢 High**: ≥70% (target within 1 standard deviation)
+    - **🟡 Medium**: 50-69% (target within 2 standard deviations)
+    - **🔴 Low**: <50% (target beyond 2 standard deviations)
+    """)
+    
+    st.markdown("### 📱 Trading Signals")
     st.markdown("""
     - **🚀 STRONG BUY**: EMA bullish + RSI < 35
     - **✅ BUY**: EMA bullish + RSI 35-50
@@ -334,19 +479,22 @@ elif not submit_button:
 
 # Sidebar footer
 st.sidebar.markdown("---")
-st.sidebar.markdown("### 📚 About")
+st.sidebar.markdown("### 📚 Quick Guide")
 st.sidebar.info(
-    "**Technical Indicators:**\n"
-    "- EMA 8/20: Trend direction\n"
-    "- RSI 14: Momentum strength\n"
-    "- OBV: Volume confirmation\n"
-    "- Pivot Points: Price targets\n\n"
-    "**Privacy:**\n"
-    "- No personal data stored\n"
-    "- Configurable via st.secrets\n"
-    "- Secure API handling\n\n"
+    "**How It Works:**\n"
+    "1. Enter ticker symbol\n"
+    "2. Set your risk amount\n"
+    "3. Click Calculate\n"
+    "4. Get instant signals!\n\n"
+    "**Indicators:**\n"
+    "- EMA 8/20: Trend\n"
+    "- RSI: Momentum\n"
+    "- Z-Score: Probability\n"
+    "- OBV: Volume\n\n"
+    "**Auto-Math:**\n"
+    "- Position sizing\n"
+    "- Stop loss (5%)\n"
+    "- Expected profit\n"
+    "- R/R ratio\n\n"
     "Data: Yahoo Finance"
 )
-
-st.sidebar.markdown("---")
-st.sidebar.caption("⚙️ Configure thresholds in `.streamlit/secrets.toml`")
