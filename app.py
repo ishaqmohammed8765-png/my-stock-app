@@ -4,9 +4,23 @@ import pandas as pd
 import plotly.graph_objects as go
 import numpy as np
 import requests
+from datetime import datetime, timedelta
 
 # Page configuration
-st.set_page_config(page_title="Hybrid Trading Calculator", page_icon="⚡", layout="wide")
+st.set_page_config(page_title="Professional Stock Dashboard", page_icon="📊", layout="wide")
+
+# ============ SECURITY: API KEY VALIDATION ============
+try:
+    FINNHUB_API_KEY = st.secrets["FINNHUB_API_KEY"]
+except Exception:
+    st.error("🔑 **API Key not found.** Please add `FINNHUB_API_KEY` to your Streamlit Secrets.")
+    st.info("""
+    **How to add secrets:**
+    1. Create `.streamlit/secrets.toml` in your project
+    2. Add: `FINNHUB_API_KEY = "your_key_here"`
+    3. For deployed apps: Add in Streamlit Cloud settings
+    """)
+    st.stop()
 
 # Load thresholds
 try:
@@ -20,12 +34,12 @@ except:
     RSI_SELL_MIN = 50
     RSI_STRONG_SELL = 65
 
-st.title("⚡ Hybrid Trading Calculator")
-st.markdown("Real-time prices from Finnhub • Historical charts from Yahoo Finance")
+st.title("📊 Professional Stock Dashboard")
+st.markdown("Real-time data • Technical analysis • Market news")
 
 # ============ HELPER FUNCTIONS ============
 def calculate_rsi(data, period=14):
-    """Calculate Relative Strength Index (RSI)"""
+    """Calculate Relative Strength Index"""
     delta = data['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
@@ -33,8 +47,12 @@ def calculate_rsi(data, period=14):
     rsi = 100 - (100 / (1 + rs))
     return rsi
 
+def calculate_sma(data, period):
+    """Calculate Simple Moving Average"""
+    return data['Close'].rolling(window=period).mean()
+
 def calculate_obv(data):
-    """Calculate On-Balance Volume (OBV)"""
+    """Calculate On-Balance Volume"""
     obv = [0]
     for i in range(1, len(data)):
         if data['Close'].iloc[i] > data['Close'].iloc[i-1]:
@@ -46,7 +64,7 @@ def calculate_obv(data):
     return obv
 
 def calculate_pivot_points(data, current_price):
-    """Calculate Pivot Point, Support, and Resistance levels"""
+    """Calculate Pivot Points"""
     high = float(data['High'].iloc[-1])
     low = float(data['Low'].iloc[-1])
     close = current_price
@@ -58,7 +76,7 @@ def calculate_pivot_points(data, current_price):
     return pivot, support, resistance
 
 def calculate_probability(data, current_price, target_price):
-    """Calculate probability using Z-score"""
+    """Calculate Z-score probability"""
     daily_data = data['Close'].resample('D').last().dropna()
     
     if len(daily_data) < 20:
@@ -92,7 +110,7 @@ def calculate_probability(data, current_price, target_price):
     return probability, z_score, volatility
 
 def calculate_investment_risk(current_price, sell_target, investment_amount, stop_loss_pct, slippage_pct):
-    """Calculate shares, risk, and profit including slippage"""
+    """Calculate investment metrics with slippage"""
     shares = investment_amount / current_price if current_price > 0 else 0
     stop_loss_price = current_price * (1 - stop_loss_pct / 100)
     
@@ -100,7 +118,6 @@ def calculate_investment_risk(current_price, sell_target, investment_amount, sto
     total_risk = risk_per_share * shares
     risk_percentage = (total_risk / investment_amount * 100) if investment_amount > 0 else 0
     
-    # Calculate profit with slippage
     profit_per_share = sell_target - current_price
     gross_profit = profit_per_share * shares
     slippage_cost = gross_profit * (slippage_pct / 100)
@@ -132,85 +149,138 @@ def get_verdict(ema_8, ema_20, rsi):
     else:
         return "⏸️ WAIT", "info"
 
-# ============ DATA FETCHING FUNCTIONS ============
+# ============ DATA FETCHING ============
 @st.cache_data(ttl=5, show_spinner=False)
-def fetch_finnhub_price(ticker, api_key):
-    """Fetch real-time price from Finnhub (fast, 5-second cache)"""
+def fetch_finnhub_price(ticker):
+    """Fetch real-time price from Finnhub"""
     try:
-        url = f"https://finnhub.io/api/v1/quote?symbol={ticker}&token={api_key}"
+        url = f"https://finnhub.io/api/v1/quote?symbol={ticker}&token={FINNHUB_API_KEY}"
         response = requests.get(url, timeout=5)
         
         if response.status_code == 200:
             data = response.json()
             
-            # Check if data is valid
             if data.get('c', 0) == 0 and data.get('pc', 0) == 0:
-                return None, None, None, f"Ticker '{ticker}' not found or invalid"
+                return None, None, None, f"Ticker '{ticker}' not found"
             
-            current_price = data.get('c')  # Current price
-            change = data.get('d')  # Change
-            percent_change = data.get('dp')  # Percent change
+            current_price = data.get('c')
+            change = data.get('d')
+            percent_change = data.get('dp')
             
             return current_price, change, percent_change, None
         elif response.status_code == 429:
-            return None, None, None, "Finnhub rate limit reached. Please wait a moment."
+            return None, None, None, "Rate limit reached. Please wait."
         else:
-            return None, None, None, f"Finnhub API error: {response.status_code}"
+            return None, None, None, f"API error: {response.status_code}"
     except Exception as e:
-        return None, None, None, f"Error fetching Finnhub data: {str(e)}"
+        return None, None, None, f"Error: {str(e)}"
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_yfinance_historical(ticker):
-    """Fetch historical data from yfinance (1-hour cache)"""
+    """Fetch historical data from yfinance"""
     try:
-        # Use standard yfinance without custom session
         stock = yf.Ticker(ticker)
-        data = stock.history(period="5d", interval="15m")
         
-        if data.empty:
-            return None, "No historical data available"
+        # Get 1 year of daily data for SMAs
+        data_1y = stock.history(period="1y", interval="1d")
         
-        # Calculate indicators
-        data['EMA_8'] = data['Close'].ewm(span=8, adjust=False).mean()
-        data['EMA_20'] = data['Close'].ewm(span=20, adjust=False).mean()
-        data['RSI'] = calculate_rsi(data, period=14)
-        data['OBV'] = calculate_obv(data)
+        # Get 5 days of 15m data for short-term analysis
+        data_5d = stock.history(period="5d", interval="15m")
         
-        return data, None
+        if data_5d.empty:
+            return None, None, "No historical data available"
+        
+        # Calculate indicators on 15m data
+        data_5d['EMA_8'] = data_5d['Close'].ewm(span=8, adjust=False).mean()
+        data_5d['EMA_20'] = data_5d['Close'].ewm(span=20, adjust=False).mean()
+        data_5d['RSI'] = calculate_rsi(data_5d, period=14)
+        data_5d['OBV'] = calculate_obv(data_5d)
+        
+        # Calculate SMAs on daily data
+        if not data_1y.empty:
+            data_1y['SMA_50'] = calculate_sma(data_1y, 50)
+            data_1y['SMA_200'] = calculate_sma(data_1y, 200)
+            data_1y['RSI_14'] = calculate_rsi(data_1y, 14)
+        
+        return data_5d, data_1y, None
     except Exception as e:
-        return None, f"Error fetching historical data: {str(e)}"
+        return None, None, f"Error: {str(e)}"
 
-def create_candlestick_chart(data, ticker):
-    """Create professional candlestick chart"""
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_finnhub_news(ticker):
+    """Fetch latest news from Finnhub"""
+    try:
+        # Get news from last 7 days
+        today = datetime.now()
+        week_ago = today - timedelta(days=7)
+        
+        from_date = week_ago.strftime('%Y-%m-%d')
+        to_date = today.strftime('%Y-%m-%d')
+        
+        url = f"https://finnhub.io/api/v1/company-news?symbol={ticker}&from={from_date}&to={to_date}&token={FINNHUB_API_KEY}"
+        response = requests.get(url, timeout=10)
+        
+        if response.status_code == 200:
+            news_data = response.json()
+            # Return top 5 news items
+            return news_data[:5] if news_data else [], None
+        else:
+            return [], f"Error fetching news: {response.status_code}"
+    except Exception as e:
+        return [], f"Error: {str(e)}"
+
+def create_price_chart_with_sma(data_5d, data_1y, ticker):
+    """Create candlestick chart with EMAs and SMAs"""
     fig = go.Figure()
     
+    # Candlestick on 15m data
     fig.add_trace(go.Candlestick(
-        x=data.index,
-        open=data['Open'],
-        high=data['High'],
-        low=data['Low'],
-        close=data['Close'],
+        x=data_5d.index,
+        open=data_5d['Open'],
+        high=data_5d['High'],
+        low=data_5d['Low'],
+        close=data_5d['Close'],
         name='Price',
         increasing_line_color='#26a69a',
         decreasing_line_color='#ef5350'
     ))
     
+    # EMA 8 and 20 on 15m data
     fig.add_trace(go.Scatter(
-        x=data.index,
-        y=data['EMA_8'],
-        name='EMA 8 (Fast)',
-        line=dict(color='#FFD700', width=3)
+        x=data_5d.index,
+        y=data_5d['EMA_8'],
+        name='EMA 8',
+        line=dict(color='#FFD700', width=2)
     ))
     
     fig.add_trace(go.Scatter(
-        x=data.index,
-        y=data['EMA_20'],
-        name='EMA 20 (Slow)',
-        line=dict(color='#1E90FF', width=3)
+        x=data_5d.index,
+        y=data_5d['EMA_20'],
+        name='EMA 20',
+        line=dict(color='#1E90FF', width=2)
     ))
+    
+    # Add SMAs if daily data available
+    if data_1y is not None and not data_1y.empty:
+        # Only show last 5 days of SMA data to match the chart timeframe
+        recent_1y = data_1y.tail(5)
+        
+        fig.add_trace(go.Scatter(
+            x=recent_1y.index,
+            y=recent_1y['SMA_50'],
+            name='SMA 50',
+            line=dict(color='#FF6B6B', width=2, dash='dash')
+        ))
+        
+        fig.add_trace(go.Scatter(
+            x=recent_1y.index,
+            y=recent_1y['SMA_200'],
+            name='SMA 200',
+            line=dict(color='#9B59B6', width=2, dash='dash')
+        ))
     
     fig.update_layout(
-        title=f'{ticker.upper()} - Candlestick Chart with EMAs',
+        title=f'{ticker.upper()} - Price with Technical Indicators',
         yaxis_title='Price ($)',
         xaxis_title='Time',
         template='plotly_dark',
@@ -222,38 +292,49 @@ def create_candlestick_chart(data, ticker):
     
     return fig
 
-# ============ SIDEBAR WITH FORM ============
-st.sidebar.header("⚙️ Calculation Settings")
-
-with st.sidebar.form("calculation_form", clear_on_submit=False):
-    st.markdown("### API Configuration")
+def create_rsi_chart(data, ticker):
+    """Create RSI momentum chart"""
+    fig = go.Figure()
     
-    # Try to load from secrets first, then allow manual input
-    default_api_key = ""
-    try:
-        default_api_key = st.secrets.get("FINNHUB_API_KEY", "")
-    except:
-        pass
+    fig.add_trace(go.Scatter(
+        x=data.index,
+        y=data['RSI'],
+        name='RSI (14)',
+        line=dict(color='#00D9FF', width=2)
+    ))
     
-    finnhub_api_key = st.text_input(
-        "Finnhub API Key",
-        value=default_api_key,
-        type="password",
-        help="Get free key at finnhub.io or store in .streamlit/secrets.toml",
-        key="api_key_input"
+    # Add overbought/oversold lines
+    fig.add_hline(y=70, line_dash="dash", line_color="red", annotation_text="Overbought (70)")
+    fig.add_hline(y=30, line_dash="dash", line_color="green", annotation_text="Oversold (30)")
+    fig.add_hline(y=50, line_dash="dot", line_color="gray", annotation_text="Neutral (50)")
+    
+    fig.update_layout(
+        title=f'{ticker.upper()} - RSI Momentum (14-day)',
+        yaxis_title='RSI',
+        xaxis_title='Time',
+        template='plotly_dark',
+        height=300,
+        hovermode='x unified',
+        yaxis_range=[0, 100]
     )
     
+    return fig
+
+# ============ SIDEBAR ============
+st.sidebar.header("⚙️ Trading Settings")
+
+with st.sidebar.form("trading_form", clear_on_submit=False):
     st.markdown("### Stock Symbol")
     ticker = st.text_input(
         "Ticker",
         value="NVDA",
-        help="Examples: AAPL, TSLA, MSFT, MKDW",
+        help="US stock symbols (e.g., AAPL, TSLA, MSFT)",
         key="ticker_input"
     )
     
     st.markdown("### Investment Parameters")
     investment_amount = st.number_input(
-        "💵 Total Investment ($)",
+        "💵 Investment ($)",
         min_value=1.0,
         value=100.0,
         step=10.0,
@@ -275,87 +356,88 @@ with st.sidebar.form("calculation_form", clear_on_submit=False):
         max_value=10.0,
         value=2.0,
         step=0.5,
-        help="Expected price slippage for penny stocks",
         key="slippage_input"
     )
     
     calculate_button = st.form_submit_button(
-        "⚡ Calculate", 
+        "⚡ Analyze", 
         use_container_width=True, 
         type="primary"
     )
-    
-    st.caption("Real-time: 5s cache | Historical: 1hr cache")
+
+st.sidebar.markdown("---")
+st.sidebar.success("🔐 Secure API Connection")
 
 # ============ MAIN CONTENT ============
 if calculate_button and ticker:
-    if not finnhub_api_key:
-        st.warning("⚠️ Please enter your Finnhub API Key in the sidebar")
-    else:
-        # Fetch real-time price from Finnhub
-        with st.spinner(f"⚡ Fetching real-time data for {ticker.upper()}..."):
-            current_price, change, percent_change, price_error = fetch_finnhub_price(ticker.upper(), finnhub_api_key)
+    with st.spinner(f"⚡ Fetching data for {ticker.upper()}..."):
+        # Fetch real-time price
+        current_price, change, percent_change, price_error = fetch_finnhub_price(ticker.upper())
         
-        if price_error:
-            st.warning(f"⚠️ {price_error}")
-            st.info("💡 **Troubleshooting:**\n"
-                   "- Verify your Finnhub API key is correct\n"
-                   "- Check ticker symbol (use US market symbols)\n"
-                   "- Try again in a moment if rate limited")
-        elif current_price:
-            # Fetch historical data from yfinance
-            with st.spinner("📊 Loading historical data..."):
-                hist_data, hist_error = fetch_yfinance_historical(ticker.upper())
-            
-            if hist_error:
-                st.warning(f"⚠️ Historical data: {hist_error}")
-                st.info("Charts will be unavailable, but calculations will proceed with live price")
-            
-            # ============ DISPLAY RESULTS ============
-            
-            # Current Price Display (Clean Metrics)
-            st.markdown("### 💰 Real-Time Price")
-            col_price1, col_price2, col_price3 = st.columns(3)
-            
-            with col_price1:
+        # Fetch historical data
+        data_5d, data_1y, hist_error = fetch_yfinance_historical(ticker.upper())
+        
+        # Fetch news
+        news_items, news_error = fetch_finnhub_news(ticker.upper())
+    
+    if price_error:
+        st.warning(f"⚠️ {price_error}")
+    elif current_price:
+        # Display current price at top
+        st.markdown("### 💰 Real-Time Price")
+        col_price1, col_price2, col_price3, col_price4 = st.columns(4)
+        
+        with col_price1:
+            st.metric(
+                f"{ticker.upper()} Price",
+                f"${current_price:.4f}"
+            )
+        
+        with col_price2:
+            st.metric(
+                "Change",
+                f"${change:.4f}" if change else "N/A",
+                delta=f"{percent_change:.2f}%" if percent_change else None
+            )
+        
+        with col_price3:
+            suggested_stop = current_price * (1 - stop_loss_pct / 100)
+            st.metric(
+                "Suggested Stop Loss",
+                f"${suggested_stop:.4f}",
+                delta=f"-{stop_loss_pct}%"
+            )
+        
+        with col_price4:
+            # Calculate 10-day average volume from historical data
+            if data_5d is not None:
+                avg_volume = data_5d['Volume'].tail(10).mean()
                 st.metric(
-                    label=f"{ticker.upper()} Current Price",
-                    value=f"${current_price:.4f}"
+                    "Avg Volume (10d)",
+                    f"{avg_volume:,.0f}"
                 )
-            
-            with col_price2:
-                st.metric(
-                    label="Price Change",
-                    value=f"${change:.4f}" if change else "N/A",
-                    delta=f"{percent_change:.2f}%" if percent_change else None
-                )
-            
-            with col_price3:
-                st.metric(
-                    label="Data Source",
-                    value="Finnhub (Live)"
-                )
-            
-            st.markdown("---")
-            
-            # Calculate metrics if we have historical data
-            if hist_data is not None:
-                ema_8_latest = float(hist_data['EMA_8'].iloc[-1])
-                ema_20_latest = float(hist_data['EMA_20'].iloc[-1])
-                rsi_latest = float(hist_data['RSI'].iloc[-1])
+            else:
+                st.metric("Avg Volume", "N/A")
+        
+        st.markdown("---")
+        
+        # ============ TABS FOR ORGANIZATION ============
+        tab1, tab2, tab3 = st.tabs(["📊 Calculator", "📈 Analysis", "📰 News"])
+        
+        # TAB 1: CALCULATOR
+        with tab1:
+            if data_5d is not None:
+                ema_8 = float(data_5d['EMA_8'].iloc[-1])
+                ema_20 = float(data_5d['EMA_20'].iloc[-1])
+                rsi = float(data_5d['RSI'].iloc[-1])
                 
-                pivot, support, resistance = calculate_pivot_points(hist_data, current_price)
-                probability, z_score, volatility = calculate_probability(hist_data, current_price, resistance)
+                pivot, support, resistance = calculate_pivot_points(data_5d, current_price)
+                probability, z_score, volatility = calculate_probability(data_5d, current_price, resistance)
+                calc = calculate_investment_risk(current_price, resistance, investment_amount, stop_loss_pct, slippage_pct)
+                verdict, verdict_type = get_verdict(ema_8, ema_20, rsi)
                 
-                # Calculate investment with slippage
-                calc = calculate_investment_risk(
-                    current_price, resistance, investment_amount, stop_loss_pct, slippage_pct
-                )
-                
-                verdict, verdict_type = get_verdict(ema_8_latest, ema_20_latest, rsi_latest)
-                
-                # VERDICT BOX
-                st.markdown("## 🎯 TRADING SIGNAL")
+                # VERDICT
+                st.markdown("## 🎯 Trading Signal")
                 if verdict_type == "success":
                     st.success(f"# {verdict}")
                 elif verdict_type == "error":
@@ -367,69 +449,27 @@ if calculate_button and ticker:
                 
                 # PRICE TARGETS
                 st.markdown("### 🎯 Price Targets")
-                col_target1, col_target2, col_target3 = st.columns(3)
+                col1, col2, col3 = st.columns(3)
                 
-                with col_target1:
-                    st.metric(
-                        "🎯 Buy Target (S1)",
-                        f"${support:.4f}",
-                        delta=f"{((support - current_price) / current_price * 100):.2f}%"
-                    )
-                
-                with col_target2:
-                    st.metric(
-                        "📍 Current Price",
-                        f"${current_price:.4f}"
-                    )
-                
-                with col_target3:
-                    st.metric(
-                        "🚪 Sell Target (R1)",
-                        f"${resistance:.4f}",
-                        delta=f"{((resistance - current_price) / current_price * 100):.2f}%"
-                    )
-                
-                st.markdown("---")
-                
-                # CONVICTION SCORE
-                st.markdown("### 🎲 Conviction Score")
-                col_conv1, col_conv2, col_conv3 = st.columns(3)
-                
-                with col_conv1:
-                    if probability >= 70:
-                        st.success(f"# {probability:.1f}%")
-                        st.markdown("### 🟢 High Conviction")
-                    elif probability >= 50:
-                        st.warning(f"# {probability:.1f}%")
-                        st.markdown("### 🟡 Medium Conviction")
-                    else:
-                        st.error(f"# {probability:.1f}%")
-                        st.markdown("### 🔴 Low Conviction")
-                
-                with col_conv2:
-                    st.metric("Z-Score", f"{z_score:.2f}σ")
-                    st.caption("Standard deviations to target")
-                
-                with col_conv3:
-                    st.metric("Daily Volatility", f"{volatility*100:.2f}%")
-                    st.caption("20-day standard deviation")
+                with col1:
+                    st.metric("Buy Target (S1)", f"${support:.4f}",
+                             delta=f"{((support - current_price) / current_price * 100):.2f}%")
+                with col2:
+                    st.metric("Current", f"${current_price:.4f}")
+                with col3:
+                    st.metric("Sell Target (R1)", f"${resistance:.4f}",
+                             delta=f"{((resistance - current_price) / current_price * 100):.2f}%")
                 
                 st.markdown("---")
                 
                 # INVESTMENT BREAKDOWN
                 st.markdown("### 🧮 Investment Breakdown")
-                st.caption(f"Based on Finnhub live price: ${current_price:.4f} | Stop Loss: {stop_loss_pct}% | Slippage: {slippage_pct}%")
+                col1, col2, col3, col4 = st.columns(4)
                 
-                col_calc1, col_calc2, col_calc3, col_calc4 = st.columns(4)
+                with col1:
+                    st.metric("📦 Shares", f"{calc['shares']:.2f}")
                 
-                with col_calc1:
-                    st.metric(
-                        "📦 Shares",
-                        f"{calc['shares']:.2f}"
-                    )
-                    st.caption(f"@ ${current_price:.4f}/share")
-                
-                with col_calc2:
+                with col2:
                     if calc['risk_percentage'] <= 5:
                         st.success(f"## {calc['risk_percentage']:.1f}%")
                     elif calc['risk_percentage'] <= 10:
@@ -439,138 +479,152 @@ if calculate_button and ticker:
                     st.markdown("**Risk %**")
                     st.caption(f"${calc['total_risk']:.2f} at risk")
                 
-                with col_calc3:
-                    st.metric(
-                        "💰 Net Profit",
-                        f"${calc['net_profit']:.2f}"
-                    )
-                    st.caption(f"Gross: ${calc['gross_profit']:.2f}")
-                    st.caption(f"Slippage: -${calc['slippage_cost']:.2f}")
+                with col3:
+                    st.metric("💰 Net Profit", f"${calc['net_profit']:.2f}")
+                    st.caption(f"After {slippage_pct}% slippage")
                 
-                with col_calc4:
-                    rr_ratio = calc['net_profit'] / calc['total_risk'] if calc['total_risk'] > 0 else 0
-                    if rr_ratio >= 2:
-                        st.success(f"**{rr_ratio:.2f}:1**")
-                        st.caption("✅ Good R/R")
-                    elif rr_ratio >= 1:
-                        st.warning(f"**{rr_ratio:.2f}:1**")
-                        st.caption("⚠️ Fair R/R")
+                with col4:
+                    rr = calc['net_profit'] / calc['total_risk'] if calc['total_risk'] > 0 else 0
+                    if rr >= 2:
+                        st.success(f"**{rr:.2f}:1**")
+                    elif rr >= 1:
+                        st.warning(f"**{rr:.2f}:1**")
                     else:
-                        st.error(f"**{rr_ratio:.2f}:1**")
-                        st.caption("❌ Poor R/R")
-                
-                st.info(f"💡 Net profit includes {slippage_pct}% slippage cost. Adjust slider for penny stock volatility.")
+                        st.error(f"**{rr:.2f}:1**")
+                    st.caption("R/R Ratio")
                 
                 st.markdown("---")
                 
-                # TECHNICAL INDICATORS
-                st.markdown("### 📊 Technical Indicators")
-                col_ind1, col_ind2, col_ind3, col_ind4 = st.columns(4)
-                
-                with col_ind1:
-                    st.metric("EMA 8", f"${ema_8_latest:.4f}")
-                with col_ind2:
-                    st.metric("EMA 20", f"${ema_20_latest:.4f}")
-                with col_ind3:
-                    st.metric("RSI (14)", f"{rsi_latest:.2f}")
-                with col_ind4:
-                    obv_recent = hist_data['OBV'].iloc[-20:]
-                    volume_trend = "📈 Bullish" if obv_recent.iloc[-1] > obv_recent.iloc[0] else "📉 Bearish"
-                    st.metric("Volume", volume_trend)
-                
-                st.markdown("---")
-                
-                # CANDLESTICK CHART
-                st.markdown("### 📈 Historical Chart (Yahoo Finance)")
-                fig = create_candlestick_chart(hist_data, ticker)
-                st.plotly_chart(fig, use_container_width=True)
-                
-                # ADDITIONAL CHARTS
-                col_chart1, col_chart2 = st.columns(2)
-                
-                with col_chart1:
-                    st.markdown("#### RSI Momentum")
-                    chart_rsi = pd.DataFrame({'RSI': hist_data['RSI']})
-                    st.line_chart(chart_rsi)
-                
-                with col_chart2:
-                    st.markdown("#### Volume (OBV)")
-                    chart_obv = pd.DataFrame({'OBV': hist_data['OBV']})
-                    st.line_chart(chart_obv)
-                
-                st.success(f"✅ Live price: ${current_price:.4f} (Finnhub) | Charts: Yahoo Finance (1hr cache)")
-            else:
-                # No historical data, but we have live price
-                st.markdown("### 🧮 Basic Calculation (No Historical Data)")
-                
-                # Simple calculation without targets
-                shares = investment_amount / current_price if current_price > 0 else 0
-                stop_loss_price = current_price * (1 - stop_loss_pct / 100)
-                total_risk = (current_price - stop_loss_price) * shares
-                risk_pct = (total_risk / investment_amount * 100) if investment_amount > 0 else 0
-                
+                # CONVICTION SCORE
+                st.markdown("### 🎲 Conviction Score")
                 col1, col2, col3 = st.columns(3)
                 
                 with col1:
-                    st.metric("📦 Shares", f"{shares:.2f}")
+                    if probability >= 70:
+                        st.success(f"# {probability:.1f}%")
+                        st.markdown("### 🟢 High")
+                    elif probability >= 50:
+                        st.warning(f"# {probability:.1f}%")
+                        st.markdown("### 🟡 Medium")
+                    else:
+                        st.error(f"# {probability:.1f}%")
+                        st.markdown("### 🔴 Low")
+                
                 with col2:
-                    st.metric("🛡️ Risk", f"${total_risk:.2f}")
-                    st.caption(f"{risk_pct:.1f}%")
+                    st.metric("Z-Score", f"{z_score:.2f}σ")
+                
                 with col3:
-                    st.metric("Stop Loss", f"${stop_loss_price:.4f}")
+                    st.metric("Volatility", f"{volatility*100:.2f}%")
+        
+        # TAB 2: ANALYSIS
+        with tab2:
+            if data_5d is not None:
+                st.markdown("### 📈 Price Chart with Technical Indicators")
+                fig_price = create_price_chart_with_sma(data_5d, data_1y, ticker)
+                st.plotly_chart(fig_price, use_container_width=True)
+                
+                st.markdown("### 📊 RSI Momentum Indicator")
+                fig_rsi = create_rsi_chart(data_5d, ticker)
+                st.plotly_chart(fig_rsi, use_container_width=True)
+                
+                # Technical Summary
+                st.markdown("### 📋 Technical Summary")
+                col1, col2, col3, col4 = st.columns(4)
+                
+                with col1:
+                    st.metric("EMA 8", f"${float(data_5d['EMA_8'].iloc[-1]):.4f}")
+                with col2:
+                    st.metric("EMA 20", f"${float(data_5d['EMA_20'].iloc[-1]):.4f}")
+                with col3:
+                    st.metric("RSI (14)", f"{float(data_5d['RSI'].iloc[-1]):.2f}")
+                with col4:
+                    obv = data_5d['OBV'].iloc[-20:]
+                    trend = "📈 Bullish" if obv.iloc[-1] > obv.iloc[0] else "📉 Bearish"
+                    st.metric("Volume", trend)
+                
+                # SMA Analysis
+                if data_1y is not None and not data_1y.empty:
+                    st.markdown("### 📊 Long-Term Moving Averages")
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        sma_50 = data_1y['SMA_50'].iloc[-1]
+                        if not pd.isna(sma_50):
+                            st.metric("SMA 50", f"${sma_50:.4f}")
+                            if current_price > sma_50:
+                                st.success("✅ Price above SMA 50 (Bullish)")
+                            else:
+                                st.error("⚠️ Price below SMA 50 (Bearish)")
+                    
+                    with col2:
+                        sma_200 = data_1y['SMA_200'].iloc[-1]
+                        if not pd.isna(sma_200):
+                            st.metric("SMA 200", f"${sma_200:.4f}")
+                            if current_price > sma_200:
+                                st.success("✅ Price above SMA 200 (Bullish)")
+                            else:
+                                st.error("⚠️ Price below SMA 200 (Bearish)")
+            else:
+                st.warning("⚠️ Historical data unavailable for analysis")
+        
+        # TAB 3: NEWS
+        with tab3:
+            st.markdown("### 📰 Latest Market News")
+            
+            if news_error:
+                st.warning(f"⚠️ {news_error}")
+            elif news_items:
+                for i, news in enumerate(news_items, 1):
+                    with st.container():
+                        st.markdown(f"#### {i}. {news.get('headline', 'No headline')}")
+                        
+                        col1, col2 = st.columns([3, 1])
+                        
+                        with col1:
+                            summary = news.get('summary', 'No summary available')
+                            if len(summary) > 200:
+                                summary = summary[:200] + "..."
+                            st.markdown(summary)
+                        
+                        with col2:
+                            news_url = news.get('url', '#')
+                            news_date = datetime.fromtimestamp(news.get('datetime', 0)).strftime('%Y-%m-%d %H:%M')
+                            st.caption(f"📅 {news_date}")
+                            st.link_button("Read More", news_url, use_container_width=True)
+                        
+                        st.markdown("---")
+            else:
+                st.info("📭 No recent news available for this ticker")
 
-elif not calculate_button:
-    st.info("👈 **Complete the form in the sidebar and click Calculate**")
+else:
+    st.info("👈 **Configure your settings and click Analyze**")
     
-    st.markdown("### ⚡ Hybrid Data System")
-    col1, col2 = st.columns(2)
+    st.markdown("### 🚀 Professional Features")
+    col1, col2, col3 = st.columns(3)
     
     with col1:
         st.markdown("""
-        **🔴 Real-Time (Finnhub)**
-        - Current price (5s cache)
-        - Price change & %
-        - Perfect for penny stocks
-        - Fast & accurate
+        **📊 Calculator**
+        - Real-time pricing
+        - Investment breakdown
+        - Risk analysis
+        - Conviction scoring
         """)
     
     with col2:
         st.markdown("""
-        **📊 Historical (Yahoo Finance)**
-        - 5-day charts (1hr cache)
-        - EMA 8 & 20 indicators
-        - RSI & OBV analysis
-        - No rate limit issues
+        **📈 Analysis**
+        - Candlestick charts
+        - EMA 8 & 20
+        - SMA 50 & 200
+        - RSI momentum
         """)
     
-    st.markdown("### 🧮 Features")
-    st.markdown("""
-    - **Live Pricing**: Finnhub API for accurate penny stock prices
-    - **Slippage Calculator**: Adjust for realistic penny stock spreads
-    - **Smart Caching**: 5s for prices, 1hr for charts
-    - **Clean Error Handling**: No blue code errors, only warnings
-    - **4 Decimal Precision**: Perfect for stocks like MKDW
-    """)
-    
-    st.markdown("### 🔑 Setup")
-    st.markdown("""
-    1. Get free API key at [finnhub.io](https://finnhub.io)
-    2. Enter API key in sidebar
-    3. Enter ticker and investment amount
-    4. Adjust stop loss and slippage
-    5. Click Calculate!
-    """)
-
-# Sidebar info
-st.sidebar.markdown("---")
-st.sidebar.info(
-    "**Hybrid System:**\n"
-    "🔴 Finnhub: Real-time (5s)\n"
-    "📊 Yahoo: Historical (1hr)\n\n"
-    "**Why Hybrid?**\n"
-    "- Accurate penny stock prices\n"
-    "- No Yahoo rate limits\n"
-    "- Fast performance\n"
-    "- Professional data\n\n"
-    "Get Finnhub key: finnhub.io"
-)
+    with col3:
+        st.markdown("""
+        **📰 News**
+        - Latest headlines
+        - Article summaries
+        - Direct links
+        - Real-time updates
+        """)
