@@ -3,11 +3,12 @@ import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
 import numpy as np
+import requests
 
 # Page configuration
-st.set_page_config(page_title="Trading Calculator", page_icon="⚡", layout="wide")
+st.set_page_config(page_title="Hybrid Trading Calculator", page_icon="⚡", layout="wide")
 
-# Load thresholds from secrets (with fallback defaults)
+# Load thresholds
 try:
     RSI_STRONG_BUY = st.secrets.get("RSI_STRONG_BUY", 35)
     RSI_BUY_MAX = st.secrets.get("RSI_BUY_MAX", 50)
@@ -19,9 +20,10 @@ except:
     RSI_SELL_MIN = 50
     RSI_STRONG_SELL = 65
 
-st.title("⚡ High-Speed Trading Calculator")
-st.markdown("Instant analysis with automated position sizing and profit calculations")
+st.title("⚡ Hybrid Trading Calculator")
+st.markdown("Real-time prices from Finnhub • Historical charts from Yahoo Finance")
 
+# ============ HELPER FUNCTIONS ============
 def calculate_rsi(data, period=14):
     """Calculate Relative Strength Index (RSI)"""
     delta = data['Close'].diff()
@@ -44,7 +46,7 @@ def calculate_obv(data):
     return obv
 
 def calculate_pivot_points(data, current_price):
-    """Calculate Pivot Point, Support (S1), and Resistance (R1) levels"""
+    """Calculate Pivot Point, Support, and Resistance levels"""
     high = float(data['High'].iloc[-1])
     low = float(data['Low'].iloc[-1])
     close = current_price
@@ -56,11 +58,7 @@ def calculate_pivot_points(data, current_price):
     return pivot, support, resistance
 
 def calculate_probability(data, current_price, target_price):
-    """
-    Calculate probability of hitting target using Z-score
-    Returns: probability percentage (0-100%), z-score, volatility
-    """
-    # Get daily closes for volatility (last 20 days)
+    """Calculate probability using Z-score"""
     daily_data = data['Close'].resample('D').last().dropna()
     
     if len(daily_data) < 20:
@@ -68,19 +66,14 @@ def calculate_probability(data, current_price, target_price):
     else:
         daily_returns = daily_data.tail(20).pct_change().dropna()
     
-    # Calculate daily volatility (standard deviation)
     volatility = daily_returns.std()
-    
-    # Calculate expected return to target
     expected_return = (target_price - current_price) / current_price
     
-    # Calculate Z-score
     if volatility > 0:
         z_score = expected_return / volatility
     else:
         z_score = 0
     
-    # Convert Z-score to probability
     from scipy import stats
     try:
         if z_score > 0:
@@ -95,43 +88,36 @@ def calculate_probability(data, current_price, target_price):
         else:
             probability = 30.0
     
-    # Cap probability at 95% for display purposes
     probability = min(probability, 95.0)
-    
     return probability, z_score, volatility
 
-def calculate_investment_risk(current_price, sell_target, investment_amount, stop_loss_pct=0.05):
-    """
-    Calculate shares, risk, and profit based on total investment
-    """
-    # Calculate shares you can buy with investment
+def calculate_investment_risk(current_price, sell_target, investment_amount, stop_loss_pct, slippage_pct):
+    """Calculate shares, risk, and profit including slippage"""
     shares = investment_amount / current_price if current_price > 0 else 0
+    stop_loss_price = current_price * (1 - stop_loss_pct / 100)
     
-    # Calculate stop loss price (5% below entry)
-    stop_loss_price = current_price * (1 - stop_loss_pct)
-    
-    # Calculate total risk in dollars
     risk_per_share = current_price - stop_loss_price
     total_risk = risk_per_share * shares
-    
-    # Calculate risk as percentage of investment
     risk_percentage = (total_risk / investment_amount * 100) if investment_amount > 0 else 0
     
-    # Expected profit if target hits
+    # Calculate profit with slippage
     profit_per_share = sell_target - current_price
-    expected_profit = profit_per_share * shares
+    gross_profit = profit_per_share * shares
+    slippage_cost = gross_profit * (slippage_pct / 100)
+    net_profit = gross_profit - slippage_cost
     
     return {
         'shares': shares,
         'stop_loss_price': stop_loss_price,
         'total_risk': total_risk,
         'risk_percentage': risk_percentage,
-        'expected_profit': expected_profit,
-        'risk_per_share': risk_per_share
+        'gross_profit': gross_profit,
+        'slippage_cost': slippage_cost,
+        'net_profit': net_profit
     }
 
 def get_verdict(ema_8, ema_20, rsi):
-    """Determine trading verdict based on EMA and RSI"""
+    """Determine trading verdict"""
     ema_bullish = ema_8 > ema_20
     ema_bearish = ema_8 < ema_20
     
@@ -146,40 +132,43 @@ def get_verdict(ema_8, ema_20, rsi):
     else:
         return "⏸️ WAIT", "info"
 
-@st.cache_data(ttl=1200, show_spinner=False)  # Cache for 20 minutes
-def fetch_stock_data(ticker):
-    """
-    Fetch stock data with standard yfinance (no custom session)
-    Cached for 20 minutes to minimize API calls
-    """
+# ============ DATA FETCHING FUNCTIONS ============
+@st.cache_data(ttl=5, show_spinner=False)
+def fetch_finnhub_price(ticker, api_key):
+    """Fetch real-time price from Finnhub (fast, 5-second cache)"""
+    try:
+        url = f"https://finnhub.io/api/v1/quote?symbol={ticker}&token={api_key}"
+        response = requests.get(url, timeout=5)
+        
+        if response.status_code == 200:
+            data = response.json()
+            
+            # Check if data is valid
+            if data.get('c', 0) == 0 and data.get('pc', 0) == 0:
+                return None, None, None, f"Ticker '{ticker}' not found or invalid"
+            
+            current_price = data.get('c')  # Current price
+            change = data.get('d')  # Change
+            percent_change = data.get('dp')  # Percent change
+            
+            return current_price, change, percent_change, None
+        elif response.status_code == 429:
+            return None, None, None, "Finnhub rate limit reached. Please wait a moment."
+        else:
+            return None, None, None, f"Finnhub API error: {response.status_code}"
+    except Exception as e:
+        return None, None, None, f"Error fetching Finnhub data: {str(e)}"
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_yfinance_historical(ticker):
+    """Fetch historical data from yfinance (1-hour cache)"""
     try:
         # Use standard yfinance without custom session
         stock = yf.Ticker(ticker)
-        
-        # STEP 1: Get current price using fast_info (most efficient)
-        real_time_price = None
-        try:
-            real_time_price = stock.fast_info.get('last_price', None)
-        except Exception:
-            pass
-        
-        # Fallback to info if fast_info fails
-        if real_time_price is None:
-            try:
-                info = stock.info
-                real_time_price = info.get('regularMarketPrice', None) or info.get('currentPrice', None)
-            except Exception:
-                pass
-        
-        # STEP 2: Fetch historical data for charts
         data = stock.history(period="5d", interval="15m")
         
         if data.empty:
-            return None, None, "No historical data found for this ticker"
-        
-        # Use latest close as final fallback for current price
-        if real_time_price is None:
-            real_time_price = float(data['Close'].iloc[-1])
+            return None, "No historical data available"
         
         # Calculate indicators
         data['EMA_8'] = data['Close'].ewm(span=8, adjust=False).mean()
@@ -187,31 +176,14 @@ def fetch_stock_data(ticker):
         data['RSI'] = calculate_rsi(data, period=14)
         data['OBV'] = calculate_obv(data)
         
-        return data, real_time_price, None
-        
+        return data, None
     except Exception as e:
-        error_msg = str(e)
-        
-        # Handle rate limit errors
-        if "429" in error_msg or "rate limit" in error_msg.lower() or "too many requests" in error_msg.lower():
-            return None, None, (
-                "⏳ **Yahoo Finance Rate Limit Detected**\n\n"
-                "Please wait 5-10 minutes before trying again.\n\n"
-                "**Tips to avoid rate limits:**\n"
-                "- Data is cached for 20 minutes - avoid rapid refreshes\n"
-                "- Wait a few minutes between different ticker searches\n"
-                "- Try again in 5-10 minutes"
-            )
-        elif "404" in error_msg or "not found" in error_msg.lower():
-            return None, None, f"❌ Ticker '{ticker}' not found. Please verify the symbol."
-        else:
-            return None, None, f"❌ Error: {error_msg}"
+        return None, f"Error fetching historical data: {str(e)}"
 
 def create_candlestick_chart(data, ticker):
-    """Create professional candlestick chart with EMA overlays"""
+    """Create professional candlestick chart"""
     fig = go.Figure()
     
-    # Candlestick
     fig.add_trace(go.Candlestick(
         x=data.index,
         open=data['Open'],
@@ -223,7 +195,6 @@ def create_candlestick_chart(data, ticker):
         decreasing_line_color='#ef5350'
     ))
     
-    # EMA 8 (Yellow) - Fast
     fig.add_trace(go.Scatter(
         x=data.index,
         y=data['EMA_8'],
@@ -231,7 +202,6 @@ def create_candlestick_chart(data, ticker):
         line=dict(color='#FFD700', width=3)
     ))
     
-    # EMA 20 (Blue) - Slow
     fig.add_trace(go.Scatter(
         x=data.index,
         y=data['EMA_20'],
@@ -252,338 +222,355 @@ def create_candlestick_chart(data, ticker):
     
     return fig
 
-# Sidebar with form to prevent auto-execution
-st.sidebar.header("⚙️ Quick Settings")
+# ============ SIDEBAR WITH FORM ============
+st.sidebar.header("⚙️ Calculation Settings")
 
-# Form ensures API is only called when Calculate button is clicked
-with st.sidebar.form("trading_form", clear_on_submit=False):
+with st.sidebar.form("calculation_form", clear_on_submit=False):
+    st.markdown("### API Configuration")
+    
+    # Try to load from secrets first, then allow manual input
+    default_api_key = ""
+    try:
+        default_api_key = st.secrets.get("FINNHUB_API_KEY", "")
+    except:
+        pass
+    
+    finnhub_api_key = st.text_input(
+        "Finnhub API Key",
+        value=default_api_key,
+        type="password",
+        help="Get free key at finnhub.io or store in .streamlit/secrets.toml",
+        key="api_key_input"
+    )
+    
     st.markdown("### Stock Symbol")
     ticker = st.text_input(
         "Ticker",
         value="NVDA",
-        help="Examples: AAPL, TSLA, MSFT, MKDW, BTC-USD",
-        placeholder="Enter ticker...",
+        help="Examples: AAPL, TSLA, MSFT, MKDW",
         key="ticker_input"
     )
     
-    st.markdown("### Investment Amount")
+    st.markdown("### Investment Parameters")
     investment_amount = st.number_input(
         "💵 Total Investment ($)",
         min_value=1.0,
         value=100.0,
         step=10.0,
-        help="Total dollars you want to invest in this position",
         key="investment_input"
     )
     
-    # Submit button - API only called when this is clicked
-    submit_button = st.form_submit_button(
+    stop_loss_pct = st.number_input(
+        "🛡️ Stop Loss (%)",
+        min_value=1.0,
+        max_value=20.0,
+        value=5.0,
+        step=0.5,
+        key="stop_loss_input"
+    )
+    
+    slippage_pct = st.slider(
+        "📉 Slippage (%)",
+        min_value=0.0,
+        max_value=10.0,
+        value=2.0,
+        step=0.5,
+        help="Expected price slippage for penny stocks",
+        key="slippage_input"
+    )
+    
+    calculate_button = st.form_submit_button(
         "⚡ Calculate", 
         use_container_width=True, 
         type="primary"
     )
     
-    st.caption("💡 Data cached for 20 minutes | Click Calculate to fetch data")
+    st.caption("Real-time: 5s cache | Historical: 1hr cache")
 
-# Main content
-if submit_button and ticker:
-    # Show custom spinner while fetching (since cache has show_spinner=False)
-    with st.spinner(f"⚡ Fetching data for {ticker.upper()}..."):
-        data, real_time_price, error = fetch_stock_data(ticker.upper())
-    
-    if error:
-        # Display enhanced error messages
-        if "Rate Limit" in error:
-            st.error(error)
-            st.warning("⏰ **What to do now:**\n"
-                      "1. Wait 5-10 minutes\n"
-                      "2. Close other Yahoo Finance tabs\n"
-                      "3. Try again with a different ticker")
-        else:
-            st.error(error)
-    elif data is not None:
-        # Use real-time price with 4 decimal precision
-        current_price = float(real_time_price)
+# ============ MAIN CONTENT ============
+if calculate_button and ticker:
+    if not finnhub_api_key:
+        st.warning("⚠️ Please enter your Finnhub API Key in the sidebar")
+    else:
+        # Fetch real-time price from Finnhub
+        with st.spinner(f"⚡ Fetching real-time data for {ticker.upper()}..."):
+            current_price, change, percent_change, price_error = fetch_finnhub_price(ticker.upper(), finnhub_api_key)
         
-        # Extract latest indicator values
-        ema_8_latest = float(data['EMA_8'].iloc[-1])
-        ema_20_latest = float(data['EMA_20'].iloc[-1])
-        rsi_latest = float(data['RSI'].iloc[-1])
-        
-        # Calculate pivot points
-        pivot, support, resistance = calculate_pivot_points(data, current_price)
-        
-        # Calculate probability for sell target
-        probability, z_score, volatility = calculate_probability(data, current_price, resistance)
-        
-        # Calculate investment risk and profit
-        calc = calculate_investment_risk(current_price, resistance, investment_amount)
-        
-        # Get trading verdict
-        verdict, verdict_type = get_verdict(ema_8_latest, ema_20_latest, rsi_latest)
-        
-        # ============ BIG VERDICT BOX AT TOP ============
-        st.markdown("## 🎯 TRADING SIGNAL")
-        if verdict_type == "success":
-            st.success(f"# {verdict}")
-        elif verdict_type == "error":
-            st.error(f"# {verdict}")
-        else:
-            st.info(f"# {verdict}")
-        
-        st.markdown("---")
-        
-        # ============ PRICE LEVELS (4 DECIMAL PRECISION) ============
-        st.markdown("### 💰 Price Levels")
-        st.caption("🔴 LIVE - Real-time with 4 decimal precision (perfect for MKDW)")
-        
-        col_price1, col_price2, col_price3 = st.columns(3)
-        
-        with col_price1:
-            st.metric(
-                label="🎯 Buy Target (S1)",
-                value=f"${support:.4f}",
-                delta=f"{((support - current_price) / current_price * 100):.2f}%"
-            )
-        
-        with col_price2:
-            st.metric(
-                label="📍 Current Price",
-                value=f"${current_price:.4f}"
-            )
-        
-        with col_price3:
-            st.metric(
-                label="🚪 Sell Target (R1)",
-                value=f"${resistance:.4f}",
-                delta=f"{((resistance - current_price) / current_price * 100):.2f}%"
-            )
-        
-        st.markdown("---")
-        
-        # ============ CONVICTION METER ============
-        st.markdown("### 🎲 Conviction Score (Probability Gauge)")
-        st.caption("Z-Score probability of hitting the Sell Target")
-        
-        col_conv1, col_conv2, col_conv3 = st.columns(3)
-        
-        with col_conv1:
-            # Visual gauge with larger display
-            if probability >= 70:
-                st.success(f"# {probability:.1f}%")
-                st.markdown("### 🟢 High Conviction")
-            elif probability >= 50:
-                st.warning(f"# {probability:.1f}%")
-                st.markdown("### 🟡 Medium Conviction")
+        if price_error:
+            st.warning(f"⚠️ {price_error}")
+            st.info("💡 **Troubleshooting:**\n"
+                   "- Verify your Finnhub API key is correct\n"
+                   "- Check ticker symbol (use US market symbols)\n"
+                   "- Try again in a moment if rate limited")
+        elif current_price:
+            # Fetch historical data from yfinance
+            with st.spinner("📊 Loading historical data..."):
+                hist_data, hist_error = fetch_yfinance_historical(ticker.upper())
+            
+            if hist_error:
+                st.warning(f"⚠️ Historical data: {hist_error}")
+                st.info("Charts will be unavailable, but calculations will proceed with live price")
+            
+            # ============ DISPLAY RESULTS ============
+            
+            # Current Price Display (Clean Metrics)
+            st.markdown("### 💰 Real-Time Price")
+            col_price1, col_price2, col_price3 = st.columns(3)
+            
+            with col_price1:
+                st.metric(
+                    label=f"{ticker.upper()} Current Price",
+                    value=f"${current_price:.4f}"
+                )
+            
+            with col_price2:
+                st.metric(
+                    label="Price Change",
+                    value=f"${change:.4f}" if change else "N/A",
+                    delta=f"{percent_change:.2f}%" if percent_change else None
+                )
+            
+            with col_price3:
+                st.metric(
+                    label="Data Source",
+                    value="Finnhub (Live)"
+                )
+            
+            st.markdown("---")
+            
+            # Calculate metrics if we have historical data
+            if hist_data is not None:
+                ema_8_latest = float(hist_data['EMA_8'].iloc[-1])
+                ema_20_latest = float(hist_data['EMA_20'].iloc[-1])
+                rsi_latest = float(hist_data['RSI'].iloc[-1])
+                
+                pivot, support, resistance = calculate_pivot_points(hist_data, current_price)
+                probability, z_score, volatility = calculate_probability(hist_data, current_price, resistance)
+                
+                # Calculate investment with slippage
+                calc = calculate_investment_risk(
+                    current_price, resistance, investment_amount, stop_loss_pct, slippage_pct
+                )
+                
+                verdict, verdict_type = get_verdict(ema_8_latest, ema_20_latest, rsi_latest)
+                
+                # VERDICT BOX
+                st.markdown("## 🎯 TRADING SIGNAL")
+                if verdict_type == "success":
+                    st.success(f"# {verdict}")
+                elif verdict_type == "error":
+                    st.error(f"# {verdict}")
+                else:
+                    st.info(f"# {verdict}")
+                
+                st.markdown("---")
+                
+                # PRICE TARGETS
+                st.markdown("### 🎯 Price Targets")
+                col_target1, col_target2, col_target3 = st.columns(3)
+                
+                with col_target1:
+                    st.metric(
+                        "🎯 Buy Target (S1)",
+                        f"${support:.4f}",
+                        delta=f"{((support - current_price) / current_price * 100):.2f}%"
+                    )
+                
+                with col_target2:
+                    st.metric(
+                        "📍 Current Price",
+                        f"${current_price:.4f}"
+                    )
+                
+                with col_target3:
+                    st.metric(
+                        "🚪 Sell Target (R1)",
+                        f"${resistance:.4f}",
+                        delta=f"{((resistance - current_price) / current_price * 100):.2f}%"
+                    )
+                
+                st.markdown("---")
+                
+                # CONVICTION SCORE
+                st.markdown("### 🎲 Conviction Score")
+                col_conv1, col_conv2, col_conv3 = st.columns(3)
+                
+                with col_conv1:
+                    if probability >= 70:
+                        st.success(f"# {probability:.1f}%")
+                        st.markdown("### 🟢 High Conviction")
+                    elif probability >= 50:
+                        st.warning(f"# {probability:.1f}%")
+                        st.markdown("### 🟡 Medium Conviction")
+                    else:
+                        st.error(f"# {probability:.1f}%")
+                        st.markdown("### 🔴 Low Conviction")
+                
+                with col_conv2:
+                    st.metric("Z-Score", f"{z_score:.2f}σ")
+                    st.caption("Standard deviations to target")
+                
+                with col_conv3:
+                    st.metric("Daily Volatility", f"{volatility*100:.2f}%")
+                    st.caption("20-day standard deviation")
+                
+                st.markdown("---")
+                
+                # INVESTMENT BREAKDOWN
+                st.markdown("### 🧮 Investment Breakdown")
+                st.caption(f"Based on Finnhub live price: ${current_price:.4f} | Stop Loss: {stop_loss_pct}% | Slippage: {slippage_pct}%")
+                
+                col_calc1, col_calc2, col_calc3, col_calc4 = st.columns(4)
+                
+                with col_calc1:
+                    st.metric(
+                        "📦 Shares",
+                        f"{calc['shares']:.2f}"
+                    )
+                    st.caption(f"@ ${current_price:.4f}/share")
+                
+                with col_calc2:
+                    if calc['risk_percentage'] <= 5:
+                        st.success(f"## {calc['risk_percentage']:.1f}%")
+                    elif calc['risk_percentage'] <= 10:
+                        st.warning(f"## {calc['risk_percentage']:.1f}%")
+                    else:
+                        st.error(f"## {calc['risk_percentage']:.1f}%")
+                    st.markdown("**Risk %**")
+                    st.caption(f"${calc['total_risk']:.2f} at risk")
+                
+                with col_calc3:
+                    st.metric(
+                        "💰 Net Profit",
+                        f"${calc['net_profit']:.2f}"
+                    )
+                    st.caption(f"Gross: ${calc['gross_profit']:.2f}")
+                    st.caption(f"Slippage: -${calc['slippage_cost']:.2f}")
+                
+                with col_calc4:
+                    rr_ratio = calc['net_profit'] / calc['total_risk'] if calc['total_risk'] > 0 else 0
+                    if rr_ratio >= 2:
+                        st.success(f"**{rr_ratio:.2f}:1**")
+                        st.caption("✅ Good R/R")
+                    elif rr_ratio >= 1:
+                        st.warning(f"**{rr_ratio:.2f}:1**")
+                        st.caption("⚠️ Fair R/R")
+                    else:
+                        st.error(f"**{rr_ratio:.2f}:1**")
+                        st.caption("❌ Poor R/R")
+                
+                st.info(f"💡 Net profit includes {slippage_pct}% slippage cost. Adjust slider for penny stock volatility.")
+                
+                st.markdown("---")
+                
+                # TECHNICAL INDICATORS
+                st.markdown("### 📊 Technical Indicators")
+                col_ind1, col_ind2, col_ind3, col_ind4 = st.columns(4)
+                
+                with col_ind1:
+                    st.metric("EMA 8", f"${ema_8_latest:.4f}")
+                with col_ind2:
+                    st.metric("EMA 20", f"${ema_20_latest:.4f}")
+                with col_ind3:
+                    st.metric("RSI (14)", f"{rsi_latest:.2f}")
+                with col_ind4:
+                    obv_recent = hist_data['OBV'].iloc[-20:]
+                    volume_trend = "📈 Bullish" if obv_recent.iloc[-1] > obv_recent.iloc[0] else "📉 Bearish"
+                    st.metric("Volume", volume_trend)
+                
+                st.markdown("---")
+                
+                # CANDLESTICK CHART
+                st.markdown("### 📈 Historical Chart (Yahoo Finance)")
+                fig = create_candlestick_chart(hist_data, ticker)
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # ADDITIONAL CHARTS
+                col_chart1, col_chart2 = st.columns(2)
+                
+                with col_chart1:
+                    st.markdown("#### RSI Momentum")
+                    chart_rsi = pd.DataFrame({'RSI': hist_data['RSI']})
+                    st.line_chart(chart_rsi)
+                
+                with col_chart2:
+                    st.markdown("#### Volume (OBV)")
+                    chart_obv = pd.DataFrame({'OBV': hist_data['OBV']})
+                    st.line_chart(chart_obv)
+                
+                st.success(f"✅ Live price: ${current_price:.4f} (Finnhub) | Charts: Yahoo Finance (1hr cache)")
             else:
-                st.error(f"# {probability:.1f}%")
-                st.markdown("### 🔴 Low Conviction")
-            st.caption("Probability of hitting target")
-        
-        with col_conv2:
-            st.metric("Z-Score", f"{z_score:.2f}σ")
-            st.caption("Standard deviations to target")
-            if abs(z_score) < 1:
-                st.info("Within 1σ - High probability")
-            elif abs(z_score) < 2:
-                st.info("Within 2σ - Medium probability")
-            else:
-                st.info("Beyond 2σ - Low probability")
-        
-        with col_conv3:
-            st.metric("Daily Volatility", f"{volatility*100:.2f}%")
-            st.caption("20-day standard deviation")
-        
-        st.caption("💡 High Conviction = Target within 1σ (68% probability) | Medium = within 2σ (47%) | Low = beyond 2σ")
-        
-        st.markdown("---")
-        
-        # ============ AUTO-CALCULATED POSITION ============
-        st.markdown("### 🧮 Investment Breakdown")
-        st.caption(f"Total Investment: ${investment_amount:.2f} | Stop Loss: 5% below entry (${calc['stop_loss_price']:.4f})")
-        
-        col_calc1, col_calc2, col_calc3, col_calc4 = st.columns(4)
-        
-        with col_calc1:
-            st.metric(
-                "📦 Shares to Buy",
-                f"{calc['shares']:.2f}",
-                help="Shares you can buy with your investment"
-            )
-            st.caption(f"@ ${current_price:.4f}/share")
-        
-        with col_calc2:
-            # THE RISK THING - Show risk clearly
-            if calc['risk_percentage'] <= 5:
-                st.success(f"## {calc['risk_percentage']:.1f}%")
-            elif calc['risk_percentage'] <= 10:
-                st.warning(f"## {calc['risk_percentage']:.1f}%")
-            else:
-                st.error(f"## {calc['risk_percentage']:.1f}%")
-            st.markdown("**Risk Percentage**")
-            st.caption(f"${calc['total_risk']:.2f} at risk")
-        
-        with col_calc3:
-            st.metric(
-                "💰 Expected Profit",
-                f"${calc['expected_profit']:.2f}",
-                help="Profit if sell target hits"
-            )
-            gain_pct = (calc['expected_profit'] / investment_amount * 100) if investment_amount > 0 else 0
-            st.caption(f"+{gain_pct:.1f}% gain")
-        
-        with col_calc4:
-            rr_ratio = calc['expected_profit'] / calc['total_risk'] if calc['total_risk'] > 0 else 0
-            if rr_ratio >= 2:
-                st.success(f"**{rr_ratio:.2f}:1**")
-                st.caption("✅ Good R/R")
-            elif rr_ratio >= 1:
-                st.warning(f"**{rr_ratio:.2f}:1**")
-                st.caption("⚠️ Fair R/R")
-            else:
-                st.error(f"**{rr_ratio:.2f}:1**")
-                st.caption("❌ Poor R/R")
-        
-        # Risk explanation box
-        st.info(f"💡 **What this means:** If you invest ${investment_amount:.2f} and the price drops 5% to your stop loss (${calc['stop_loss_price']:.4f}), you'll lose ${calc['total_risk']:.2f} which is {calc['risk_percentage']:.1f}% of your investment.")
-        
-        st.markdown("---")
-        
-        # ============ TECHNICAL INDICATORS ============
-        st.markdown("### 📊 Technical Indicators")
-        
-        col_ind1, col_ind2, col_ind3, col_ind4 = st.columns(4)
-        
-        with col_ind1:
-            st.metric("EMA 8 (Fast)", f"${ema_8_latest:.4f}")
-        with col_ind2:
-            st.metric("EMA 20 (Slow)", f"${ema_20_latest:.4f}")
-        with col_ind3:
-            st.metric("RSI (14)", f"{rsi_latest:.2f}")
-        with col_ind4:
-            obv_recent = data['OBV'].iloc[-20:]
-            volume_trend = "📈 Bullish" if obv_recent.iloc[-1] > obv_recent.iloc[0] else "📉 Bearish"
-            st.metric("Volume (OBV)", volume_trend)
-        
-        st.markdown("---")
-        
-        # ============ CANDLESTICK CHART WITH EMA OVERLAYS ============
-        st.markdown("### 📈 Professional Chart")
-        st.caption("Candlestick with EMA 8 (Yellow) and EMA 20 (Blue)")
-        
-        fig = create_candlestick_chart(data, ticker)
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # ============ ADDITIONAL CHARTS ============
-        col_chart1, col_chart2 = st.columns(2)
-        
-        with col_chart1:
-            st.markdown("#### 📉 RSI Momentum")
-            chart_rsi = pd.DataFrame({'RSI': data['RSI']})
-            st.line_chart(chart_rsi)
-            st.caption("Overbought >70 | Oversold <30")
-        
-        with col_chart2:
-            st.markdown("#### 📊 Volume (OBV)")
-            chart_obv = pd.DataFrame({'OBV': data['OBV']})
-            st.line_chart(chart_obv)
-            st.caption("Rising = Bullish | Falling = Bearish")
-        
-        st.success(f"⚡ Analysis complete • Live: ${current_price:.4f} • Cached for 20 min")
+                # No historical data, but we have live price
+                st.markdown("### 🧮 Basic Calculation (No Historical Data)")
+                
+                # Simple calculation without targets
+                shares = investment_amount / current_price if current_price > 0 else 0
+                stop_loss_price = current_price * (1 - stop_loss_pct / 100)
+                total_risk = (current_price - stop_loss_price) * shares
+                risk_pct = (total_risk / investment_amount * 100) if investment_amount > 0 else 0
+                
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    st.metric("📦 Shares", f"{shares:.2f}")
+                with col2:
+                    st.metric("🛡️ Risk", f"${total_risk:.2f}")
+                    st.caption(f"{risk_pct:.1f}%")
+                with col3:
+                    st.metric("Stop Loss", f"${stop_loss_price:.4f}")
 
-elif not submit_button:
-    # Welcome screen
-    st.info("👈 **Enter ticker and investment amount, then click Calculate button**")
+elif not calculate_button:
+    st.info("👈 **Complete the form in the sidebar and click Calculate**")
     
-    st.success("🚀 **Button-Controlled Execution** - API only called when you click Calculate (prevents auto-execution and rate limits)")
+    st.markdown("### ⚡ Hybrid Data System")
+    col1, col2 = st.columns(2)
     
-    st.markdown("### ⚡ High-Speed Features")
-    
-    col_feat1, col_feat2 = st.columns(2)
-    
-    with col_feat1:
+    with col1:
         st.markdown("""
-        **📊 Instant Analysis**
-        - Real-time prices (4 decimals)
-        - EMA 8 & 20 trend signals
-        - RSI momentum indicator
-        - OBV volume confirmation
-        - Pivot point targets
+        **🔴 Real-Time (Finnhub)**
+        - Current price (5s cache)
+        - Price change & %
+        - Perfect for penny stocks
+        - Fast & accurate
         """)
     
-    with col_feat2:
+    with col2:
         st.markdown("""
-        **🧮 Investment Calculator**
-        - Enter total investment amount
-        - Get shares to buy
-        - See your total risk ($)
-        - Risk as % of investment
-        - Expected profit calculation
-        
-        **⚡ Performance**
-        - 20-minute caching
-        - Button-based execution
-        - No auto-refresh
-        - Standard yfinance API
+        **📊 Historical (Yahoo Finance)**
+        - 5-day charts (1hr cache)
+        - EMA 8 & 20 indicators
+        - RSI & OBV analysis
+        - No rate limit issues
         """)
     
-    st.markdown("### 🎲 Conviction Score")
+    st.markdown("### 🧮 Features")
     st.markdown("""
-    Z-Score probability of hitting Sell Target:
-    - **🟢 High**: ≥70% (target within 1 standard deviation)
-    - **🟡 Medium**: 50-69% (target within 2 standard deviations)
-    - **🔴 Low**: <50% (target beyond 2 standard deviations)
-    
-    The Conviction Score shows how likely the stock is to reach your sell target based on historical volatility.
+    - **Live Pricing**: Finnhub API for accurate penny stock prices
+    - **Slippage Calculator**: Adjust for realistic penny stock spreads
+    - **Smart Caching**: 5s for prices, 1hr for charts
+    - **Clean Error Handling**: No blue code errors, only warnings
+    - **4 Decimal Precision**: Perfect for stocks like MKDW
     """)
     
-    st.markdown("### 💰 How Investment Risk Works")
+    st.markdown("### 🔑 Setup")
     st.markdown("""
-    **Example:** You invest $100 in MKDW at $0.2680
-    
-    1. **Shares**: $100 / $0.2680 = 373 shares
-    2. **Stop Loss**: 5% below entry = $0.2546
-    3. **Risk per share**: $0.2680 - $0.2546 = $0.0134
-    4. **Total Risk**: $0.0134 × 373 = $5.00
-    5. **Risk %**: $5.00 / $100 = **5.0%** of your investment
-    
-    This means if the price drops 5% and hits your stop loss, you lose $5 (5% of your $100 investment).
-    """)
-    
-    st.markdown("### 📱 Trading Signals")
-    st.markdown("""
-    - **🚀 STRONG BUY**: EMA bullish + RSI < 35
-    - **✅ BUY**: EMA bullish + RSI 35-50
-    - **⚠️ SELL**: EMA bearish + RSI 50-65
-    - **🔻 STRONG SELL**: EMA bearish + RSI > 65
-    - **⏸️ WAIT**: All other conditions
+    1. Get free API key at [finnhub.io](https://finnhub.io)
+    2. Enter API key in sidebar
+    3. Enter ticker and investment amount
+    4. Adjust stop loss and slippage
+    5. Click Calculate!
     """)
 
-# Sidebar footer
+# Sidebar info
 st.sidebar.markdown("---")
-st.sidebar.markdown("### 📚 Quick Guide")
 st.sidebar.info(
-    "**How It Works:**\n"
-    "1. Enter ticker symbol\n"
-    "2. Set total investment\n"
-    "3. Click Calculate button\n"
-    "4. See your risk & profit!\n\n"
-    "**Indicators:**\n"
-    "- EMA 8/20: Trend direction\n"
-    "- RSI: Momentum strength\n"
-    "- Z-Score: Target probability\n"
-    "- OBV: Volume confirmation\n\n"
-    "**Investment Logic:**\n"
-    "- Shares = Investment / Price\n"
-    "- Risk = (Price - Stop) × Shares\n"
-    "- Risk % = Risk / Investment\n"
-    "- Stop Loss: 5% below entry\n\n"
-    "**Performance:**\n"
-    "✅ 20-minute smart caching\n"
-    "✅ Button-based execution\n"
-    "✅ Standard yfinance API\n\n"
-    "Data: Yahoo Finance"
+    "**Hybrid System:**\n"
+    "🔴 Finnhub: Real-time (5s)\n"
+    "📊 Yahoo: Historical (1hr)\n\n"
+    "**Why Hybrid?**\n"
+    "- Accurate penny stock prices\n"
+    "- No Yahoo rate limits\n"
+    "- Fast performance\n"
+    "- Professional data\n\n"
+    "Get Finnhub key: finnhub.io"
 )
-
-st.sidebar.markdown("---")
-st.sidebar.success("🚀 Ready to Calculate!")
