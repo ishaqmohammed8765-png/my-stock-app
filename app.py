@@ -1,212 +1,449 @@
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 from datetime import datetime, timedelta
 import yfinance as yf
 import pandas as pd
 from scipy.stats import norm
 import numpy as np
+import threading
 
 class StockCalculatorPro:
     def __init__(self, root):
         self.root = root
         self.root.title("Stock Calculator Pro")
-        self.root.geometry("900x700")
-        self.root.resizable(True, True)
-        
-        # Configure style
-        self.style = ttk.Style()
-        self.style.theme_use('clam')
+        self.root.geometry("950x750")
         
         # Storage for current stock data
         self.current_ticker = None
         self.current_price = None
         self.volatility = None
+        self.stock_data = {}
         
+        # Configure style
+        try:
+            self.style = ttk.Style()
+            self.style.theme_use('clam')
+        except:
+            pass  # Use default if clam not available
+        
+        # Initialize UI immediately
         self.setup_ui()
+        
+        # Focus on ticker entry
+        self.stock_ticker_entry.focus_set()
     
     def setup_ui(self):
         """Create the complete user interface"""
-        # Main container
-        main_frame = ttk.Frame(self.root, padding="10")
-        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        # Main container with padding
+        main_frame = tk.Frame(self.root, bg='#f5f6fa')
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         
-        # Configure grid weights
-        self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(0, weight=1)
-        main_frame.columnconfigure(1, weight=1)
+        # ============ TITLE ============
+        title_frame = tk.Frame(main_frame, bg='#2c3e50', relief=tk.RAISED, borderwidth=2)
+        title_frame.pack(fill=tk.X, pady=(0, 15))
         
-        # Title
         title_label = tk.Label(
-            main_frame,
+            title_frame,
             text="📈 Stock Calculator Pro",
-            font=("Arial", 24, "bold"),
-            fg="#2c3e50"
+            font=("Arial", 26, "bold"),
+            fg="white",
+            bg='#2c3e50',
+            pady=15
         )
-        title_label.grid(row=0, column=0, columnspan=3, pady=(0, 20))
+        title_label.pack()
+        
+        subtitle_label = tk.Label(
+            title_frame,
+            text="Advanced Trading Analysis with Log-Normal Probability Models",
+            font=("Arial", 10),
+            fg="#ecf0f1",
+            bg='#2c3e50',
+            pady=(0, 10)
+        )
+        subtitle_label.pack()
         
         # ============ INPUT SECTION ============
-        input_frame = ttk.LabelFrame(main_frame, text="Stock Lookup", padding="15")
-        input_frame.grid(row=1, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(0, 10))
-        input_frame.columnconfigure(1, weight=1)
-        
-        # Stock Ticker
-        ttk.Label(input_frame, text="Stock Ticker:", font=("Arial", 10, "bold")).grid(
-            row=0, column=0, sticky=tk.W, padx=(0, 10), pady=5
+        input_frame = tk.LabelFrame(
+            main_frame,
+            text=" 🔍 Stock Lookup ",
+            font=("Arial", 11, "bold"),
+            bg='#f5f6fa',
+            fg='#2c3e50',
+            relief=tk.GROOVE,
+            borderwidth=2,
+            padx=20,
+            pady=15
         )
-        self.stock_ticker_entry = ttk.Entry(input_frame, font=("Arial", 11))
-        self.stock_ticker_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), pady=5)
+        input_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        # Ticker input row
+        ticker_frame = tk.Frame(input_frame, bg='#f5f6fa')
+        ticker_frame.pack(fill=tk.X, pady=5)
+        
+        tk.Label(
+            ticker_frame,
+            text="Stock Ticker:",
+            font=("Arial", 11, "bold"),
+            bg='#f5f6fa',
+            fg='#34495e'
+        ).pack(side=tk.LEFT, padx=(0, 10))
+        
+        self.stock_ticker_entry = tk.Entry(
+            ticker_frame,
+            font=("Arial", 13),
+            width=15,
+            relief=tk.SOLID,
+            borderwidth=1
+        )
+        self.stock_ticker_entry.pack(side=tk.LEFT, padx=(0, 10))
         self.stock_ticker_entry.bind('<Return>', lambda e: self.lookup_stock_price())
         
-        # Lookup Button
-        lookup_btn = ttk.Button(
-            input_frame,
-            text="🔍 Lookup Price",
-            command=self.lookup_stock_price
+        lookup_btn = tk.Button(
+            ticker_frame,
+            text="🔍 Lookup Stock",
+            command=self.lookup_stock_price,
+            font=("Arial", 11, "bold"),
+            bg='#3498db',
+            fg='white',
+            activebackground='#2980b9',
+            activeforeground='white',
+            relief=tk.RAISED,
+            borderwidth=2,
+            padx=20,
+            pady=5,
+            cursor='hand2'
         )
-        lookup_btn.grid(row=0, column=2, padx=(10, 0), pady=5)
+        lookup_btn.pack(side=tk.LEFT, padx=5)
         
-        # ============ RESULTS SECTION ============
-        results_frame = ttk.LabelFrame(main_frame, text="Stock Information", padding="15")
-        results_frame.grid(row=2, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(0, 10))
-        results_frame.columnconfigure(1, weight=1)
+        # Status indicator
+        self.status_label = tk.Label(
+            ticker_frame,
+            text="",
+            font=("Arial", 9),
+            bg='#f5f6fa',
+            fg='#7f8c8d'
+        )
+        self.status_label.pack(side=tk.LEFT, padx=10)
+        
+        # ============ STOCK INFO SECTION ============
+        info_frame = tk.LabelFrame(
+            main_frame,
+            text=" 📊 Stock Information ",
+            font=("Arial", 11, "bold"),
+            bg='#f5f6fa',
+            fg='#2c3e50',
+            relief=tk.GROOVE,
+            borderwidth=2,
+            padx=20,
+            pady=15
+        )
+        info_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        # Create grid for info display
+        info_grid = tk.Frame(info_frame, bg='#f5f6fa')
+        info_grid.pack(fill=tk.X)
         
         # Current Price
-        ttk.Label(results_frame, text="Current Price:", font=("Arial", 10)).grid(
-            row=0, column=0, sticky=tk.W, pady=5
-        )
+        price_frame = tk.Frame(info_grid, bg='#ecf0f1', relief=tk.RAISED, borderwidth=1)
+        price_frame.grid(row=0, column=0, sticky='ew', padx=5, pady=5)
+        info_grid.columnconfigure(0, weight=1)
+        
+        tk.Label(
+            price_frame,
+            text="Current Price",
+            font=("Arial", 9),
+            bg='#ecf0f1',
+            fg='#7f8c8d'
+        ).pack(pady=(5, 0))
+        
         self.current_price_label = tk.Label(
-            results_frame,
+            price_frame,
             text="--",
-            font=("Arial", 14, "bold"),
-            fg="#27ae60"
+            font=("Arial", 20, "bold"),
+            bg='#ecf0f1',
+            fg='#27ae60'
         )
-        self.current_price_label.grid(row=0, column=1, sticky=tk.W, pady=5)
+        self.current_price_label.pack(pady=(0, 5))
         
         # Volatility
-        ttk.Label(results_frame, text="Annualized Volatility:", font=("Arial", 10)).grid(
-            row=1, column=0, sticky=tk.W, pady=5
-        )
+        vol_frame = tk.Frame(info_grid, bg='#ecf0f1', relief=tk.RAISED, borderwidth=1)
+        vol_frame.grid(row=0, column=1, sticky='ew', padx=5, pady=5)
+        info_grid.columnconfigure(1, weight=1)
+        
+        tk.Label(
+            vol_frame,
+            text="Ann. Volatility (σ)",
+            font=("Arial", 9),
+            bg='#ecf0f1',
+            fg='#7f8c8d'
+        ).pack(pady=(5, 0))
+        
         self.volatility_label = tk.Label(
-            results_frame,
+            vol_frame,
             text="--",
-            font=("Arial", 12)
+            font=("Arial", 16, "bold"),
+            bg='#ecf0f1',
+            fg='#e67e22'
         )
-        self.volatility_label.grid(row=1, column=1, sticky=tk.W, pady=5)
+        self.volatility_label.pack(pady=(0, 5))
         
         # Buy Probability
-        ttk.Label(results_frame, text="Probability (Reach Buy):", font=("Arial", 10)).grid(
-            row=2, column=0, sticky=tk.W, pady=5
-        )
+        buy_prob_frame = tk.Frame(info_grid, bg='#ecf0f1', relief=tk.RAISED, borderwidth=1)
+        buy_prob_frame.grid(row=1, column=0, sticky='ew', padx=5, pady=5)
+        
+        tk.Label(
+            buy_prob_frame,
+            text="Buy Target Probability",
+            font=("Arial", 9),
+            bg='#ecf0f1',
+            fg='#7f8c8d'
+        ).pack(pady=(5, 0))
+        
         self.buy_prob_label = tk.Label(
-            results_frame,
+            buy_prob_frame,
             text="--",
-            font=("Arial", 12),
-            fg="#3498db"
+            font=("Arial", 16, "bold"),
+            bg='#ecf0f1',
+            fg='#3498db'
         )
-        self.buy_prob_label.grid(row=2, column=1, sticky=tk.W, pady=5)
+        self.buy_prob_label.pack(pady=(0, 5))
         
         # Sell Probability
-        ttk.Label(results_frame, text="Probability (Reach Sell):", font=("Arial", 10)).grid(
-            row=3, column=0, sticky=tk.W, pady=5
-        )
+        sell_prob_frame = tk.Frame(info_grid, bg='#ecf0f1', relief=tk.RAISED, borderwidth=1)
+        sell_prob_frame.grid(row=1, column=1, sticky='ew', padx=5, pady=5)
+        
+        tk.Label(
+            sell_prob_frame,
+            text="Sell Target Probability",
+            font=("Arial", 9),
+            bg='#ecf0f1',
+            fg='#7f8c8d'
+        ).pack(pady=(5, 0))
+        
         self.sell_prob_label = tk.Label(
-            results_frame,
+            sell_prob_frame,
             text="--",
+            font=("Arial", 16, "bold"),
+            bg='#ecf0f1',
+            fg='#e74c3c'
+        )
+        self.sell_prob_label.pack(pady=(0, 5))
+        
+        # ============ TRADING CALCULATOR ============
+        trading_frame = tk.LabelFrame(
+            main_frame,
+            text=" 💰 Trading Calculator ",
+            font=("Arial", 11, "bold"),
+            bg='#f5f6fa',
+            fg='#2c3e50',
+            relief=tk.GROOVE,
+            borderwidth=2,
+            padx=20,
+            pady=15
+        )
+        trading_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        # Input grid
+        inputs_grid = tk.Frame(trading_frame, bg='#f5f6fa')
+        inputs_grid.pack(fill=tk.X, pady=5)
+        
+        # Row 1: Buy and Sell Price
+        tk.Label(
+            inputs_grid,
+            text="Buy Price ($):",
+            font=("Arial", 10, "bold"),
+            bg='#f5f6fa',
+            fg='#34495e'
+        ).grid(row=0, column=0, sticky='w', pady=5)
+        
+        self.buy_price_entry = tk.Entry(
+            inputs_grid,
             font=("Arial", 12),
-            fg="#e74c3c"
+            width=15,
+            relief=tk.SOLID,
+            borderwidth=1
         )
-        self.sell_prob_label.grid(row=3, column=1, sticky=tk.W, pady=5)
+        self.buy_price_entry.grid(row=0, column=1, sticky='ew', padx=10, pady=5)
+        self.buy_price_entry.bind('<KeyRelease>', lambda e: self.update_probabilities())
         
-        # ============ TRADING SECTION ============
-        trading_frame = ttk.LabelFrame(main_frame, text="Trading Calculator", padding="15")
-        trading_frame.grid(row=3, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(0, 10))
-        trading_frame.columnconfigure(1, weight=1)
-        trading_frame.columnconfigure(3, weight=1)
+        tk.Label(
+            inputs_grid,
+            text="Sell Price ($):",
+            font=("Arial", 10, "bold"),
+            bg='#f5f6fa',
+            fg='#34495e'
+        ).grid(row=0, column=2, sticky='w', padx=(20, 0), pady=5)
         
-        # Buy Price
-        ttk.Label(trading_frame, text="Buy Price ($):", font=("Arial", 10)).grid(
-            row=0, column=0, sticky=tk.W, padx=(0, 10), pady=5
+        self.sell_price_entry = tk.Entry(
+            inputs_grid,
+            font=("Arial", 12),
+            width=15,
+            relief=tk.SOLID,
+            borderwidth=1
         )
-        self.buy_price_entry = ttk.Entry(trading_frame, font=("Arial", 11))
-        self.buy_price_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), pady=5, padx=(0, 20))
+        self.sell_price_entry.grid(row=0, column=3, sticky='ew', padx=10, pady=5)
+        self.sell_price_entry.bind('<KeyRelease>', lambda e: self.update_probabilities())
         
-        # Sell Price
-        ttk.Label(trading_frame, text="Sell Price ($):", font=("Arial", 10)).grid(
-            row=0, column=2, sticky=tk.W, padx=(0, 10), pady=5
-        )
-        self.sell_price_entry = ttk.Entry(trading_frame, font=("Arial", 11))
-        self.sell_price_entry.grid(row=0, column=3, sticky=(tk.W, tk.E), pady=5)
+        # Row 2: Quantity and Time Horizon
+        tk.Label(
+            inputs_grid,
+            text="Quantity:",
+            font=("Arial", 10, "bold"),
+            bg='#f5f6fa',
+            fg='#34495e'
+        ).grid(row=1, column=0, sticky='w', pady=5)
         
-        # Quantity
-        ttk.Label(trading_frame, text="Quantity:", font=("Arial", 10)).grid(
-            row=1, column=0, sticky=tk.W, padx=(0, 10), pady=5
+        self.quantity_entry = tk.Entry(
+            inputs_grid,
+            font=("Arial", 12),
+            width=15,
+            relief=tk.SOLID,
+            borderwidth=1
         )
-        self.quantity_entry = ttk.Entry(trading_frame, font=("Arial", 11))
-        self.quantity_entry.grid(row=1, column=1, sticky=(tk.W, tk.E), pady=5, padx=(0, 20))
+        self.quantity_entry.grid(row=1, column=1, sticky='ew', padx=10, pady=5)
         self.quantity_entry.insert(0, "100")
         
-        # Time Horizon (days)
-        ttk.Label(trading_frame, text="Time Horizon (days):", font=("Arial", 10)).grid(
-            row=1, column=2, sticky=tk.W, padx=(0, 10), pady=5
+        tk.Label(
+            inputs_grid,
+            text="Time Horizon (days):",
+            font=("Arial", 10, "bold"),
+            bg='#f5f6fa',
+            fg='#34495e'
+        ).grid(row=1, column=2, sticky='w', padx=(20, 0), pady=5)
+        
+        self.time_horizon_entry = tk.Entry(
+            inputs_grid,
+            font=("Arial", 12),
+            width=15,
+            relief=tk.SOLID,
+            borderwidth=1
         )
-        self.time_horizon_entry = ttk.Entry(trading_frame, font=("Arial", 11))
-        self.time_horizon_entry.grid(row=1, column=3, sticky=(tk.W, tk.E), pady=5)
+        self.time_horizon_entry.grid(row=1, column=3, sticky='ew', padx=10, pady=5)
         self.time_horizon_entry.insert(0, "30")
+        self.time_horizon_entry.bind('<KeyRelease>', lambda e: self.update_probabilities())
         
-        # Buttons
-        button_frame = ttk.Frame(trading_frame)
-        button_frame.grid(row=2, column=0, columnspan=4, pady=(10, 0))
+        # Configure column weights
+        inputs_grid.columnconfigure(1, weight=1)
+        inputs_grid.columnconfigure(3, weight=1)
         
-        calc_btn = ttk.Button(
+        # Buttons row
+        button_frame = tk.Frame(trading_frame, bg='#f5f6fa')
+        button_frame.pack(fill=tk.X, pady=(10, 5))
+        
+        calc_btn = tk.Button(
             button_frame,
             text="💰 Calculate P&L",
-            command=self.calculate_profit_loss
+            command=self.calculate_profit_loss,
+            font=("Arial", 10, "bold"),
+            bg='#27ae60',
+            fg='white',
+            activebackground='#229954',
+            activeforeground='white',
+            relief=tk.RAISED,
+            borderwidth=2,
+            padx=15,
+            pady=8,
+            cursor='hand2'
         )
         calc_btn.pack(side=tk.LEFT, padx=5)
         
-        add_btn = ttk.Button(
+        add_btn = tk.Button(
             button_frame,
             text="➕ Add to Portfolio",
-            command=self.add_to_portfolio
+            command=self.add_to_portfolio,
+            font=("Arial", 10, "bold"),
+            bg='#3498db',
+            fg='white',
+            activebackground='#2980b9',
+            activeforeground='white',
+            relief=tk.RAISED,
+            borderwidth=2,
+            padx=15,
+            pady=8,
+            cursor='hand2'
         )
         add_btn.pack(side=tk.LEFT, padx=5)
         
-        clear_btn = ttk.Button(
+        clear_btn = tk.Button(
             button_frame,
             text="🗑️ Clear All",
-            command=self.clear_all
+            command=self.clear_all,
+            font=("Arial", 10, "bold"),
+            bg='#95a5a6',
+            fg='white',
+            activebackground='#7f8c8d',
+            activeforeground='white',
+            relief=tk.RAISED,
+            borderwidth=2,
+            padx=15,
+            pady=8,
+            cursor='hand2'
         )
         clear_btn.pack(side=tk.LEFT, padx=5)
         
-        # Profit/Loss Display
+        export_btn = tk.Button(
+            button_frame,
+            text="📥 Export Portfolio",
+            command=self.export_portfolio,
+            font=("Arial", 10, "bold"),
+            bg='#9b59b6',
+            fg='white',
+            activebackground='#8e44ad',
+            activeforeground='white',
+            relief=tk.RAISED,
+            borderwidth=2,
+            padx=15,
+            pady=8,
+            cursor='hand2'
+        )
+        export_btn.pack(side=tk.LEFT, padx=5)
+        
+        # P&L Display
         self.profit_label = tk.Label(
             trading_frame,
             text="",
-            font=("Arial", 14, "bold")
+            font=("Arial", 16, "bold"),
+            bg='#f5f6fa'
         )
-        self.profit_label.grid(row=3, column=0, columnspan=4, pady=(10, 0))
+        self.profit_label.pack(pady=(10, 0))
         
-        # ============ PORTFOLIO SECTION ============
-        portfolio_frame = ttk.LabelFrame(main_frame, text="Portfolio History", padding="10")
-        portfolio_frame.grid(row=4, column=0, columnspan=3, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
-        portfolio_frame.columnconfigure(0, weight=1)
-        portfolio_frame.rowconfigure(0, weight=1)
+        # ============ PORTFOLIO TABLE ============
+        portfolio_frame = tk.LabelFrame(
+            main_frame,
+            text=" 📈 Portfolio History ",
+            font=("Arial", 11, "bold"),
+            bg='#f5f6fa',
+            fg='#2c3e50',
+            relief=tk.GROOVE,
+            borderwidth=2,
+            padx=10,
+            pady=10
+        )
+        portfolio_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
         
-        # Configure main grid to allow portfolio to expand
-        main_frame.rowconfigure(4, weight=1)
+        # Treeview with scrollbars
+        tree_frame = tk.Frame(portfolio_frame, bg='#f5f6fa')
+        tree_frame.pack(fill=tk.BOTH, expand=True)
         
-        # Treeview with scrollbar
-        tree_scroll = ttk.Scrollbar(portfolio_frame)
-        tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        # Scrollbars
+        tree_scroll_y = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL)
+        tree_scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
         
+        tree_scroll_x = ttk.Scrollbar(tree_frame, orient=tk.HORIZONTAL)
+        tree_scroll_x.pack(side=tk.BOTTOM, fill=tk.X)
+        
+        # Treeview
         self.portfolio_table = ttk.Treeview(
-            portfolio_frame,
-            columns=("Ticker", "Date", "Buy", "Sell", "Qty", "P&L"),
+            tree_frame,
+            columns=("Ticker", "Date", "Buy", "Sell", "Qty", "P&L", "P&L%"),
             show="headings",
-            height=8,
-            yscrollcommand=tree_scroll.set
+            height=10,
+            yscrollcommand=tree_scroll_y.set,
+            xscrollcommand=tree_scroll_x.set
         )
-        tree_scroll.config(command=self.portfolio_table.yview)
+        
+        tree_scroll_y.config(command=self.portfolio_table.yview)
+        tree_scroll_x.config(command=self.portfolio_table.xview)
         
         # Define headings
         self.portfolio_table.heading("Ticker", text="Ticker")
@@ -214,7 +451,8 @@ class StockCalculatorPro:
         self.portfolio_table.heading("Buy", text="Buy Price")
         self.portfolio_table.heading("Sell", text="Sell Price")
         self.portfolio_table.heading("Qty", text="Quantity")
-        self.portfolio_table.heading("P&L", text="Profit/Loss")
+        self.portfolio_table.heading("P&L", text="Profit/Loss ($)")
+        self.portfolio_table.heading("P&L%", text="Return (%)")
         
         # Define column widths
         self.portfolio_table.column("Ticker", width=80, anchor=tk.CENTER)
@@ -223,102 +461,114 @@ class StockCalculatorPro:
         self.portfolio_table.column("Sell", width=100, anchor=tk.CENTER)
         self.portfolio_table.column("Qty", width=80, anchor=tk.CENTER)
         self.portfolio_table.column("P&L", width=120, anchor=tk.CENTER)
+        self.portfolio_table.column("P&L%", width=100, anchor=tk.CENTER)
         
         self.portfolio_table.pack(fill=tk.BOTH, expand=True)
         
-        # Delete button for portfolio
-        delete_btn = ttk.Button(
-            main_frame,
+        # Portfolio control buttons
+        portfolio_btn_frame = tk.Frame(main_frame, bg='#f5f6fa')
+        portfolio_btn_frame.pack(fill=tk.X, pady=(5, 0))
+        
+        delete_btn = tk.Button(
+            portfolio_btn_frame,
             text="❌ Delete Selected",
-            command=self.delete_selected
+            command=self.delete_selected,
+            font=("Arial", 10, "bold"),
+            bg='#e74c3c',
+            fg='white',
+            activebackground='#c0392b',
+            activeforeground='white',
+            relief=tk.RAISED,
+            borderwidth=2,
+            padx=15,
+            pady=5,
+            cursor='hand2'
         )
-        delete_btn.grid(row=5, column=0, columnspan=3, pady=(5, 0))
+        delete_btn.pack(side=tk.LEFT, padx=5)
+        
+        # Summary label
+        self.summary_label = tk.Label(
+            portfolio_btn_frame,
+            text="Total Trades: 0 | Net P&L: $0.00",
+            font=("Arial", 10, "bold"),
+            bg='#f5f6fa',
+            fg='#34495e'
+        )
+        self.summary_label.pack(side=tk.RIGHT, padx=10)
     
     def calculate_historical_volatility(self, ticker_symbol, days=60):
-        """
-        Calculate annualized historical volatility using actual price data
-        """
+        """Calculate annualized historical volatility using actual price data"""
         try:
             end_date = datetime.now()
-            start_date = end_date - timedelta(days=days + 30)  # Extra buffer
+            start_date = end_date - timedelta(days=days + 30)
             
-            # Fetch historical data
             ticker = yf.Ticker(ticker_symbol)
             hist_data = ticker.history(start=start_date, end=end_date)
             
             if hist_data.empty or len(hist_data) < 20:
-                return None, "Insufficient historical data"
+                return None, "Insufficient historical data (need 20+ trading days)"
             
             # Calculate log returns
             hist_data['Log_Return'] = np.log(hist_data['Close'] / hist_data['Close'].shift(1))
-            
-            # Remove NaN values
             log_returns = hist_data['Log_Return'].dropna()
             
             if len(log_returns) < 20:
                 return None, "Insufficient data for volatility calculation"
             
-            # Calculate annualized volatility
-            # Assuming 252 trading days per year
+            # Calculate annualized volatility (252 trading days)
             daily_volatility = log_returns.std()
             annualized_volatility = daily_volatility * np.sqrt(252)
             
             return annualized_volatility, None
             
         except Exception as e:
-            return None, f"Error calculating volatility: {str(e)}"
+            return None, f"Volatility calculation error: {str(e)}"
     
     def calculate_lognormal_probability(self, S0, ST, sigma, T, mu=0.0):
         """
-        Calculate probability of reaching target price using Log-Normal distribution
+        Calculate probability using Log-Normal distribution
         
-        Parameters:
-        S0: Current stock price
-        ST: Target stock price
-        sigma: Annualized volatility
-        T: Time horizon in years
-        mu: Expected return (default 0 for risk-neutral)
-        
-        Returns:
-        Probability of stock price being above ST at time T
+        P(S_T > ST) where ln(S_T/S_0) ~ N((mu - sigma^2/2)*T, sigma*sqrt(T))
         """
-        if T <= 0 or sigma <= 0 or S0 <= 0:
-            return 0.5  # Return neutral probability if invalid inputs
+        if T <= 0 or sigma <= 0 or S0 <= 0 or ST <= 0:
+            return 0.5
         
         try:
-            # Log-normal model: ln(ST/S0) ~ N((mu - sigma^2/2)*T, sigma*sqrt(T))
+            # Log-normal model
             d = (np.log(ST / S0) - (mu - 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
-            
-            # P(S > ST) = 1 - N(d)
             prob_above = 1 - norm.cdf(d)
-            
             return prob_above
-            
-        except Exception as e:
+        except:
             return 0.5
     
     def lookup_stock_price(self):
-        """Fetch stock price and calculate volatility with robust error handling"""
+        """Fetch stock price with threading to prevent GUI freeze"""
+        ticker_symbol = self.stock_ticker_entry.get().strip().upper()
+        
+        if not ticker_symbol:
+            messagebox.showwarning("Input Error", "Please enter a stock ticker symbol")
+            return
+        
+        # Show loading state
+        self.status_label.config(text="⏳ Loading...", fg='#e67e22')
+        self.current_price_label.config(text="Loading...", fg='#95a5a6')
+        self.volatility_label.config(text="Loading...", fg='#95a5a6')
+        self.root.update_idletasks()
+        
+        # Run in thread to prevent freezing
+        thread = threading.Thread(target=self._fetch_stock_data, args=(ticker_symbol,))
+        thread.daemon = True
+        thread.start()
+    
+    def _fetch_stock_data(self, ticker_symbol):
+        """Background thread for fetching stock data"""
         try:
-            # Get ticker symbol
-            ticker_symbol = self.stock_ticker_entry.get().strip().upper()
-            
-            if not ticker_symbol:
-                messagebox.showwarning("Input Error", "Please enter a stock ticker symbol")
-                return
-            
-            # Show loading state
-            self.current_price_label.config(text="Loading...", fg="#95a5a6")
-            self.root.update()
-            
-            # Fetch stock data
             ticker = yf.Ticker(ticker_symbol)
             
-            # Try to get current price using fast_info first
+            # Get current price
             try:
                 current_price = ticker.fast_info['lastPrice']
             except:
-                # Fallback to history
                 hist = ticker.history(period="1d")
                 if hist.empty:
                     raise ValueError("No price data available")
@@ -327,70 +577,70 @@ class StockCalculatorPro:
             if pd.isna(current_price) or current_price <= 0:
                 raise ValueError("Invalid price data")
             
-            # Calculate historical volatility
+            # Calculate volatility
             volatility, error = self.calculate_historical_volatility(ticker_symbol)
             
             if error:
-                messagebox.showwarning("Volatility Warning", error)
-                volatility = 0.3  # Default to 30% if calculation fails
+                volatility = 0.3  # Default 30% if calculation fails
+                vol_note = " (default)"
+            else:
+                vol_note = ""
             
-            # Store current data
+            # Store data
             self.current_ticker = ticker_symbol
             self.current_price = current_price
             self.volatility = volatility
             
-            # Update display
-            self.current_price_label.config(
-                text=f"${current_price:.2f}",
-                fg="#27ae60"
-            )
-            self.volatility_label.config(
-                text=f"{volatility*100:.2f}%"
-            )
-            
-            # Calculate suggested buy/sell prices (5% below/above)
-            suggested_buy = current_price * 0.95
-            suggested_sell = current_price * 1.05
-            
-            # Populate entry fields
-            self.buy_price_entry.delete(0, tk.END)
-            self.buy_price_entry.insert(0, f"{suggested_buy:.2f}")
-            
-            self.sell_price_entry.delete(0, tk.END)
-            self.sell_price_entry.insert(0, f"{suggested_sell:.2f}")
-            
-            # Calculate probabilities
-            self.update_probabilities()
-            
-            messagebox.showinfo(
-                "Success",
-                f"Stock data loaded for {ticker_symbol}\n"
-                f"Price: ${current_price:.2f}\n"
-                f"Volatility: {volatility*100:.2f}%"
-            )
+            # Update UI (must be done in main thread)
+            self.root.after(0, self._update_stock_display, current_price, volatility, vol_note, None)
             
         except ValueError as ve:
-            self.current_price_label.config(text="Error", fg="#e74c3c")
-            messagebox.showerror("Data Error", str(ve))
+            self.root.after(0, self._update_stock_display, None, None, None, str(ve))
         except Exception as e:
-            self.current_price_label.config(text="Error", fg="#e74c3c")
             error_msg = str(e)
             if "No data found" in error_msg or "404" in error_msg:
-                messagebox.showerror(
-                    "Ticker Not Found",
-                    f"Could not find ticker '{self.stock_ticker_entry.get()}'.\n"
-                    "Please check the symbol and try again."
-                )
-            elif "timed out" in error_msg.lower() or "connection" in error_msg.lower():
-                messagebox.showerror(
-                    "Network Error",
-                    "Connection error. Please check your internet connection."
-                )
-            else:
-                messagebox.showerror("Error", f"An error occurred: {error_msg}")
+                error_msg = f"Ticker '{ticker_symbol}' not found"
+            elif "timed out" in error_msg.lower():
+                error_msg = "Connection timeout - check internet"
+            self.root.after(0, self._update_stock_display, None, None, None, error_msg)
+    
+    def _update_stock_display(self, current_price, volatility, vol_note, error):
+        """Update UI with fetched stock data (runs in main thread)"""
+        if error:
+            self.current_price_label.config(text="Error", fg='#e74c3c')
+            self.volatility_label.config(text="--", fg='#95a5a6')
+            self.status_label.config(text="❌ Failed", fg='#e74c3c')
+            messagebox.showerror("Error", error)
+            return
+        
+        # Update displays
+        self.current_price_label.config(text=f"${current_price:.2f}", fg='#27ae60')
+        self.volatility_label.config(text=f"{volatility*100:.2f}%{vol_note}", fg='#e67e22')
+        self.status_label.config(text="✅ Success", fg='#27ae60')
+        
+        # Populate suggested prices (5% range)
+        suggested_buy = current_price * 0.95
+        suggested_sell = current_price * 1.05
+        
+        self.buy_price_entry.delete(0, tk.END)
+        self.buy_price_entry.insert(0, f"{suggested_buy:.2f}")
+        
+        self.sell_price_entry.delete(0, tk.END)
+        self.sell_price_entry.insert(0, f"{suggested_sell:.2f}")
+        
+        # Update probabilities
+        self.update_probabilities()
+        
+        # Show success message
+        messagebox.showinfo(
+            "Stock Loaded",
+            f"✅ {self.current_ticker}\n"
+            f"Price: ${current_price:.2f}\n"
+            f"Volatility: {volatility*100:.2f}%"
+        )
     
     def update_probabilities(self):
-        """Update probability calculations based on current inputs"""
+        """Update probability calculations"""
         try:
             if self.current_price is None or self.volatility is None:
                 return
@@ -399,11 +649,9 @@ class StockCalculatorPro:
             sell_price = float(self.sell_price_entry.get())
             time_horizon = float(self.time_horizon_entry.get())
             
-            # Convert days to years
             T = time_horizon / 365.0
             
-            # Calculate probabilities using log-normal model
-            # For buy price (below current): probability of going down
+            # Calculate probabilities
             if buy_price < self.current_price:
                 buy_prob = 1 - self.calculate_lognormal_probability(
                     self.current_price, buy_price, self.volatility, T
@@ -413,7 +661,6 @@ class StockCalculatorPro:
                     self.current_price, buy_price, self.volatility, T
                 )
             
-            # For sell price (above current): probability of going up
             if sell_price > self.current_price:
                 sell_prob = self.calculate_lognormal_probability(
                     self.current_price, sell_price, self.volatility, T
@@ -423,62 +670,49 @@ class StockCalculatorPro:
                     self.current_price, sell_price, self.volatility, T
                 )
             
-            # Update labels
             self.buy_prob_label.config(text=f"{buy_prob:.2%}")
             self.sell_prob_label.config(text=f"{sell_prob:.2%}")
             
         except ValueError:
-            # If inputs are invalid, clear probability display
             self.buy_prob_label.config(text="--")
             self.sell_prob_label.config(text="--")
     
     def calculate_profit_loss(self):
-        """Calculate profit/loss based on buy/sell prices and quantity"""
+        """Calculate and display profit/loss"""
         try:
             buy_price = float(self.buy_price_entry.get())
             sell_price = float(self.sell_price_entry.get())
             quantity = int(self.quantity_entry.get())
             
             if buy_price <= 0 or sell_price <= 0 or quantity <= 0:
-                raise ValueError("Prices and quantity must be positive")
+                raise ValueError("All values must be positive")
             
-            # Calculate totals
-            total_buy_cost = buy_price * quantity
-            total_sell_revenue = sell_price * quantity
-            profit_loss = total_sell_revenue - total_buy_cost
-            profit_loss_pct = (profit_loss / total_buy_cost) * 100
+            total_cost = buy_price * quantity
+            total_revenue = sell_price * quantity
+            profit_loss = total_revenue - total_cost
+            profit_loss_pct = (profit_loss / total_cost) * 100
             
-            # Update display
             if profit_loss > 0:
                 self.profit_label.config(
-                    text=f"💰 Profit: ${profit_loss:.2f} ({profit_loss_pct:+.2f}%)",
-                    fg="#27ae60"
+                    text=f"💰 Profit: ${profit_loss:,.2f} ({profit_loss_pct:+.2f}%)",
+                    fg='#27ae60'
                 )
             elif profit_loss < 0:
                 self.profit_label.config(
-                    text=f"📉 Loss: ${abs(profit_loss):.2f} ({profit_loss_pct:.2f}%)",
-                    fg="#e74c3c"
+                    text=f"📉 Loss: ${abs(profit_loss):,.2f} ({profit_loss_pct:.2f}%)",
+                    fg='#e74c3c'
                 )
             else:
-                self.profit_label.config(
-                    text=f"Break Even: $0.00",
-                    fg="#95a5a6"
-                )
+                self.profit_label.config(text="⚖️ Break Even", fg='#95a5a6')
             
-            # Update probabilities
             self.update_probabilities()
             
         except ValueError as e:
-            self.profit_label.config(
-                text=f"⚠️ Invalid input: {str(e)}",
-                fg="#e74c3c"
-            )
-            messagebox.showerror("Input Error", str(e))
+            messagebox.showerror("Input Error", f"Invalid input: {str(e)}")
     
     def add_to_portfolio(self):
-        """Add current trade to portfolio table"""
+        """Add trade to portfolio table"""
         try:
-            # Validate all inputs
             if not self.current_ticker:
                 raise ValueError("Please lookup a stock first")
             
@@ -487,18 +721,13 @@ class StockCalculatorPro:
             quantity = int(self.quantity_entry.get())
             
             if buy_price <= 0 or sell_price <= 0 or quantity <= 0:
-                raise ValueError("Prices and quantity must be positive")
+                raise ValueError("All values must be positive")
             
-            # Calculate P&L
             profit_loss = (sell_price - buy_price) * quantity
+            profit_loss_pct = ((sell_price - buy_price) / buy_price) * 100
             
-            # Get current timestamp
             current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             
-            # Format values
-            pl_formatted = f"${profit_loss:+.2f}"
-            
-            # Insert into table
             self.portfolio_table.insert(
                 "",
                 "end",
@@ -508,39 +737,83 @@ class StockCalculatorPro:
                     f"${buy_price:.2f}",
                     f"${sell_price:.2f}",
                     quantity,
-                    pl_formatted
+                    f"${profit_loss:+,.2f}",
+                    f"{profit_loss_pct:+.2f}%"
                 ),
                 tags=('profit' if profit_loss >= 0 else 'loss',)
             )
             
-            # Configure tags for color coding
             self.portfolio_table.tag_configure('profit', foreground='#27ae60')
             self.portfolio_table.tag_configure('loss', foreground='#e74c3c')
             
-            messagebox.showinfo("Success", "Trade added to portfolio!")
+            self.update_portfolio_summary()
+            messagebox.showinfo("Success", "✅ Trade added to portfolio!")
             
         except ValueError as e:
             messagebox.showerror("Input Error", str(e))
     
+    def update_portfolio_summary(self):
+        """Update portfolio summary statistics"""
+        total_trades = len(self.portfolio_table.get_children())
+        total_pl = 0.0
+        
+        for item in self.portfolio_table.get_children():
+            values = self.portfolio_table.item(item)['values']
+            pl_str = values[5].replace('$', '').replace(',', '')
+            total_pl += float(pl_str)
+        
+        self.summary_label.config(
+            text=f"Total Trades: {total_trades} | Net P&L: ${total_pl:+,.2f}"
+        )
+    
     def delete_selected(self):
-        """Delete selected row from portfolio"""
-        selected_items = self.portfolio_table.selection()
-        if not selected_items:
-            messagebox.showwarning("Selection Error", "Please select a row to delete")
+        """Delete selected rows from portfolio"""
+        selected = self.portfolio_table.selection()
+        if not selected:
+            messagebox.showwarning("Selection Error", "Please select row(s) to delete")
             return
         
-        for item in selected_items:
+        for item in selected:
             self.portfolio_table.delete(item)
+        
+        self.update_portfolio_summary()
+    
+    def export_portfolio(self):
+        """Export portfolio to CSV file"""
+        if not self.portfolio_table.get_children():
+            messagebox.showwarning("Export Error", "Portfolio is empty - nothing to export")
+            return
+        
+        try:
+            filename = filedialog.asksaveasfilename(
+                defaultextension=".csv",
+                filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+                initialfile=f"portfolio_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            )
+            
+            if filename:
+                data = []
+                for item in self.portfolio_table.get_children():
+                    data.append(self.portfolio_table.item(item)['values'])
+                
+                df = pd.DataFrame(
+                    data,
+                    columns=["Ticker", "Date/Time", "Buy Price", "Sell Price", "Quantity", "P&L ($)", "Return (%)"]
+                )
+                df.to_csv(filename, index=False)
+                messagebox.showinfo("Export Success", f"✅ Portfolio exported to:\n{filename}")
+                
+        except Exception as e:
+            messagebox.showerror("Export Error", f"Failed to export: {str(e)}")
     
     def clear_all(self):
-        """Clear all input fields and results"""
+        """Clear all inputs and reset"""
         response = messagebox.askyesno(
             "Clear All",
-            "Are you sure you want to clear all inputs and results?"
+            "Clear all inputs and results?\n(Portfolio will remain)"
         )
         
         if response:
-            # Clear entries
             self.stock_ticker_entry.delete(0, tk.END)
             self.buy_price_entry.delete(0, tk.END)
             self.sell_price_entry.delete(0, tk.END)
@@ -549,22 +822,27 @@ class StockCalculatorPro:
             self.time_horizon_entry.delete(0, tk.END)
             self.time_horizon_entry.insert(0, "30")
             
-            # Clear labels
-            self.current_price_label.config(text="--")
-            self.volatility_label.config(text="--")
-            self.buy_prob_label.config(text="--")
-            self.sell_prob_label.config(text="--")
+            self.current_price_label.config(text="--", fg='#95a5a6')
+            self.volatility_label.config(text="--", fg='#95a5a6')
+            self.buy_prob_label.config(text="--", fg='#95a5a6')
+            self.sell_prob_label.config(text="--", fg='#95a5a6')
             self.profit_label.config(text="")
+            self.status_label.config(text="")
             
-            # Clear stored data
             self.current_ticker = None
             self.current_price = None
             self.volatility = None
 
 def main():
-    root = tk.Tk()
-    app = StockCalculatorPro(root)
-    root.mainloop()
+    """Main entry point - ensures GUI starts properly"""
+    try:
+        root = tk.Tk()
+        app = StockCalculatorPro(root)
+        root.mainloop()
+    except Exception as e:
+        print(f"Critical error starting application: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     main()
