@@ -3,30 +3,9 @@ import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
 import numpy as np
-import requests
-from time import sleep
 
 # Page configuration
 st.set_page_config(page_title="Trading Calculator", page_icon="⚡", layout="wide")
-
-# ============ ANTI-BLOCKING SETUP ============
-# Create a persistent session with realistic headers
-@st.cache_resource
-def get_session():
-    """Create a requests session with realistic browser headers"""
-    session = requests.Session()
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1'
-    })
-    return session
-
-# Get the shared session
-SESSION = get_session()
 
 # Load thresholds from secrets (with fallback defaults)
 try:
@@ -170,41 +149,39 @@ def get_verdict(ema_8, ema_20, rsi):
 @st.cache_data(ttl=1200, show_spinner=False)  # Cache for 20 minutes
 def fetch_stock_data(ticker):
     """
-    Fetch stock data with anti-blocking measures
-    Minimizes API calls by getting current price first, then historical data
+    Fetch stock data with standard yfinance (no custom session)
+    Cached for 20 minutes to minimize API calls
     """
     try:
-        # Use the session for all yfinance calls
-        stock = yf.Ticker(ticker, session=SESSION)
+        # Use standard yfinance without custom session
+        stock = yf.Ticker(ticker)
         
-        # STEP 1: Get current price FIRST (minimal data)
+        # STEP 1: Get current price using fast_info (most efficient)
         real_time_price = None
         try:
-            # Try fast_info first (fastest, most efficient)
             real_time_price = stock.fast_info.get('last_price', None)
         except Exception:
             pass
         
+        # Fallback to info if fast_info fails
         if real_time_price is None:
             try:
-                # Fallback to info (slower but more reliable)
                 info = stock.info
                 real_time_price = info.get('regularMarketPrice', None) or info.get('currentPrice', None)
             except Exception:
                 pass
         
-        # STEP 2: Only fetch historical data if we need it for charts
-        # This reduces the data load significantly
+        # STEP 2: Fetch historical data for charts
         data = stock.history(period="5d", interval="15m")
         
         if data.empty:
             return None, None, "No historical data found for this ticker"
         
-        # If we still don't have current price, use latest close as fallback
+        # Use latest close as final fallback for current price
         if real_time_price is None:
             real_time_price = float(data['Close'].iloc[-1])
         
-        # Calculate indicators using historical data
+        # Calculate indicators
         data['EMA_8'] = data['Close'].ewm(span=8, adjust=False).mean()
         data['EMA_20'] = data['Close'].ewm(span=20, adjust=False).mean()
         data['RSI'] = calculate_rsi(data, period=14)
@@ -215,15 +192,15 @@ def fetch_stock_data(ticker):
     except Exception as e:
         error_msg = str(e)
         
-        # Specific handling for rate limit errors
+        # Handle rate limit errors
         if "429" in error_msg or "rate limit" in error_msg.lower() or "too many requests" in error_msg.lower():
             return None, None, (
                 "⏳ **Yahoo Finance Rate Limit Detected**\n\n"
                 "Please wait 5-10 minutes before trying again.\n\n"
                 "**Tips to avoid rate limits:**\n"
                 "- Data is cached for 20 minutes - avoid rapid refreshes\n"
-                "- Close other apps/tabs using Yahoo Finance\n"
-                "- Wait a few minutes between different ticker searches"
+                "- Wait a few minutes between different ticker searches\n"
+                "- Try again in 5-10 minutes"
             )
         elif "404" in error_msg or "not found" in error_msg.lower():
             return None, None, f"❌ Ticker '{ticker}' not found. Please verify the symbol."
@@ -275,10 +252,10 @@ def create_candlestick_chart(data, ticker):
     
     return fig
 
-# Sidebar
+# Sidebar with form to prevent auto-execution
 st.sidebar.header("⚙️ Quick Settings")
 
-# ============ OPTIMIZED FORM (No Double-Ping) ============
+# Form ensures API is only called when Calculate button is clicked
 with st.sidebar.form("trading_form", clear_on_submit=False):
     st.markdown("### Stock Symbol")
     ticker = st.text_input(
@@ -299,13 +276,14 @@ with st.sidebar.form("trading_form", clear_on_submit=False):
         key="investment_input"
     )
     
+    # Submit button - API only called when this is clicked
     submit_button = st.form_submit_button(
         "⚡ Calculate", 
         use_container_width=True, 
         type="primary"
     )
     
-    st.caption("💡 Data cached for 20 minutes to avoid rate limits")
+    st.caption("💡 Data cached for 20 minutes | Click Calculate to fetch data")
 
 # Main content
 if submit_button and ticker:
@@ -515,9 +493,9 @@ if submit_button and ticker:
 
 elif not submit_button:
     # Welcome screen
-    st.info("👈 **Enter ticker and investment amount, then click Calculate**")
+    st.info("👈 **Enter ticker and investment amount, then click Calculate button**")
     
-    st.success("🛡️ **Anti-Rate-Limit Protection Active** - Uses realistic browser headers, minimized requests, and 20-minute smart caching")
+    st.success("🚀 **Button-Controlled Execution** - API only called when you click Calculate (prevents auto-execution and rate limits)")
     
     st.markdown("### ⚡ High-Speed Features")
     
@@ -542,11 +520,11 @@ elif not submit_button:
         - Risk as % of investment
         - Expected profit calculation
         
-        **🛡️ Anti-Rate-Limit**
-        - Realistic browser identity
-        - Minimal data requests
+        **⚡ Performance**
         - 20-minute caching
-        - No double-pinging
+        - Button-based execution
+        - No auto-refresh
+        - Standard yfinance API
         """)
     
     st.markdown("### 🎲 Conviction Score")
@@ -588,25 +566,24 @@ st.sidebar.info(
     "**How It Works:**\n"
     "1. Enter ticker symbol\n"
     "2. Set total investment\n"
-    "3. Click Calculate\n"
+    "3. Click Calculate button\n"
     "4. See your risk & profit!\n\n"
     "**Indicators:**\n"
-    "- EMA 8/20: Trend\n"
-    "- RSI: Momentum\n"
-    "- Z-Score: Probability\n"
-    "- OBV: Volume\n\n"
+    "- EMA 8/20: Trend direction\n"
+    "- RSI: Momentum strength\n"
+    "- Z-Score: Target probability\n"
+    "- OBV: Volume confirmation\n\n"
     "**Investment Logic:**\n"
     "- Shares = Investment / Price\n"
     "- Risk = (Price - Stop) × Shares\n"
     "- Risk % = Risk / Investment\n"
     "- Stop Loss: 5% below entry\n\n"
-    "**Anti-Blocking:**\n"
-    "✅ Realistic browser headers\n"
-    "✅ Minimized data requests\n"
-    "✅ 20-min smart caching\n"
-    "✅ Rate limit protection\n\n"
+    "**Performance:**\n"
+    "✅ 20-minute smart caching\n"
+    "✅ Button-based execution\n"
+    "✅ Standard yfinance API\n\n"
     "Data: Yahoo Finance"
 )
 
 st.sidebar.markdown("---")
-st.sidebar.success("🛡️ Anti-Rate-Limit Active")
+st.sidebar.success("🚀 Ready to Calculate!")
