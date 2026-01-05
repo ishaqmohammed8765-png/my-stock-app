@@ -1,4 +1,4 @@
-import streamlit as st
+mport streamlit as st
 import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
@@ -100,29 +100,34 @@ def calculate_probability(data, current_price, target_price):
     
     return probability, z_score, volatility
 
-def calculate_position_sizing(current_price, sell_target, risk_amount, stop_loss_pct=0.05):
+def calculate_investment_risk(current_price, sell_target, investment_amount, stop_loss_pct=0.05):
     """
-    Calculate position size and expected profit
+    Calculate shares, risk, and profit based on total investment
     """
+    # Calculate shares you can buy with investment
+    shares = investment_amount / current_price if current_price > 0 else 0
+    
     # Calculate stop loss price (5% below entry)
     stop_loss_price = current_price * (1 - stop_loss_pct)
-    loss_per_share = current_price - stop_loss_price
     
-    # Position size: shares to buy so stop loss equals risk amount
-    position_size = risk_amount / loss_per_share if loss_per_share > 0 else 0
+    # Calculate total risk in dollars
+    risk_per_share = current_price - stop_loss_price
+    total_risk = risk_per_share * shares
+    
+    # Calculate risk as percentage of investment
+    risk_percentage = (total_risk / investment_amount * 100) if investment_amount > 0 else 0
     
     # Expected profit if target hits
     profit_per_share = sell_target - current_price
-    expected_profit = profit_per_share * position_size
-    
-    # Total capital needed
-    total_capital = current_price * position_size
+    expected_profit = profit_per_share * shares
     
     return {
-        'position_size': position_size,
+        'shares': shares,
         'stop_loss_price': stop_loss_price,
+        'total_risk': total_risk,
+        'risk_percentage': risk_percentage,
         'expected_profit': expected_profit,
-        'total_capital': total_capital
+        'risk_per_share': risk_per_share
     }
 
 def get_verdict(ema_8, ema_20, rsi):
@@ -235,13 +240,13 @@ with st.sidebar.form("trading_form"):
         placeholder="Enter ticker..."
     )
     
-    st.markdown("### Risk Management")
-    risk_amount = st.number_input(
-        "💵 Risk Amount ($)",
+    st.markdown("### Investment Amount")
+    investment_amount = st.number_input(
+        "💵 Total Investment ($)",
         min_value=1.0,
-        value=20.0,
-        step=5.0,
-        help="How much you're willing to lose if 5% stop loss is hit"
+        value=100.0,
+        step=10.0,
+        help="Total dollars you want to invest in this position"
     )
     
     submit_button = st.form_submit_button("⚡ Calculate", use_container_width=True, type="primary")
@@ -274,8 +279,8 @@ if submit_button and ticker:
         # Calculate probability for sell target
         probability, z_score, volatility = calculate_probability(data, current_price, resistance)
         
-        # Calculate position sizing and profit
-        calc = calculate_position_sizing(current_price, resistance, risk_amount)
+        # Calculate investment risk and profit
+        calc = calculate_investment_risk(current_price, resistance, investment_amount)
         
         # Get trading verdict
         verdict, verdict_type = get_verdict(ema_8_latest, ema_20_latest, rsi_latest)
@@ -320,25 +325,33 @@ if submit_button and ticker:
         st.markdown("---")
         
         # ============ CONVICTION METER ============
-        st.markdown("### 🎲 Conviction Meter (Probability Gauge)")
+        st.markdown("### 🎲 Conviction Score (Probability Gauge)")
+        st.caption("Z-Score probability of hitting the Sell Target")
         
         col_conv1, col_conv2, col_conv3 = st.columns(3)
         
         with col_conv1:
-            # Visual gauge
+            # Visual gauge with larger display
             if probability >= 70:
-                st.success(f"## {probability:.1f}%")
-                st.markdown("🟢 **High Conviction**")
+                st.success(f"# {probability:.1f}%")
+                st.markdown("### 🟢 High Conviction")
             elif probability >= 50:
-                st.warning(f"## {probability:.1f}%")
-                st.markdown("🟡 **Medium Conviction**")
+                st.warning(f"# {probability:.1f}%")
+                st.markdown("### 🟡 Medium Conviction")
             else:
-                st.error(f"## {probability:.1f}%")
-                st.markdown("🔴 **Low Conviction**")
+                st.error(f"# {probability:.1f}%")
+                st.markdown("### 🔴 Low Conviction")
+            st.caption("Probability of hitting target")
         
         with col_conv2:
             st.metric("Z-Score", f"{z_score:.2f}σ")
             st.caption("Standard deviations to target")
+            if abs(z_score) < 1:
+                st.info("Within 1σ - High probability")
+            elif abs(z_score) < 2:
+                st.info("Within 2σ - Medium probability")
+            else:
+                st.info("Beyond 2σ - Low probability")
         
         with col_conv3:
             st.metric("Daily Volatility", f"{volatility*100:.2f}%")
@@ -348,26 +361,30 @@ if submit_button and ticker:
         
         st.markdown("---")
         
-        # ============ AUTO-CALCULATED POSITION SIZING ============
-        st.markdown("### 🧮 Auto-Calculated Position (No Logging)")
-        st.caption(f"Risk Amount: ${risk_amount:.2f} | Stop Loss: 5% below entry (${calc['stop_loss_price']:.4f})")
+        # ============ AUTO-CALCULATED POSITION ============
+        st.markdown("### 🧮 Investment Breakdown")
+        st.caption(f"Total Investment: ${investment_amount:.2f} | Stop Loss: 5% below entry (${calc['stop_loss_price']:.4f})")
         
         col_calc1, col_calc2, col_calc3, col_calc4 = st.columns(4)
         
         with col_calc1:
             st.metric(
-                "📦 Position Size",
-                f"{calc['position_size']:.2f}",
-                help="Number of shares to buy"
+                "📦 Shares to Buy",
+                f"{calc['shares']:.2f}",
+                help="Shares you can buy with your investment"
             )
-            st.caption("shares")
+            st.caption(f"@ ${current_price:.4f}/share")
         
         with col_calc2:
-            st.metric(
-                "💵 Capital Needed",
-                f"${calc['total_capital']:.2f}",
-                help="Total money needed for this position"
-            )
+            # THE RISK THING - Show risk clearly
+            if calc['risk_percentage'] <= 5:
+                st.success(f"## {calc['risk_percentage']:.1f}%")
+            elif calc['risk_percentage'] <= 10:
+                st.warning(f"## {calc['risk_percentage']:.1f}%")
+            else:
+                st.error(f"## {calc['risk_percentage']:.1f}%")
+            st.markdown("**Risk Percentage**")
+            st.caption(f"${calc['total_risk']:.2f} at risk")
         
         with col_calc3:
             st.metric(
@@ -375,18 +392,23 @@ if submit_button and ticker:
                 f"${calc['expected_profit']:.2f}",
                 help="Profit if sell target hits"
             )
+            gain_pct = (calc['expected_profit'] / investment_amount * 100) if investment_amount > 0 else 0
+            st.caption(f"+{gain_pct:.1f}% gain")
         
         with col_calc4:
-            rr_ratio = calc['expected_profit'] / risk_amount if risk_amount > 0 else 0
+            rr_ratio = calc['expected_profit'] / calc['total_risk'] if calc['total_risk'] > 0 else 0
             if rr_ratio >= 2:
                 st.success(f"**{rr_ratio:.2f}:1**")
-                st.caption("✅ Good")
+                st.caption("✅ Good R/R")
             elif rr_ratio >= 1:
                 st.warning(f"**{rr_ratio:.2f}:1**")
-                st.caption("⚠️ Fair")
+                st.caption("⚠️ Fair R/R")
             else:
                 st.error(f"**{rr_ratio:.2f}:1**")
-                st.caption("❌ Poor")
+                st.caption("❌ Poor R/R")
+        
+        # Risk explanation box
+        st.info(f"💡 **What this means:** If you invest ${investment_amount:.2f} and the price drops 5% to your stop loss (${calc['stop_loss_price']:.4f}), you'll lose ${calc['total_risk']:.2f} which is {calc['risk_percentage']:.1f}% of your investment.")
         
         st.markdown("---")
         
@@ -434,7 +456,7 @@ if submit_button and ticker:
 
 elif not submit_button:
     # Welcome screen
-    st.info("👈 **Enter ticker and risk amount, then click Calculate**")
+    st.info("👈 **Enter ticker and investment amount, then click Calculate**")
     
     st.markdown("### ⚡ High-Speed Features")
     
@@ -452,20 +474,35 @@ elif not submit_button:
     
     with col_feat2:
         st.markdown("""
-        **🧮 Auto-Calculator**
-        - Position size (5% stop loss)
-        - Expected profit at target
-        - Risk/Reward ratio
-        - Capital needed
-        - No logging - just speed!
+        **🧮 Investment Calculator**
+        - Enter total investment amount
+        - Get shares to buy
+        - See your total risk ($)
+        - Risk as % of investment
+        - Expected profit calculation
         """)
     
-    st.markdown("### 🎲 Conviction Meter")
+    st.markdown("### 🎲 Conviction Score")
     st.markdown("""
-    Uses Z-Score to calculate probability (0-100%):
+    Z-Score probability of hitting Sell Target:
     - **🟢 High**: ≥70% (target within 1 standard deviation)
     - **🟡 Medium**: 50-69% (target within 2 standard deviations)
     - **🔴 Low**: <50% (target beyond 2 standard deviations)
+    
+    The Conviction Score shows how likely the stock is to reach your sell target based on historical volatility.
+    """)
+    
+    st.markdown("### 💰 How Investment Risk Works")
+    st.markdown("""
+    **Example:** You invest $100 in MKDW at $0.2680
+    
+    1. **Shares**: $100 / $0.2680 = 373 shares
+    2. **Stop Loss**: 5% below entry = $0.2546
+    3. **Risk per share**: $0.2680 - $0.2546 = $0.0134
+    4. **Total Risk**: $0.0134 × 373 = $5.00
+    5. **Risk %**: $5.00 / $100 = **5.0%** of your investment
+    
+    This means if the price drops 5% and hits your stop loss, you lose $5 (5% of your $100 investment).
     """)
     
     st.markdown("### 📱 Trading Signals")
@@ -483,18 +520,18 @@ st.sidebar.markdown("### 📚 Quick Guide")
 st.sidebar.info(
     "**How It Works:**\n"
     "1. Enter ticker symbol\n"
-    "2. Set your risk amount\n"
+    "2. Set total investment\n"
     "3. Click Calculate\n"
-    "4. Get instant signals!\n\n"
+    "4. See your risk & profit!\n\n"
     "**Indicators:**\n"
     "- EMA 8/20: Trend\n"
     "- RSI: Momentum\n"
     "- Z-Score: Probability\n"
     "- OBV: Volume\n\n"
-    "**Auto-Math:**\n"
-    "- Position sizing\n"
-    "- Stop loss (5%)\n"
-    "- Expected profit\n"
-    "- R/R ratio\n\n"
+    "**Investment Logic:**\n"
+    "- Shares = Investment / Price\n"
+    "- Risk = (Price - Stop) × Shares\n"
+    "- Risk % = Risk / Investment\n"
+    "- Stop Loss: 5% below entry\n\n"
     "Data: Yahoo Finance"
 )
