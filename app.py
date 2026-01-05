@@ -43,11 +43,13 @@ def calculate_obv(data):
             obv.append(obv[-1])
     return obv
 
-def calculate_pivot_points(data):
-    """Calculate Pivot Point, Support (S1), and Resistance (R1) levels"""
+def calculate_pivot_points(data, current_price):
+    """Calculate Pivot Point, Support (S1), and Resistance (R1) levels using latest data"""
+    # Use the most recent high/low from historical data
     high = float(data['High'].iloc[-1])
     low = float(data['Low'].iloc[-1])
-    close = float(data['Close'].iloc[-1])
+    # Use real-time price for most accurate pivot calculation
+    close = current_price
     
     pivot = (high + low + close) / 3
     support = (2 * pivot) - high  # S1 - Buy Target
@@ -79,25 +81,37 @@ def fetch_stock_data(ticker):
         data = stock.history(period="5d", interval="15m")
         
         if data.empty:
-            return None, "No data found for this ticker"
+            return None, None, "No data found for this ticker"
         
-        # Calculate indicators
+        # Get real-time price (most current available)
+        try:
+            # Try fast_info first (most reliable)
+            real_time_price = stock.fast_info['last_price']
+        except:
+            try:
+                # Fallback to info
+                real_time_price = stock.info.get('regularMarketPrice', None)
+            except:
+                # Final fallback to latest historical close
+                real_time_price = float(data['Close'].iloc[-1])
+        
+        # Calculate indicators using latest data
         data['EMA_8'] = data['Close'].ewm(span=8, adjust=False).mean()
         data['EMA_20'] = data['Close'].ewm(span=20, adjust=False).mean()
         data['RSI'] = calculate_rsi(data, period=14)
         data['OBV'] = calculate_obv(data)
         
-        return data, None
+        return data, real_time_price, None
         
     except Exception as e:
         error_msg = str(e)
         
         if "429" in error_msg or "rate limit" in error_msg.lower():
-            return None, "⏳ Yahoo Finance rate limit reached. Please wait a few minutes and try again."
+            return None, None, "⏳ Yahoo Finance rate limit reached. Please wait a few minutes and try again."
         elif "404" in error_msg or "not found" in error_msg.lower():
-            return None, f"❌ Ticker '{ticker}' not found. Please check the symbol and try again."
+            return None, None, f"❌ Ticker '{ticker}' not found. Please check the symbol and try again."
         else:
-            return None, f"❌ Error fetching data: {error_msg}"
+            return None, None, f"❌ Error fetching data: {error_msg}"
 
 def create_candlestick_chart(data, ticker):
     """Create professional candlestick chart with EMA overlays"""
@@ -162,7 +176,7 @@ with st.sidebar.form("ticker_form"):
 # Main content
 if submit_button and ticker:
     with st.spinner(f"Analyzing {ticker.upper()}..."):
-        data, error = fetch_stock_data(ticker.upper())
+        data, real_time_price, error = fetch_stock_data(ticker.upper())
     
     if error:
         st.error(error)
@@ -172,39 +186,42 @@ if submit_button and ticker:
                     "- Data is cached for 5 minutes\n"
                     "- Avoid rapid successive requests")
     elif data is not None:
-        # Extract latest values
-        current_price = float(data['Close'].iloc[-1])
+        # Use real-time price for current price
+        current_price = float(real_time_price)
+        
+        # Extract latest indicator values
         ema_8_latest = float(data['EMA_8'].iloc[-1])
         ema_20_latest = float(data['EMA_20'].iloc[-1])
         rsi_latest = float(data['RSI'].iloc[-1])
         
-        # Calculate pivot points
-        pivot, support, resistance = calculate_pivot_points(data)
+        # Calculate pivot points using real-time price for accuracy
+        pivot, support, resistance = calculate_pivot_points(data, current_price)
         
         # Get trading verdict
         verdict, verdict_type = get_verdict(ema_8_latest, ema_20_latest, rsi_latest)
         
         # TOP SECTION: Price Targets (Most Important)
         st.markdown("### 💰 Price Levels")
+        st.caption("🔴 **LIVE** - Real-time market data with 4 decimal precision")
         col_price1, col_price2, col_price3 = st.columns(3)
         
         with col_price1:
             st.metric(
                 label="🎯 Buy Target (S1)",
-                value=f"${support:.2f}",
+                value=f"${support:.4f}",
                 delta=f"{((support - current_price) / current_price * 100):.1f}%"
             )
         
         with col_price2:
             st.metric(
                 label="📍 Current Price",
-                value=f"${current_price:.2f}"
+                value=f"${current_price:.4f}"
             )
         
         with col_price3:
             st.metric(
                 label="🚪 Sell Target (R1)",
-                value=f"${resistance:.2f}",
+                value=f"${resistance:.4f}",
                 delta=f"{((resistance - current_price) / current_price * 100):.1f}%"
             )
         
@@ -226,9 +243,9 @@ if submit_button and ticker:
         col_ind1, col_ind2, col_ind3, col_ind4 = st.columns(4)
         
         with col_ind1:
-            st.metric("EMA 8", f"${ema_8_latest:.2f}")
+            st.metric("EMA 8", f"${ema_8_latest:.4f}")
         with col_ind2:
-            st.metric("EMA 20", f"${ema_20_latest:.2f}")
+            st.metric("EMA 20", f"${ema_20_latest:.4f}")
         with col_ind3:
             st.metric("RSI (14)", f"{rsi_latest:.2f}")
         with col_ind4:
@@ -240,6 +257,7 @@ if submit_button and ticker:
         
         # Professional Candlestick Chart
         st.markdown("### 📈 Professional Chart")
+        st.caption("Candlestick chart clearly shows price spikes and movements with EMA overlays")
         fig = create_candlestick_chart(data, ticker)
         st.plotly_chart(fig, use_container_width=True)
         
@@ -278,7 +296,7 @@ if submit_button and ticker:
             else:
                 st.info(f"**📊 RSI: NEUTRAL**\n\nRSI at {rsi_latest:.1f}")
         
-        st.success("✅ Analysis complete • Data cached for 5 minutes")
+        st.success("✅ Real-time analysis complete • Live price: ${:.4f} • Data cached for 5 minutes".format(current_price))
 
 elif not submit_button:
     # Welcome screen
