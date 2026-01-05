@@ -1,36 +1,56 @@
 import streamlit as st
 import yfinance as yf
+import pandas as pd
 
-st.set_page_config(page_title="Daily Stock Signal", layout="wide")
-st.title("🚀 Daily Buy/Sell Signals")
+st.title("📈 Daily Stock Signal Tracker")
 
-ticker = st.text_input("Enter Ticker", "NVDA").upper()
+# Input for stock ticker
+ticker = st.text_input("Enter Stock Ticker", value="NVDA")
 
 if ticker:
     try:
-        # We fetch 5 days of data with 15-minute intervals for daily precision
-        data = yf.download(ticker, period="5d", interval="15m")
+        # Fetch 5 days of data with 15-minute interval
+        stock = yf.Ticker(ticker)
+        data = stock.history(period="5d", interval="15m")
         
-        if not data.empty:
-            # Short-term EMA for Day Trading (8 and 20 periods)
-            data['EMA8'] = data['Close'].ewm(span=8).mean()
-            data['EMA20'] = data['Close'].ewm(span=20).mean()
-            
-            last_price = data['Close'].iloc[-1]
-            last_8 = data['EMA8'].iloc[-1]
-            last_20 = data['EMA20'].iloc[-1]
-            
-            st.metric(f"Current {ticker} Price (15m)", f"${last_price:.2f}")
-            
-            # Daily Signal Logic
-            if last_8 > last_21:
-                st.success("🔥 DAILY BUY: Momentum is pushing UP today.")
-            else:
-                st.error("📉 DAILY WAIT: Momentum is currently DOWN.")
-                
-            # Charting the intraday movement
-            st.line_chart(data[['Close', 'EMA8', 'EMA20']])
+        if data.empty:
+            st.error(f"No data found for ticker: {ticker}")
         else:
-            st.warning("Could not find daily data. Try a major ticker like TSLA.")
+            # Calculate EMA 8 and EMA 20
+            data['EMA_8'] = data['Close'].ewm(span=8, adjust=False).mean()
+            data['EMA_20'] = data['Close'].ewm(span=20, adjust=False).mean()
+            
+            # Get the latest values and convert to float
+            current_price = float(data['Close'].iloc[-1])
+            ema_8_latest = float(data['EMA_8'].iloc[-1])
+            ema_20_latest = float(data['EMA_20'].iloc[-1])
+            
+            # Display current price
+            st.metric(label=f"{ticker} Current Price", value=f"${current_price:.2f}")
+            
+            # Display signal based on EMA comparison
+            if ema_8_latest > ema_20_latest:
+                st.success("🟢 BUY Signal: EMA 8 > EMA 20")
+            else:
+                st.error("🔴 WAIT Signal: EMA 8 < EMA 20")
+            
+            # Display EMA values
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric(label="EMA 8 (Fast)", value=f"${ema_8_latest:.2f}")
+            with col2:
+                st.metric(label="EMA 20 (Slow)", value=f"${ema_20_latest:.2f}")
+            
+            # Prepare data for line chart
+            chart_data = pd.DataFrame({
+                'Close': data['Close'],
+                'EMA_8': data['EMA_8'],
+                'EMA_20': data['EMA_20']
+            })
+            
+            # Display line chart
+            st.subheader("Price and EMA Trends")
+            st.line_chart(chart_data)
+            
     except Exception as e:
-        st.error(f"Error: {e}")
+        st.error(f"Error fetching data for {ticker}: {str(e)}")
