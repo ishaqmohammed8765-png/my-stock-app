@@ -5,7 +5,6 @@ from scipy.stats import norm
 import numpy as np
 from datetime import datetime, timedelta
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 
 # Page config
 st.set_page_config(
@@ -15,7 +14,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS for better styling
+# Custom CSS
 st.markdown("""
     <style>
     .main-header {
@@ -82,13 +81,6 @@ def calculate_lognormal_probability(S0, K, sigma, T, r=0.0):
     d2 = [ln(S0/K) + (r - 0.5*σ²)T] / (σ√T)
     
     P(S_T > K) = N(d2)
-    
-    Parameters:
-    - S0: Current stock price
-    - K: Target price (strike)
-    - sigma: Annualized volatility
-    - T: Time to expiration (in years)
-    - r: Risk-free rate (default 0 for simplicity)
     """
     if T <= 0 or sigma <= 0 or S0 <= 0 or K <= 0:
         return 0.5
@@ -96,10 +88,7 @@ def calculate_lognormal_probability(S0, K, sigma, T, r=0.0):
     try:
         # Black-Scholes d2 formula
         d2 = (np.log(S0 / K) + (r - 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
-        
-        # Probability that stock price > K at time T
         prob_above = norm.cdf(d2)
-        
         return prob_above
     except:
         return 0.5
@@ -275,7 +264,6 @@ with st.sidebar:
                 if error:
                     st.warning(error)
                     volatility = 0.3  # Default 30%
-                    # Still try to get historical data
                     hist_data = ticker.history(period="6mo")
                 
                 # Store in session state
@@ -292,46 +280,7 @@ with st.sidebar:
     # Display current stock info
     if st.session_state.current_ticker:
         st.divider()
-    
-    # Display recommended prices
-    if st.session_state.hist_data is not None and rec_buy_price and rec_sell_price:
-        st.markdown("### 💡 AI-Powered Price Recommendations")
-        st.caption("Based on 20-day SMA ± 1 Standard Deviation")
-        
-        # Get SMA and Std for display
-        _, _, latest_sma, latest_std = get_recommended_levels(st.session_state.hist_data)
-        
-        # Calculate differences from current price
-        buy_diff = ((rec_buy_price - st.session_state.current_price) / st.session_state.current_price * 100)
-        sell_diff = ((rec_sell_price - st.session_state.current_price) / st.session_state.current_price * 100)
-        
-        col1, col2, col3 = st.columns([1, 1, 1])
-        
-        with col1:
-            st.info(f"""
-            **Recommended Buy (Dip)**  
-            ${rec_buy_price:.2f}  
-            _{buy_diff:+.2f}% from current_  
-            _SMA: ${latest_sma:.2f} - σ: ${latest_std:.2f}_
-            """)
-        
-        with col2:
-            st.info(f"""
-            **Recommended Sell (Strength)**  
-            ${rec_sell_price:.2f}  
-            _{sell_diff:+.2f}% from current_  
-            _SMA: ${latest_sma:.2f} + σ: ${latest_std:.2f}_
-            """)
-        
-        with col3:
-            st.write("")  # Spacing
-            st.write("")  # More spacing
-            if st.button("✨ Use Recommended Prices", type="secondary", use_container_width=True):
-                st.session_state.use_recommended = True
-                st.rerun()
-    
-    st.divider()
-    st.markdown("### 📊 Current Stock")
+        st.markdown("### 📊 Current Stock")
         
         col1, col2 = st.columns(2)
         with col1:
@@ -369,7 +318,7 @@ tab1, tab2, tab3 = st.tabs(["💰 Trading Calculator", "📈 Technical Chart", "
 with tab1:
     st.markdown("### Configure Your Trade")
     
-    # Get recommended prices first (we'll need them for defaults)
+    # Get recommended prices first
     rec_buy_price = None
     rec_sell_price = None
     if st.session_state.hist_data is not None:
@@ -382,7 +331,7 @@ with tab1:
     if use_rec and rec_buy_price and rec_sell_price:
         default_buy = float(rec_buy_price)
         default_sell = float(rec_sell_price)
-        st.session_state.use_recommended = False  # Reset flag
+        st.session_state.use_recommended = False
     else:
         default_buy = float(st.session_state.current_price * 0.95)
         default_sell = float(st.session_state.current_price * 1.05)
@@ -427,29 +376,64 @@ with tab1:
     
     st.divider()
     
+    # Display recommended prices
+    if st.session_state.hist_data is not None and rec_buy_price and rec_sell_price:
+        st.markdown("### 💡 AI-Powered Price Recommendations")
+        st.caption("Based on 20-day SMA ± 1 Standard Deviation")
+        
+        # Get SMA and Std for display
+        _, _, latest_sma, latest_std = get_recommended_levels(st.session_state.hist_data)
+        
+        # Calculate differences from current price
+        buy_diff = ((rec_buy_price - st.session_state.current_price) / st.session_state.current_price * 100)
+        sell_diff = ((rec_sell_price - st.session_state.current_price) / st.session_state.current_price * 100)
+        
+        col1, col2, col3 = st.columns([1, 1, 1])
+        
+        with col1:
+            st.info(f"""
+            **Recommended Buy (Dip)**  
+            ${rec_buy_price:.2f}  
+            _{buy_diff:+.2f}% from current_  
+            _SMA: ${latest_sma:.2f} - σ: ${latest_std:.2f}_
+            """)
+        
+        with col2:
+            st.info(f"""
+            **Recommended Sell (Strength)**  
+            ${rec_sell_price:.2f}  
+            _{sell_diff:+.2f}% from current_  
+            _SMA: ${latest_sma:.2f} + σ: ${latest_std:.2f}_
+            """)
+        
+        with col3:
+            st.write("")
+            st.write("")
+            if st.button("✨ Use Recommended Prices", type="secondary", use_container_width=True):
+                st.session_state.use_recommended = True
+                st.rerun()
+    
+    st.divider()
+    
     # Calculate probabilities using Black-Scholes d2
     T = time_horizon / 365.0
     
     # Probability of reaching buy price
     if buy_price < st.session_state.current_price:
-        # Prob of going DOWN to buy price
         buy_prob = 1 - calculate_lognormal_probability(
             st.session_state.current_price, buy_price, st.session_state.volatility, T
         )
     else:
-        # Prob of going UP to buy price
         buy_prob = calculate_lognormal_probability(
             st.session_state.current_price, buy_price, st.session_state.volatility, T
         )
     
     # Probability of reaching sell price
     if sell_price > st.session_state.current_price:
-        # Prob of going UP to sell price
         sell_prob = calculate_lognormal_probability(
             st.session_state.current_price, sell_price, st.session_state.volatility, T
         )
     else:
-        # Prob of going DOWN to sell price
         sell_prob = 1 - calculate_lognormal_probability(
             st.session_state.current_price, sell_price, st.session_state.volatility, T
         )
@@ -535,7 +519,7 @@ with tab2:
     if st.session_state.hist_data is not None:
         st.markdown("### 📈 Technical Analysis")
         
-        # Get current values from calculator (if available)
+        # Get current values from calculator
         buy_price_chart = buy_price if 'buy_price' in locals() else None
         sell_price_chart = sell_price if 'sell_price' in locals() else None
         
