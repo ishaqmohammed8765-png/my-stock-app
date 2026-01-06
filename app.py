@@ -331,7 +331,7 @@ with st.sidebar:
                 st.rerun()
     
     st.divider()
-        st.markdown("### 📊 Current Stock")
+    st.markdown("### 📊 Current Stock")
         
         col1, col2 = st.columns(2)
         with col1:
