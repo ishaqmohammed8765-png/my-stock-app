@@ -108,8 +108,40 @@ def calculate_sma(data, period=20):
     """Calculate Simple Moving Average"""
     return data['Close'].rolling(window=period).mean()
 
-def create_candlestick_chart(hist_data, ticker, buy_price=None, sell_price=None):
+def get_recommended_levels(hist_data):
+    """
+    Calculate recommended buy/sell levels based on SMA ± 1 Std Dev
+    
+    Returns:
+    - recommended_buy: SMA_20 - 1 * std_dev (buy the dip)
+    - recommended_sell: SMA_20 + 1 * std_dev (sell the strength)
+    """
+    try:
+        # Calculate 20-day SMA
+        sma_20 = hist_data['Close'].rolling(window=20).mean()
+        
+        # Calculate 20-day standard deviation
+        std_20 = hist_data['Close'].rolling(window=20).std()
+        
+        # Get most recent values
+        latest_sma = sma_20.iloc[-1]
+        latest_std = std_20.iloc[-1]
+        
+        # Recommended levels
+        recommended_buy = latest_sma - latest_std
+        recommended_sell = latest_sma + latest_std
+        
+        return recommended_buy, recommended_sell, latest_sma, latest_std
+    except:
+        return None, None, None, None
+
+def create_candlestick_chart(hist_data, ticker, buy_price=None, sell_price=None, 
+                             rec_buy=None, rec_sell=None):
     """Create interactive candlestick chart with overlays"""
+    
+    # Fix timezone issue - strip timezone info
+    hist_data = hist_data.copy()
+    hist_data.index = hist_data.index.tz_localize(None)
     
     # Get last 6 months of data
     six_months_ago = datetime.now() - timedelta(days=180)
@@ -163,6 +195,28 @@ def create_candlestick_chart(hist_data, ticker, buy_price=None, sell_price=None)
             line_color="#4caf50",
             annotation_text=f"Sell Target: ${sell_price:.2f}",
             annotation_position="right"
+        )
+    
+    # Recommended Buy Level (dashed, lighter color)
+    if rec_buy:
+        fig.add_hline(
+            y=rec_buy,
+            line_dash="dot",
+            line_color="#9c27b0",
+            opacity=0.6,
+            annotation_text=f"Rec. Buy: ${rec_buy:.2f}",
+            annotation_position="left"
+        )
+    
+    # Recommended Sell Level (dashed, lighter color)
+    if rec_sell:
+        fig.add_hline(
+            y=rec_sell,
+            line_dash="dot",
+            line_color="#ff5722",
+            opacity=0.6,
+            annotation_text=f"Rec. Sell: ${rec_sell:.2f}",
+            annotation_position="left"
         )
     
     # Update layout
@@ -238,6 +292,45 @@ with st.sidebar:
     # Display current stock info
     if st.session_state.current_ticker:
         st.divider()
+    
+    # Display recommended prices
+    if st.session_state.hist_data is not None and rec_buy_price and rec_sell_price:
+        st.markdown("### 💡 AI-Powered Price Recommendations")
+        st.caption("Based on 20-day SMA ± 1 Standard Deviation")
+        
+        # Get SMA and Std for display
+        _, _, latest_sma, latest_std = get_recommended_levels(st.session_state.hist_data)
+        
+        # Calculate differences from current price
+        buy_diff = ((rec_buy_price - st.session_state.current_price) / st.session_state.current_price * 100)
+        sell_diff = ((rec_sell_price - st.session_state.current_price) / st.session_state.current_price * 100)
+        
+        col1, col2, col3 = st.columns([1, 1, 1])
+        
+        with col1:
+            st.info(f"""
+            **Recommended Buy (Dip)**  
+            ${rec_buy_price:.2f}  
+            _{buy_diff:+.2f}% from current_  
+            _SMA: ${latest_sma:.2f} - σ: ${latest_std:.2f}_
+            """)
+        
+        with col2:
+            st.info(f"""
+            **Recommended Sell (Strength)**  
+            ${rec_sell_price:.2f}  
+            _{sell_diff:+.2f}% from current_  
+            _SMA: ${latest_sma:.2f} + σ: ${latest_std:.2f}_
+            """)
+        
+        with col3:
+            st.write("")  # Spacing
+            st.write("")  # More spacing
+            if st.button("✨ Use Recommended Prices", type="secondary", use_container_width=True):
+                st.session_state.use_recommended = True
+                st.rerun()
+    
+    st.divider()
         st.markdown("### 📊 Current Stock")
         
         col1, col2 = st.columns(2)
@@ -276,15 +369,34 @@ tab1, tab2, tab3 = st.tabs(["💰 Trading Calculator", "📈 Technical Chart", "
 with tab1:
     st.markdown("### Configure Your Trade")
     
+    # Get recommended prices first (we'll need them for defaults)
+    rec_buy_price = None
+    rec_sell_price = None
+    if st.session_state.hist_data is not None:
+        rec_buy_price, rec_sell_price, _, _ = get_recommended_levels(st.session_state.hist_data)
+    
+    # Check if we should use recommended prices
+    use_rec = st.session_state.get('use_recommended', False)
+    
+    # Determine default values
+    if use_rec and rec_buy_price and rec_sell_price:
+        default_buy = float(rec_buy_price)
+        default_sell = float(rec_sell_price)
+        st.session_state.use_recommended = False  # Reset flag
+    else:
+        default_buy = float(st.session_state.current_price * 0.95)
+        default_sell = float(st.session_state.current_price * 1.05)
+    
     col1, col2 = st.columns(2)
     
     with col1:
         buy_price = st.number_input(
             "Buy Price ($)",
             min_value=0.01,
-            value=float(st.session_state.current_price * 0.95),
+            value=default_buy,
             format="%.2f",
-            help="Target price to buy the stock"
+            help="Target price to buy the stock",
+            key="buy_price_input"
         )
         
         quantity = st.number_input(
@@ -299,9 +411,10 @@ with tab1:
         sell_price = st.number_input(
             "Sell Price ($)",
             min_value=0.01,
-            value=float(st.session_state.current_price * 1.05),
+            value=default_sell,
             format="%.2f",
-            help="Target price to sell the stock"
+            help="Target price to sell the stock",
+            key="sell_price_input"
         )
         
         time_horizon = st.number_input(
@@ -426,14 +539,32 @@ with tab2:
         buy_price_chart = buy_price if 'buy_price' in locals() else None
         sell_price_chart = sell_price if 'sell_price' in locals() else None
         
+        # Get recommended levels
+        rec_buy, rec_sell, _, _ = get_recommended_levels(st.session_state.hist_data)
+        
         # Create and display chart
         fig = create_candlestick_chart(
             st.session_state.hist_data,
             st.session_state.current_ticker,
             buy_price_chart,
-            sell_price_chart
+            sell_price_chart,
+            rec_buy,
+            rec_sell
         )
         st.plotly_chart(fig, use_container_width=True)
+        
+        # Chart legend
+        st.markdown("""
+        **Chart Legend:**
+        - 🟢 **Green/Red Candles**: Price movement (Open, High, Low, Close)
+        - 🟠 **Orange Line**: 20-day Simple Moving Average
+        - 🔵 **Blue Dashed**: Your Buy Target
+        - 🟢 **Green Dashed**: Your Sell Target
+        - 🟣 **Purple Dotted**: AI Recommended Buy (SMA - 1σ)
+        - 🔴 **Red Dotted**: AI Recommended Sell (SMA + 1σ)
+        """)
+        
+        st.divider()
         
         # Chart statistics
         col1, col2, col3, col4 = st.columns(4)
@@ -454,6 +585,24 @@ with tab2:
             price_change = ((recent_data['Close'].iloc[-1] - recent_data['Close'].iloc[0]) / 
                           recent_data['Close'].iloc[0] * 100)
             st.metric("30-Day Change", f"{price_change:+.2f}%")
+        
+        # Educational info
+        with st.expander("📚 Understanding the Recommendations"):
+            st.markdown("""
+            **How AI Recommendations Work:**
+            
+            - **20-day SMA (Simple Moving Average)**: The average closing price over the past 20 trading days. Acts as a trend indicator.
+            
+            - **Standard Deviation (σ)**: Measures price volatility. Higher σ = more volatile stock.
+            
+            - **Buy Recommendation (SMA - 1σ)**: This represents a "buy the dip" strategy. When price falls to this level, 
+              it's statistically 1 standard deviation below the recent average - potentially a good entry point.
+            
+            - **Sell Recommendation (SMA + 1σ)**: This represents a "sell on strength" strategy. When price rises to this level,
+              it's statistically 1 standard deviation above the recent average - potentially a good exit point.
+            
+            **Important Note**: These are statistical guides, not guarantees. Always do your own research and consider your risk tolerance.
+            """)
     else:
         st.warning("⚠️ No historical data available. Try reloading the stock.")
 
