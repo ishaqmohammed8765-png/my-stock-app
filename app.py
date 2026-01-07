@@ -4,7 +4,6 @@ import pandas as pd
 import numpy as np
 from scipy.stats import norm
 import plotly.graph_objects as go
-from datetime import datetime
 
 st.set_page_config(page_title="Stock Calculator Pro", layout="wide")
 
@@ -16,24 +15,30 @@ def load_stock(ticker):
     try:
         df = yf.download(ticker, period="6mo", progress=False)
         df = df.tail(120)
-        if df.empty:
-            raise ValueError
+        if df.empty or "Close" not in df:
+            return pd.DataFrame()
         df.index = df.index.tz_localize(None)
         return df
     except:
         return pd.DataFrame()
 
+# =====================================================
+# SAFE VOLATILITY (FIXED)
+# =====================================================
 def annual_volatility(df):
     r = np.log(df["Close"] / df["Close"].shift(1)).dropna()
     if len(r) < 10:
-        return 0.3
-    return max(min(r.std() * np.sqrt(252), 1.5), 0.15)
+        return 0.30
+    vol = float(r.std()) * np.sqrt(252)
+    return max(0.15, min(vol, 1.5))
 
 def expected_move(price, vol, days=30):
     return price * vol * np.sqrt(days / 365)
 
 def prob_hit(S, K, vol, days=30):
     T = days / 365
+    if S <= 0 or K <= 0:
+        return 0.5
     d2 = (np.log(S / K) - 0.5 * vol**2 * T) / (vol * np.sqrt(T))
     return float(np.clip(norm.cdf(d2), 0.001, 0.999))
 
@@ -50,18 +55,18 @@ with st.sidebar:
     load = st.button("Load Stock")
 
 # =====================================================
-# LOAD MAIN STOCK
+# LOAD STOCK
 # =====================================================
 if load:
     df = load_stock(ticker)
     if df.empty:
-        st.error("No data available")
+        st.error("No data available for this stock.")
         st.stop()
     st.session_state.df = df
     st.session_state.ticker = ticker
 
 if "df" not in st.session_state:
-    st.info("Load a stock to begin")
+    st.info("👈 Enter a stock symbol and press **Load Stock**")
     st.stop()
 
 df = st.session_state.df
@@ -83,7 +88,7 @@ sell_prob = prob_hit(price, sell, vol, days)
 RRR = (sell - buy) / max(buy - stop, 0.01)
 
 # =====================================================
-# KELLY
+# KELLY POSITION SIZING
 # =====================================================
 returns = df["Close"].pct_change().dropna()
 wins = returns[returns > 0]
@@ -94,7 +99,7 @@ if len(wins) < 10 or len(losses) < 10:
 else:
     win_rate = len(wins) / len(returns)
     loss_rate = 1 - win_rate
-    R = wins.mean() / abs(losses.mean())
+    R = abs(wins.mean() / losses.mean())
     kelly_fraction = win_rate - (loss_rate / R)
 
 kelly_fraction = max(min(kelly_fraction * 0.5, 0.15), 0.01)
@@ -121,15 +126,15 @@ with tab1:
     c4.metric("Stop-Loss", f"${stop:.2f}")
 
     if RRR >= 2:
-        st.success(f"Risk-Reward Ratio: {RRR:.2f}")
+        st.success(f"Risk–Reward Ratio: {RRR:.2f}")
     elif RRR >= 1.5:
-        st.warning(f"Risk-Reward Ratio: {RRR:.2f}")
+        st.warning(f"Risk–Reward Ratio: {RRR:.2f}")
     else:
-        st.error(f"Risk-Reward Ratio: {RRR:.2f}")
+        st.error(f"Risk–Reward Ratio: {RRR:.2f}")
 
-    st.info("Recommended Risk-Reward ≥ 1.5")
+    st.info("📌 **Recommended RRR ≥ 1.5** — lower ratios mean poor reward vs risk.")
 
-    st.metric("Kelly Position Size", qty)
+    st.metric("Kelly Position Size (Shares)", qty)
     st.metric("Expected Profit", f"${(sell-buy)*qty:,.2f}")
 
 # =====================================================
@@ -144,11 +149,15 @@ with tab2:
     st.plotly_chart(fig, use_container_width=True)
 
 # =====================================================
-# BACKTEST TAB
+# BACKTEST TAB (BEGINNER FRIENDLY)
 # =====================================================
 with tab3:
-    pnl = [df["Close"].iloc[i+days] - df["Close"].iloc[i]
-           for i in range(len(df)-days)]
+    st.info("📘 This backtest checks what would have happened if you bought and held for 30 days each time.")
+
+    pnl = []
+    for i in range(len(df)-days):
+        pnl.append(df["Close"].iloc[i+days] - df["Close"].iloc[i])
+
     bt = pd.DataFrame({"PnL": pnl})
     bt["CumPnL"] = bt["PnL"].cumsum()
 
@@ -159,7 +168,7 @@ with tab3:
     c3.metric("Total P&L", f"${bt.PnL.sum():,.2f}")
 
     fig = go.Figure()
-    fig.add_trace(go.Scatter(y=bt["CumPnL"]))
+    fig.add_trace(go.Scatter(y=bt["CumPnL"], name="Cumulative P&L"))
     st.plotly_chart(fig, use_container_width=True)
 
 # =====================================================
@@ -167,54 +176,52 @@ with tab3:
 # =====================================================
 with tab4:
     if not st.session_state.portfolio:
-        st.info("No trades yet")
+        st.info("No trades added yet.")
     else:
         pf = pd.DataFrame(st.session_state.portfolio)
         st.dataframe(pf)
         st.metric("Total Expected P&L", f"${pf['Expected PnL'].sum():,.2f}")
 
 # =====================================================
-# OPPORTUNITY TAB (SAFE)
+# OPPORTUNITY TAB (RANKED + SAFE)
 # =====================================================
 with tab5:
     st.subheader("Best Available Opportunity")
 
-    universe = ["AAPL", "MSFT", "NVDA", "META", "AMZN", "GOOGL",
-                "TSLA", "AMD", "NFLX", "AVGO"]
-
-    best = None
+    universe = ["AAPL","MSFT","NVDA","META","AMZN","GOOGL","TSLA","AMD","NFLX","AVGO"]
+    candidates = []
 
     for sym in universe:
         df_try = load_stock(sym)
-        if df_try.empty:
+        if df_try.empty or len(df_try) < 60:
             continue
 
-        p = df_try["Close"].iloc[-1]
-        v = annual_volatility(df_try)
-        m = expected_move(p, v)
+        price_t = df_try["Close"].iloc[-1]
+        ma50 = df_try["Close"].rolling(50).mean().iloc[-1]
 
-        b = p - m
-        s = p + m
-        stp = b - m * 0.5
+        if price_t < ma50:
+            continue  # trend filter
 
-        bp = 1 - prob_hit(p, b, v)
-        RRR_try = (s - b) / max(b - stp, 0.01)
+        vol_t = annual_volatility(df_try)
+        move_t = expected_move(price_t, vol_t)
+        buy_t = price_t - move_t
+        sell_t = price_t + move_t
+        stop_t = buy_t - move_t * 0.5
 
-        if bp >= 0.6 and RRR_try >= 1.5:
-            best = {
-                "Ticker": sym,
-                "Price": p,
-                "Buy": b,
-                "Sell": s,
-                "RRR": RRR_try,
-                "Prob": bp
-            }
-            break
+        prob_t = 1 - prob_hit(price_t, buy_t, vol_t)
+        RRR_t = (sell_t - buy_t) / max(buy_t - stop_t, 0.01)
+        EV = prob_t * (sell_t - buy_t)
 
-    if not best:
-        st.warning("No opportunity found right now")
+        if prob_t >= 0.55 and RRR_t >= 1.5:
+            candidates.append((EV, sym, buy_t, sell_t, RRR_t, prob_t))
+
+    if not candidates:
+        st.warning("❌ No good opportunities found right now.")
     else:
-        st.title(best["Ticker"])
-        st.metric("Buy Target", f"${best['Buy']:.2f}", f"{best['Prob']:.1%}")
-        st.metric("Sell Target", f"${best['Sell']:.2f}")
-        st.metric("Risk-Reward Ratio", f"{best['RRR']:.2f}")
+        best = sorted(candidates, reverse=True)[0]
+        _, sym, b, s, r, p = best
+
+        st.title(sym)
+        st.metric("Buy Target", f"${b:.2f}", f"{p:.1%}")
+        st.metric("Sell Target", f"${s:.2f}")
+        st.metric("Risk–Reward Ratio", f"{r:.2f}")
