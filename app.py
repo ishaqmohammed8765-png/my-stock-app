@@ -2,7 +2,6 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from scipy.stats import norm
 import plotly.graph_objects as go
 
 # =====================================================
@@ -22,10 +21,11 @@ MONTE_CARLO_SIMS = 5000
 ACCOUNT_SIZE = 10_000
 
 # =====================================================
-# SAFE DATA LOAD
+# FUNCTIONS
 # =====================================================
 @st.cache_data(ttl=300)
 def load_stock(ticker):
+    """Download stock data safely."""
     try:
         df = yf.download(ticker, period="6mo", progress=False)
         if df.empty or "Close" not in df.columns:
@@ -37,38 +37,68 @@ def load_stock(ticker):
         st.warning(f"Failed to load {ticker}: {e}")
         return pd.DataFrame()
 
-# =====================================================
-# VOLATILITY & EXPECTED MOVE
-# =====================================================
+
 def annual_volatility(df):
+    """Calculate annualized volatility using EWMA."""
     r = np.log(df["Close"] / df["Close"].shift(1)).dropna()
     if len(r) < 10:
         return 0.30
     vol = r.ewm(span=20).std().iloc[-1] * np.sqrt(252)
     return float(np.clip(vol, VOL_FLOOR, VOL_CAP))
 
+
 def expected_move(price, vol, days=DAYS):
+    """Expected price move over a given number of days."""
     return price * vol * np.sqrt(days / 252)
 
-# =====================================================
-# MONTE CARLO PROBABILITY TO HIT
-# =====================================================
+
 def prob_hit_mc(S, K, vol, days=DAYS, sims=MONTE_CARLO_SIMS):
+    """Vectorized Monte Carlo probability of hitting target."""
     dt = 1/252
-    hits = 0
-    for _ in range(sims):
-        price = S
-        for _ in range(days):
-            price *= np.exp((0 - 0.5*vol**2)*dt + vol*np.sqrt(dt)*np.random.normal())
-            if price >= K:
-                hits += 1
-                break
-    return hits / sims
+    # Simulate all paths at once
+    random_shocks = np.random.normal(size=(sims, days))
+    # cumulative product of geometric Brownian motion
+    price_paths = S * np.exp(np.cumsum(( -0.5*vol**2)*dt + vol*np.sqrt(dt)*random_shocks, axis=1))
+    hits = (price_paths >= K).any(axis=1)
+    return hits.mean()
+
+
+def kelly_fraction(df):
+    """Calculate Kelly fraction for position sizing."""
+    returns = df["Close"].pct_change().dropna()
+    wins = returns[returns > 0]
+    losses = returns[returns < 0]
+
+    if len(wins) < 10 or len(losses) < 10:
+        fraction = 0.02
+    else:
+        win_rate = len(wins) / len(returns)
+        loss_rate = 1 - win_rate
+        R = abs(wins.mean() / losses.mean())
+        fraction = win_rate - (loss_rate / R)
+
+    return float(np.clip(fraction * 0.5, KELLY_MIN, KELLY_MAX))
+
+
+def backtest(df, days=DAYS):
+    """Simple 30-day buy & hold backtest with stop-loss."""
+    pnl = []
+    for i in range(len(df) - days):
+        entry = df["Close"].iloc[i]
+        window = df["Close"].iloc[i:i+days]
+        stop_price = entry - expected_move(entry, annual_volatility(df)) * 0.5
+        hits = window[window <= stop_price]
+        exit_price = float(hits.iloc[0]) if not hits.empty else float(window.iloc[-1])
+        pnl.append(exit_price - entry)
+    bt = pd.DataFrame({"PnL": pnl})
+    bt["CumPnL"] = bt["PnL"].cumsum()
+    return bt
 
 # =====================================================
 # SESSION STATE
 # =====================================================
-st.session_state.setdefault("portfolio", [])
+if "portfolio" not in st.session_state:
+    st.session_state.portfolio = []
 
 # =====================================================
 # SIDEBAR
@@ -98,7 +128,7 @@ price = float(df["Close"].iloc[-1])
 vol = annual_volatility(df)
 
 # =====================================================
-# LEVELS
+# CALCULATIONS
 # =====================================================
 move = expected_move(price, vol)
 buy = price - move
@@ -109,23 +139,8 @@ buy_prob = 1 - prob_hit_mc(price, buy, vol)
 sell_prob = prob_hit_mc(price, sell, vol)
 RRR = (sell - buy) / max(buy - stop, 0.01)
 
-# =====================================================
-# KELLY POSITION SIZING
-# =====================================================
-returns = df["Close"].pct_change().dropna()
-wins = returns[returns > 0]
-losses = returns[returns < 0]
-
-if len(wins) < 10 or len(losses) < 10:
-    kelly_fraction = 0.02
-else:
-    win_rate = len(wins) / len(returns)
-    loss_rate = 1 - win_rate
-    R = abs(wins.mean() / losses.mean())
-    kelly_fraction = win_rate - (loss_rate / R)
-
-kelly_fraction = float(np.clip(kelly_fraction * 0.5, KELLY_MIN, KELLY_MAX))
-qty = int((ACCOUNT_SIZE * kelly_fraction) / max(buy - stop, 0.01))
+kelly = kelly_fraction(df)
+qty = int((ACCOUNT_SIZE * kelly) / max(buy - stop, 0.01))
 
 # =====================================================
 # TABS
@@ -139,11 +154,10 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs(
 # =====================================================
 with tab1:
     st.title(ticker)
-
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Price", f"${price:.2f}")
-    c2.metric("Buy Target", f"${buy:.2f}", f"{buy_prob:.1%}")
-    c3.metric("Sell Target", f"${sell:.2f}", f"{sell_prob:.1%}")
+    c2.metric("Buy Target", f"${buy:.2f}", f"{buy_prob*100:.1f}%")
+    c3.metric("Sell Target", f"${sell:.2f}", f"{sell_prob*100:.1f}%")
     c4.metric("Stop-Loss", f"${stop:.2f}")
 
     if RRR >= 2:
@@ -153,7 +167,6 @@ with tab1:
     else:
         st.error(f"Risk–Reward Ratio: {RRR:.2f}")
 
-    st.info("📌 **Recommended RRR ≥ 1.5** — lower ratios mean poor reward vs risk.")
     st.metric("Kelly Position Size (Shares)", qty)
     st.metric("Expected Profit", f"${(sell-buy)*qty:,.2f}")
 
@@ -173,27 +186,11 @@ with tab2:
 # =====================================================
 with tab3:
     st.info("📘 Backtest: 30-day buy & hold with stop-loss")
-
-    pnl = []
-    for i in range(len(df)-DAYS):
-        entry = float(df["Close"].iloc[i])
-        window = df["Close"].iloc[i:i+DAYS]
-        if window.empty:
-            continue
-        stop_price = entry - expected_move(entry, annual_volatility(df))*0.5
-        if (window <= stop_price).any():
-            exit_price = float(window[window <= stop_price].iloc[0])
-        else:
-            exit_price = float(df["Close"].iloc[i+DAYS])
-        pnl.append(exit_price - entry)
-
-    bt = pd.DataFrame({"PnL": pnl})
-    bt["CumPnL"] = bt["PnL"].cumsum()
-
+    bt = backtest(df)
     c1, c2, c3 = st.columns(3)
-    c1.metric("Win Rate", f"{(bt.PnL>0).mean():.1%}")
-    c2.metric("Profit Factor",
-              f"{bt[bt.PnL>0].PnL.sum() / max(abs(bt[bt.PnL<0].PnL.sum()),0.01):.2f}")
+    c1.metric("Win Rate", f"{(bt.PnL>0).mean()*100:.1f}%")
+    profit_factor = bt[bt.PnL>0].PnL.sum() / max(abs(bt[bt.PnL<0].PnL.sum()),0.01)
+    c2.metric("Profit Factor", f"{profit_factor:.2f}")
     c3.metric("Total P&L", f"${bt.PnL.sum():,.2f}")
 
     fig = go.Figure()
@@ -216,7 +213,6 @@ with tab4:
 # =====================================================
 with tab5:
     st.subheader("Best Available Opportunity")
-
     universe = ["AAPL","MSFT","NVDA","META","AMZN","GOOGL","TSLA","AMD","NFLX","AVGO"]
     candidates = []
 
@@ -246,10 +242,10 @@ with tab5:
     if not candidates:
         st.warning("❌ No good opportunities found right now.")
     else:
-        best = sorted(candidates, reverse=True)[0]
+        best = max(candidates, key=lambda x: x[0])
         _, sym, b, s, r, p = best
 
         st.title(sym)
-        st.metric("Buy Target", f"${b:.2f}", f"{p:.1%}")
+        st.metric("Buy Target", f"${b:.2f}", f"{p*100:.1f}%")
         st.metric("Sell Target", f"${s:.2f}")
         st.metric("Risk–Reward Ratio", f"{r:.2f}")
