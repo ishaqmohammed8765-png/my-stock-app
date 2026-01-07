@@ -30,45 +30,49 @@ def load_stock(ticker):
         df = yf.download(ticker, period="6mo", progress=False)
         if df.empty or "Close" not in df.columns:
             return pd.DataFrame()
+        df = df.copy()
         if df.index.tz is not None:
             df.index = df.index.tz_localize(None)
-        df["Close"] = pd.to_numeric(df["Close"], errors="coerce").dropna()
+        df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
+        df = df.dropna(subset=["Close"])
         return df.tail(120)
-    except Exception as e:
-        st.warning(f"Failed to load {ticker}: {e}")
+    except Exception:
         return pd.DataFrame()
-
 
 def annual_volatility(df):
     """Calculate annualized volatility using EWMA."""
+    if df.empty:
+        return 0.30
     r = np.log(df["Close"] / df["Close"].shift(1)).dropna()
     if len(r) < 10:
         return 0.30
     vol = r.ewm(span=20).std().iloc[-1] * np.sqrt(252)
     return float(np.clip(vol, VOL_FLOOR, VOL_CAP))
 
-
 def expected_move(price, vol, days=DAYS):
     """Expected price move over a given number of days."""
     return price * vol * np.sqrt(days / 252)
 
-
 def prob_hit_mc(S, K, vol, days=DAYS, sims=MONTE_CARLO_SIMS):
     """Vectorized Monte Carlo probability of hitting target."""
+    if vol <= 0 or S <= 0 or K <= 0:
+        return 0.0
     dt = 1/252
     random_shocks = np.random.normal(size=(sims, days))
     price_paths = S * np.exp(np.cumsum((-0.5*vol**2)*dt + vol*np.sqrt(dt)*random_shocks, axis=1))
     hits = (price_paths >= K).any(axis=1)
-    return hits.mean()
-
+    return float(hits.mean())
 
 def kelly_fraction(df):
     """Calculate Kelly fraction for position sizing."""
+    if df.empty:
+        return 0.02
     returns = df["Close"].pct_change().dropna()
     returns = pd.to_numeric(returns, errors="coerce").dropna()
+    if returns.empty:
+        return 0.02
     wins = returns[returns > 0]
     losses = returns[returns < 0]
-
     if len(wins) < 10 or len(losses) < 10:
         fraction = 0.02
     else:
@@ -76,16 +80,14 @@ def kelly_fraction(df):
         loss_rate = 1 - win_rate
         R = abs(wins.mean() / losses.mean()) if losses.mean() != 0 else 1
         fraction = win_rate - (loss_rate / R)
-
     return float(np.clip(fraction * 0.5, KELLY_MIN, KELLY_MAX))
-
 
 def backtest(df, days=DAYS):
     """Simple 30-day buy & hold backtest with stop-loss."""
     pnl = []
     for i in range(len(df) - days):
         entry = df["Close"].iloc[i]
-        window = df["Close"].iloc[i:i+days]
+        window = df["Close"].iloc[i:i+days].copy()
         stop_price = entry - expected_move(entry, annual_volatility(df)) * 0.5
         window = pd.to_numeric(window, errors="coerce").dropna()
         if window.empty:
@@ -93,6 +95,8 @@ def backtest(df, days=DAYS):
         hits = window[window <= stop_price]
         exit_price = float(hits.iloc[0]) if not hits.empty else float(window.iloc[-1])
         pnl.append(exit_price - entry)
+    if not pnl:
+        return pd.DataFrame({"PnL": []})
     bt = pd.DataFrame({"PnL": pnl})
     bt["PnL"] = pd.to_numeric(bt["PnL"], errors="coerce").fillna(0)
     bt["CumPnL"] = bt["PnL"].cumsum()
@@ -103,26 +107,30 @@ def backtest(df, days=DAYS):
 # =====================================================
 if "portfolio" not in st.session_state:
     st.session_state.portfolio = []
+if "df" not in st.session_state:
+    st.session_state.df = pd.DataFrame()
+if "ticker" not in st.session_state:
+    st.session_state.ticker = ""
 
 # =====================================================
 # SIDEBAR
 # =====================================================
 with st.sidebar:
-    ticker = st.text_input("Stock Symbol", value="AAPL").upper()
+    ticker_input = st.text_input("Stock Symbol", value="AAPL").upper()
     load = st.button("Load Stock")
 
 # =====================================================
 # LOAD STOCK
 # =====================================================
 if load:
-    df = load_stock(ticker)
+    df = load_stock(ticker_input)
     if df.empty:
         st.error("No data available for this stock.")
-        st.stop()
-    st.session_state.df = df
-    st.session_state.ticker = ticker
+    else:
+        st.session_state.df = df
+        st.session_state.ticker = ticker_input
 
-if "df" not in st.session_state:
+if st.session_state.df.empty:
     st.info("👈 Enter a stock symbol and press **Load Stock**")
     st.stop()
 
@@ -180,9 +188,9 @@ with tab1:
 with tab2:
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=df.index, y=df["Close"], name="Price"))
-    fig.add_hline(y=buy, line_dash="dot", annotation_text="Buy")
-    fig.add_hline(y=sell, line_dash="dot", annotation_text="Sell")
-    fig.add_hline(y=stop, line_dash="dot", annotation_text="Stop")
+    for y_val, name in [(buy, "Buy"), (sell, "Sell"), (stop, "Stop")]:
+        if not np.isnan(y_val):
+            fig.add_hline(y=y_val, line_dash="dot", annotation_text=name)
     st.plotly_chart(fig, use_container_width=True)
 
 # =====================================================
@@ -192,15 +200,19 @@ with tab3:
     st.info("📘 Backtest: 30-day buy & hold with stop-loss")
     bt = backtest(df)
     c1, c2, c3 = st.columns(3)
-    win_rate = (bt["PnL"] > 0).mean() * 100
-    profit_factor = bt[bt["PnL"]>0].PnL.sum() / max(abs(bt[bt["PnL"]<0].PnL.sum()), 0.01)
+    if not bt.empty:
+        win_rate = (bt["PnL"] > 0).mean() * 100
+        profit_factor = bt[bt["PnL"]>0].PnL.sum() / max(abs(bt[bt["PnL"]<0].PnL.sum()), 0.01)
+        total_pnl = bt["PnL"].sum()
+    else:
+        win_rate = profit_factor = total_pnl = 0
     c1.metric("Win Rate", f"{win_rate:.1f}%")
     c2.metric("Profit Factor", f"{profit_factor:.2f}")
-    c3.metric("Total P&L", f"${bt['PnL'].sum():,.2f}")
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(y=bt["CumPnL"], name="Cumulative P&L"))
-    st.plotly_chart(fig, use_container_width=True)
+    c3.metric("Total P&L", f"${total_pnl:,.2f}")
+    if not bt.empty:
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(y=bt["CumPnL"], name="Cumulative P&L"))
+        st.plotly_chart(fig, use_container_width=True)
 
 # =====================================================
 # PORTFOLIO TAB
@@ -210,6 +222,8 @@ with tab4:
         st.info("No trades added yet.")
     else:
         pf = pd.DataFrame(st.session_state.portfolio)
+        if "Expected PnL" not in pf.columns:
+            pf["Expected PnL"] = 0
         pf = pf.apply(pd.to_numeric, errors="coerce").fillna(0)
         st.dataframe(pf)
         st.metric("Total Expected P&L", f"${pf['Expected PnL'].sum():,.2f}")
