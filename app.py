@@ -32,6 +32,7 @@ def load_stock(ticker):
             return pd.DataFrame()
         if df.index.tz is not None:
             df.index = df.index.tz_localize(None)
+        df["Close"] = pd.to_numeric(df["Close"], errors="coerce").dropna()
         return df.tail(120)
     except Exception as e:
         st.warning(f"Failed to load {ticker}: {e}")
@@ -55,10 +56,8 @@ def expected_move(price, vol, days=DAYS):
 def prob_hit_mc(S, K, vol, days=DAYS, sims=MONTE_CARLO_SIMS):
     """Vectorized Monte Carlo probability of hitting target."""
     dt = 1/252
-    # Simulate all paths at once
     random_shocks = np.random.normal(size=(sims, days))
-    # cumulative product of geometric Brownian motion
-    price_paths = S * np.exp(np.cumsum(( -0.5*vol**2)*dt + vol*np.sqrt(dt)*random_shocks, axis=1))
+    price_paths = S * np.exp(np.cumsum((-0.5*vol**2)*dt + vol*np.sqrt(dt)*random_shocks, axis=1))
     hits = (price_paths >= K).any(axis=1)
     return hits.mean()
 
@@ -66,6 +65,7 @@ def prob_hit_mc(S, K, vol, days=DAYS, sims=MONTE_CARLO_SIMS):
 def kelly_fraction(df):
     """Calculate Kelly fraction for position sizing."""
     returns = df["Close"].pct_change().dropna()
+    returns = pd.to_numeric(returns, errors="coerce").dropna()
     wins = returns[returns > 0]
     losses = returns[returns < 0]
 
@@ -74,7 +74,7 @@ def kelly_fraction(df):
     else:
         win_rate = len(wins) / len(returns)
         loss_rate = 1 - win_rate
-        R = abs(wins.mean() / losses.mean())
+        R = abs(wins.mean() / losses.mean()) if losses.mean() != 0 else 1
         fraction = win_rate - (loss_rate / R)
 
     return float(np.clip(fraction * 0.5, KELLY_MIN, KELLY_MAX))
@@ -87,10 +87,14 @@ def backtest(df, days=DAYS):
         entry = df["Close"].iloc[i]
         window = df["Close"].iloc[i:i+days]
         stop_price = entry - expected_move(entry, annual_volatility(df)) * 0.5
+        window = pd.to_numeric(window, errors="coerce").dropna()
+        if window.empty:
+            continue
         hits = window[window <= stop_price]
         exit_price = float(hits.iloc[0]) if not hits.empty else float(window.iloc[-1])
         pnl.append(exit_price - entry)
     bt = pd.DataFrame({"PnL": pnl})
+    bt["PnL"] = pd.to_numeric(bt["PnL"], errors="coerce").fillna(0)
     bt["CumPnL"] = bt["PnL"].cumsum()
     return bt
 
@@ -188,10 +192,11 @@ with tab3:
     st.info("📘 Backtest: 30-day buy & hold with stop-loss")
     bt = backtest(df)
     c1, c2, c3 = st.columns(3)
-    c1.metric("Win Rate", f"{(bt.PnL>0).mean()*100:.1f}%")
-    profit_factor = bt[bt.PnL>0].PnL.sum() / max(abs(bt[bt.PnL<0].PnL.sum()),0.01)
+    win_rate = (bt["PnL"] > 0).mean() * 100
+    profit_factor = bt[bt["PnL"]>0].PnL.sum() / max(abs(bt[bt["PnL"]<0].PnL.sum()), 0.01)
+    c1.metric("Win Rate", f"{win_rate:.1f}%")
     c2.metric("Profit Factor", f"{profit_factor:.2f}")
-    c3.metric("Total P&L", f"${bt.PnL.sum():,.2f}")
+    c3.metric("Total P&L", f"${bt['PnL'].sum():,.2f}")
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(y=bt["CumPnL"], name="Cumulative P&L"))
@@ -205,6 +210,7 @@ with tab4:
         st.info("No trades added yet.")
     else:
         pf = pd.DataFrame(st.session_state.portfolio)
+        pf = pf.apply(pd.to_numeric, errors="coerce").fillna(0)
         st.dataframe(pf)
         st.metric("Total Expected P&L", f"${pf['Expected PnL'].sum():,.2f}")
 
@@ -244,7 +250,6 @@ with tab5:
     else:
         best = max(candidates, key=lambda x: x[0])
         _, sym, b, s, r, p = best
-
         st.title(sym)
         st.metric("Buy Target", f"${b:.2f}", f"{p*100:.1f}%")
         st.metric("Sell Target", f"${s:.2f}")
