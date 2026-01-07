@@ -5,7 +5,21 @@ import numpy as np
 from scipy.stats import norm
 import plotly.graph_objects as go
 
+# =====================================================
+# CONFIG
+# =====================================================
 st.set_page_config(page_title="Stock Calculator Pro", layout="wide")
+
+# =====================================================
+# CONSTANTS
+# =====================================================
+DAYS = 30
+VOL_FLOOR = 0.10
+VOL_CAP = 1.5
+KELLY_MAX = 0.15
+KELLY_MIN = 0.01
+MONTE_CARLO_SIMS = 5000
+ACCOUNT_SIZE = 10_000
 
 # =====================================================
 # SAFE DATA LOAD
@@ -14,33 +28,42 @@ st.set_page_config(page_title="Stock Calculator Pro", layout="wide")
 def load_stock(ticker):
     try:
         df = yf.download(ticker, period="6mo", progress=False)
-        df = df.tail(120)
-        if df.empty or "Close" not in df:
+        if df.empty or "Close" not in df.columns:
             return pd.DataFrame()
-        df.index = df.index.tz_localize(None)
-        return df
-    except:
+        if df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
+        return df.tail(120)
+    except Exception as e:
+        st.warning(f"Failed to load {ticker}: {e}")
         return pd.DataFrame()
 
 # =====================================================
-# SAFE VOLATILITY (FIXED)
+# VOLATILITY & EXPECTED MOVE
 # =====================================================
 def annual_volatility(df):
     r = np.log(df["Close"] / df["Close"].shift(1)).dropna()
     if len(r) < 10:
         return 0.30
-    vol = float(r.std()) * np.sqrt(252)
-    return max(0.15, min(vol, 1.5))
+    vol = r.ewm(span=20).std().iloc[-1] * np.sqrt(252)
+    return float(np.clip(vol, VOL_FLOOR, VOL_CAP))
 
-def expected_move(price, vol, days=30):
-    return price * vol * np.sqrt(days / 365)
+def expected_move(price, vol, days=DAYS):
+    return price * vol * np.sqrt(days / 252)
 
-def prob_hit(S, K, vol, days=30):
-    T = days / 365
-    if S <= 0 or K <= 0:
-        return 0.5
-    d2 = (np.log(S / K) - 0.5 * vol**2 * T) / (vol * np.sqrt(T))
-    return float(np.clip(norm.cdf(d2), 0.001, 0.999))
+# =====================================================
+# MONTE CARLO PROBABILITY TO HIT
+# =====================================================
+def prob_hit_mc(S, K, vol, days=DAYS, sims=MONTE_CARLO_SIMS):
+    dt = 1/252
+    hits = 0
+    for _ in range(sims):
+        price = S
+        for _ in range(days):
+            price *= np.exp((0 - 0.5*vol**2)*dt + vol*np.sqrt(dt)*np.random.normal())
+            if price >= K:
+                hits += 1
+                break
+    return hits / sims
 
 # =====================================================
 # SESSION STATE
@@ -77,14 +100,13 @@ vol = annual_volatility(df)
 # =====================================================
 # LEVELS
 # =====================================================
-days = 30
-move = expected_move(price, vol, days)
+move = expected_move(price, vol)
 buy = price - move
 sell = price + move
 stop = buy - move * 0.5
 
-buy_prob = 1 - prob_hit(price, buy, vol, days)
-sell_prob = prob_hit(price, sell, vol, days)
+buy_prob = 1 - prob_hit_mc(price, buy, vol)
+sell_prob = prob_hit_mc(price, sell, vol)
 RRR = (sell - buy) / max(buy - stop, 0.01)
 
 # =====================================================
@@ -102,9 +124,8 @@ else:
     R = abs(wins.mean() / losses.mean())
     kelly_fraction = win_rate - (loss_rate / R)
 
-kelly_fraction = max(min(kelly_fraction * 0.5, 0.15), 0.01)
-account_size = 10_000
-qty = int((account_size * kelly_fraction) / max(buy - stop, 0.01))
+kelly_fraction = float(np.clip(kelly_fraction * 0.5, KELLY_MIN, KELLY_MAX))
+qty = int((ACCOUNT_SIZE * kelly_fraction) / max(buy - stop, 0.01))
 
 # =====================================================
 # TABS
@@ -133,7 +154,6 @@ with tab1:
         st.error(f"Risk–Reward Ratio: {RRR:.2f}")
 
     st.info("📌 **Recommended RRR ≥ 1.5** — lower ratios mean poor reward vs risk.")
-
     st.metric("Kelly Position Size (Shares)", qty)
     st.metric("Expected Profit", f"${(sell-buy)*qty:,.2f}")
 
@@ -149,14 +169,18 @@ with tab2:
     st.plotly_chart(fig, use_container_width=True)
 
 # =====================================================
-# BACKTEST TAB (BEGINNER FRIENDLY)
+# BACKTEST TAB
 # =====================================================
 with tab3:
-    st.info("📘 This backtest checks what would have happened if you bought and held for 30 days each time.")
+    st.info("📘 Backtest: 30-day buy & hold with stop-loss")
 
     pnl = []
-    for i in range(len(df)-days):
-        pnl.append(df["Close"].iloc[i+days] - df["Close"].iloc[i])
+    for i in range(len(df)-DAYS):
+        entry = df["Close"].iloc[i]
+        window = df["Close"].iloc[i:i+DAYS]
+        stop_price = entry - expected_move(entry, annual_volatility(df))*0.5
+        exit_price = window.min() if (window <= stop_price).any() else df["Close"].iloc[i+DAYS]
+        pnl.append(exit_price - entry)
 
     bt = pd.DataFrame({"PnL": pnl})
     bt["CumPnL"] = bt["PnL"].cumsum()
@@ -164,7 +188,7 @@ with tab3:
     c1, c2, c3 = st.columns(3)
     c1.metric("Win Rate", f"{(bt.PnL>0).mean():.1%}")
     c2.metric("Profit Factor",
-              f"{bt[bt.PnL>0].PnL.sum() / abs(bt[bt.PnL<0].PnL.sum()):.2f}")
+              f"{bt[bt.PnL>0].PnL.sum() / max(abs(bt[bt.PnL<0].PnL.sum()),0.01):.2f}")
     c3.metric("Total P&L", f"${bt.PnL.sum():,.2f}")
 
     fig = go.Figure()
@@ -183,7 +207,7 @@ with tab4:
         st.metric("Total Expected P&L", f"${pf['Expected PnL'].sum():,.2f}")
 
 # =====================================================
-# OPPORTUNITY TAB (RANKED + SAFE)
+# OPPORTUNITY TAB
 # =====================================================
 with tab5:
     st.subheader("Best Available Opportunity")
@@ -198,9 +222,8 @@ with tab5:
 
         price_t = df_try["Close"].iloc[-1]
         ma50 = df_try["Close"].rolling(50).mean().iloc[-1]
-
         if price_t < ma50:
-            continue  # trend filter
+            continue
 
         vol_t = annual_volatility(df_try)
         move_t = expected_move(price_t, vol_t)
@@ -208,7 +231,7 @@ with tab5:
         sell_t = price_t + move_t
         stop_t = buy_t - move_t * 0.5
 
-        prob_t = 1 - prob_hit(price_t, buy_t, vol_t)
+        prob_t = 1 - prob_hit_mc(price_t, buy_t, vol_t)
         RRR_t = (sell_t - buy_t) / max(buy_t - stop_t, 0.01)
         EV = prob_t * (sell_t - buy_t)
 
