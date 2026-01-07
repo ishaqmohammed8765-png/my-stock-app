@@ -23,15 +23,21 @@ ACCOUNT_SIZE = 10_000
 # =====================================================
 # FUNCTIONS
 # =====================================================
+@st.cache_data(ttl=3600)  # Cache for 1 hour to avoid rate limits
 def load_stock(ticker):
     """Download stock data safely."""
+    import time
+    
     try:
-        # Use Ticker object for more reliable data access
+        # Add small delay to avoid rate limiting
+        time.sleep(0.5)
+        
+        # Use Ticker object with timeout
         stock = yf.Ticker(ticker)
-        df = stock.history(period="6mo")
+        df = stock.history(period="6mo", timeout=10)
         
         if df is None or df.empty:
-            st.error(f"⚠️ No data returned from Yahoo Finance for {ticker}")
+            st.warning(f"⚠️ No data available for {ticker}. Yahoo Finance may be rate limiting. Try again in a few minutes or use a different ticker.")
             return pd.DataFrame()
         
         # The history() method returns a clean DataFrame with Close column
@@ -53,7 +59,11 @@ def load_stock(ticker):
             
         return df.tail(120)
     except Exception as e:
-        st.error(f"❌ Error loading {ticker}: {str(e)}")
+        error_msg = str(e)
+        if "Rate limit" in error_msg or "Too Many Requests" in error_msg:
+            st.error(f"🚫 Yahoo Finance rate limit reached. Please wait 5-10 minutes before trying again. Cache may help on reload.")
+        else:
+            st.error(f"❌ Error loading {ticker}: {error_msg}")
         return pd.DataFrame()
 
 def annual_volatility(df):
@@ -129,12 +139,7 @@ if "df" not in st.session_state:
 if "ticker" not in st.session_state:
     st.session_state.ticker = ""
 
-# =====================================================
-# SIDEBAR
-# =====================================================
-with st.sidebar:
-    ticker_input = st.text_input("Stock Symbol", value="AAPL").upper()
-    load = st.button("Load Stock")
+
 
 # =====================================================
 # LOAD STOCK
