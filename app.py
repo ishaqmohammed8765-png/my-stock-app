@@ -1,12 +1,12 @@
 """
-Stock Calculator Pro — Beginner-Friendly Advanced Dashboard
+Stock Calculator Pro — Advanced Dashboard
 Features:
-- Auto Buy/Sell Targets with Probability
+- Auto Buy/Sell Targets with Probabilities
 - Suggested Action (Buy / Hold / Sell)
 - Stop-Loss & Risk Control
 - Position Sizing via Kelly Criterion
-- Random Strong-Buy Opportunity Finder
-- Beginner-Friendly Backtesting with Metrics and Cumulative P&L Chart
+- Random Buy / Strong Buy Opportunity Finder
+- Backtesting with Metrics and Cumulative P&L Chart
 - Traffic-Light Risk-to-Reward System
 - Portfolio Tracking + CSV Download
 - Robust error handling to prevent white screens and handle data limits
@@ -62,7 +62,6 @@ def load_stock(ticker):
         stock = yf.Ticker(ticker)
         hist = stock.history(period="6mo")
         if hist.empty:
-            # fallback dummy data
             return 1.0, pd.DataFrame({"Open":[1], "High":[1], "Low":[1], "Close":[1]}, index=[pd.Timestamp.today()])
         hist.index = hist.index.tz_localize(None)
         hist = hist.tail(120)  # limit to prevent overload
@@ -125,11 +124,11 @@ def find_opportunity():
         buy_prob = 1 - bs_prob(price, buy_target, sigma, T)
         sell_prob = bs_prob(price, sell_target, sigma, T)
         RRR = (sell_target - buy_target)/(buy_target - calc_stop_loss(buy_target, sigma))
-        # only strong buy
-        if buy_prob >= 0.7 and RRR >= 1.5:
+        # Buy or Strong Buy
+        if buy_prob >= 0.6 and RRR >= 1.0:
             stop_loss = calc_stop_loss(buy_target, sigma)
             action, color = suggested_action(buy_prob, sell_prob)
-            qty = kelly_position_size(st.session_state.account_balance, 0.6, RRR, buy_target, stop_loss) # default 60% win rate
+            qty = kelly_position_size(st.session_state.account_balance, 0.6, RRR, buy_target, stop_loss)
             return {"Ticker": ticker, "Price": price, "Hist": hist, "BuyTarget": buy_target, "SellTarget": sell_target, "BuyProb": buy_prob, "SellProb": sell_prob, "Action": action, "Color": color, "StopLoss": stop_loss, "Qty": qty, "RRR": RRR}
     return None
 
@@ -149,11 +148,9 @@ def backtest(hist, sigma, horizon_days=30):
         buy_target = S - calculate_expected_move(S, sigma, T)
         sell_target = S + calculate_expected_move(S, sigma, T)
         stop_loss = calc_stop_loss(buy_target, sigma)
-        # Probabilities
         buy_prob = 1 - bs_prob(S, buy_target, sigma, T)
         sell_prob = bs_prob(S, sell_target, sigma, T)
         action, _ = suggested_action(buy_prob, sell_prob)
-        # Gap-down realism
         open_next = hist["Open"].iloc[i+1]
         pnl = 0
         if open_next < stop_loss:
@@ -187,7 +184,8 @@ with st.sidebar:
 # ==========================
 # MAIN
 # ==========================
-st.title("📈 Stock Calculator Pro — Beginner-Friendly Dashboard")
+st.title("📈 Stock Calculator Pro")
+
 S = None
 hist = None
 
@@ -230,64 +228,50 @@ with tab1:
         action, color = suggested_action(buy_prob, sell_prob)
         pnl = calculate_pnl(buy_target, sell_target, qty)
         RRR = (sell_target - buy_target)/(buy_target - stop_loss)
-        # Traffic light
-        if RRR < 1.5: rrr_msg = st.error(f"Poor Risk-Reward Ratio: {RRR:.2f}")
-        elif RRR > 2.0: rrr_msg = st.success(f"Good Risk-Reward Ratio: {RRR:.2f}")
-        else: rrr_msg = st.warning(f"Moderate Risk-Reward Ratio: {RRR:.2f}")
 
-        st.header(f"Ticker: {st.session_state.ticker}")
+        # Metrics display
+        st.header(f"{st.session_state.ticker}")
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Price", f"${S:.2f}")
         c2.metric("Buy Target", f"${buy_target:.2f}", f"{buy_prob:.1%}")
         c3.metric("Sell Target", f"${sell_target:.2f}", f"{sell_prob:.1%}")
         c4.metric("Stop-Loss", f"${stop_loss:.2f}")
+
         st.markdown(f"### Suggested Action: <span style='color:{color}'>{action}</span>", unsafe_allow_html=True)
+
+        # Risk-to-Reward Panel just below metrics
+        if RRR < 1.5: st.error(f"Risk-Reward Ratio: {RRR:.2f}")
+        elif RRR > 2.0: st.success(f"Risk-Reward Ratio: {RRR:.2f}")
+        else: st.warning(f"Risk-Reward Ratio: {RRR:.2f}")
+        st.info("Recommended RRR ≥ 1.5 — Higher values indicate better reward relative to risk.")
+
         st.metric("Position Size (Qty)", f"{qty}")
         st.metric("Expected P&L", f"${pnl:,.2f}")
 
+        # Add to Portfolio
         st.divider()
         with st.form("manual_trade"):
             qty_input = st.number_input("Quantity", min_value=1, value=qty)
             submit_trade = st.form_submit_button("Add Trade to Portfolio")
         if submit_trade:
-            st.session_state.portfolio.append({"Ticker": st.session_state.ticker,"Time": datetime.now().strftime("%Y-%m-%d %H:%M"),"Buy": buy_target,"Sell": sell_target,"StopLoss": stop_loss,"Qty": qty_input,"PnL": calculate_pnl(buy_target, sell_target, qty_input)})
+            st.session_state.portfolio.append({
+                "Ticker": st.session_state.ticker,
+                "Time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "Buy": buy_target,
+                "Sell": sell_target,
+                "StopLoss": stop_loss,
+                "Qty": qty_input,
+                "PnL": calculate_pnl(buy_target, sell_target, qty_input)
+            })
             st.success("Trade added!")
-
-# ==========================
-# TAB 2 — CHART
-# ==========================
-with tab2:
-    if hist is not None:
-        move = calculate_expected_move(S, st.session_state.volatility, st.session_state.horizon/365)
-        fig = go.Figure()
-        fig.add_candlestick(x=hist.index, open=hist["Open"], high=hist["High"], low=hist["Low"], close=hist["Close"])
-        fig.add_hrect(y0=S - move, y1=S + move, fillcolor="green", opacity=0.06, line_width=0)
-        fig.add_hrect(y0=S - 2*move, y1=S + 2*move, fillcolor="red", opacity=0.04, line_width=0)
-        fig.add_hline(y=st.session_state.buy_price, line_dash="dash", line_color="blue")
-        fig.add_hline(y=st.session_state.sell_price, line_dash="dash", line_color="green")
-        fig.add_hline(y=st.session_state.stop_loss, line_dash="dot", line_color="red")
-        fig.update_layout(height=650, title=f"{st.session_state.ticker} — Expected Move & Stop-Loss", xaxis_rangeslider_visible=False)
-        st.plotly_chart(fig, use_container_width=True)
-    else: st.info("Load a ticker to view chart")
-
-# ==========================
-# TAB 3 — PORTFOLIO
-# ==========================
-with tab3:
-    if st.session_state.portfolio:
-        df = pd.DataFrame(st.session_state.portfolio)
-        st.dataframe(df, use_container_width=True)
-        st.metric("Total P&L", f"${df['PnL'].sum():,.2f}")
-        st.download_button("Download Portfolio CSV", df.to_csv(index=False), "portfolio.csv")
-    else: st.info("No trades yet")
 
 # ==========================
 # TAB 4 — OPPORTUNITY
 # ==========================
 with tab4:
-    st.subheader("🚀 Random Strong-Buy Opportunity Finder")
+    st.subheader("🚀 Random Buy / Strong Buy Opportunity")
     if st.button("Find Opportunity"):
-        with st.spinner("Searching for strong buy..."):
+        with st.spinner("Searching for opportunity..."):
             opp = find_opportunity()
         if opp:
             st.session_state.ticker = opp["Ticker"]
@@ -299,7 +283,7 @@ with tab4:
             st.session_state.qty = opp["Qty"]
             st.session_state.volatility = hist_vol(opp["Hist"])
 
-            st.title(f"{opp['Ticker']} Opportunity")
+            st.title(f"{opp['Ticker']}")
             st.metric("Price", f"${opp['Price']:.2f}")
             st.metric("Buy Target", f"${opp['BuyTarget']:.2f}", f"{opp['BuyProb']:.1%}")
             st.metric("Sell Target", f"${opp['SellTarget']:.2f}", f"{opp['SellProb']:.1%}")
@@ -307,33 +291,9 @@ with tab4:
             st.metric("Position Size (Qty)", f"{opp['Qty']}")
             st.markdown(f"### Suggested Action: <span style='color:{opp['Color']}'>{opp['Action']}</span>", unsafe_allow_html=True)
             # RRR traffic light
-            if opp['RRR'] < 1.5: st.error(f"Poor Risk-Reward Ratio: {opp['RRR']:.2f}")
-            elif opp['RRR'] > 2.0: st.success(f"Good Risk-Reward Ratio: {opp['RRR']:.2f}")
-            else: st.warning(f"Moderate Risk-Reward Ratio: {opp['RRR']:.2f}")
+            if opp['RRR'] < 1.5: st.error(f"Risk-Reward Ratio: {opp['RRR']:.2f}")
+            elif opp['RRR'] > 2.0: st.success(f"Risk-Reward Ratio: {opp['RRR']:.2f}")
+            else: st.warning(f"Risk-Reward Ratio: {opp['RRR']:.2f}")
+            st.info("Recommended RRR ≥ 1.5 — Higher values indicate better reward relative to risk.")
         else:
-            st.warning("No strong buy opportunity found!")
-
-# ==========================
-# TAB 5 — BACKTEST
-# ==========================
-with tab5:
-    if hist is not None:
-        st.subheader("📜 Backtesting (Beginner-Friendly)")
-        df_bt, win_rate, pf, mdd = backtest(hist, st.session_state.volatility)
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Win Rate", f"{win_rate:.1%}", "Percentage of profitable trades")
-        c2.metric("Profit Factor", f"{pf:.2f}", "Profit compared to losses")
-        c3.metric("Max Drawdown", f"${mdd:,.2f}", "Largest money drop")
-        c4.metric("Total Cumulative P&L", f"${df_bt['CumulativePnL'].iloc[-1]:,.2f}")
-        # Cumulative P&L chart
-        fig = go.Figure()
-        fig.add_scatter(x=df_bt["Date"], y=df_bt["CumulativePnL"], mode="lines+markers", name="Cumulative PnL", line=dict(color="green"))
-        fig.update_layout(title="Backtest Cumulative P&L", xaxis_title="Date", yaxis_title="Cumulative P&L ($)")
-        st.plotly_chart(fig, use_container_width=True)
-        # Show top 3 profitable trades
-        st.subheader("Top 3 Trades by P&L")
-        top_trades = df_bt.nlargest(3, "PnL")[["Date","BuyTarget","SellTarget","Action","PnL"]]
-        for idx, row in top_trades.iterrows():
-            st.markdown(f"**Date:** {row['Date'].date()} | **Action:** {row['Action']} | **Buy:** ${row['BuyTarget']:.2f} | **Sell:** ${row['SellTarget']:.2f} | **PnL:** ${row['PnL']:.2f}")
-    else:
-        st.info("Load a ticker to backtest")
+            st.warning("No opportunity found!")
