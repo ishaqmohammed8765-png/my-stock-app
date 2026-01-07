@@ -1,6 +1,11 @@
 """
-Stock Calculator Pro — Enhanced & Streamlit/GitHub Safe
-Features: Auto buy/sell targets, probability indicators, random opportunity finder.
+Stock Calculator Pro — Smart Dashboard
+Features:
+- Auto buy/sell targets with probability
+- Suggested action (Buy / Hold / Sell)
+- Random opportunity finder
+- Candlestick chart with expected moves
+- Portfolio tracking (in-memory + CSV download)
 """
 
 import streamlit as st
@@ -47,19 +52,18 @@ init_state()
 # ==========================
 @st.cache_data(ttl=300)
 def load_stock(ticker):
-    """Load 6 months of historical stock data with safe fallback."""
+    """Load historical data safely"""
     try:
         stock = yf.Ticker(ticker)
         hist = stock.history(period="6mo")
         if hist.empty:
-            # Dummy data if fetch fails
             hist = pd.DataFrame({
                 "Open": [1], "High": [1], "Low": [1], "Close": [1]
             }, index=[pd.Timestamp.today()])
             price = 1.0
         else:
             hist.index = hist.index.tz_localize(None)
-            hist = hist.tail(120)  # last ~6 months
+            hist = hist.tail(120)  # limit to last ~6 months
             price = hist["Close"].iloc[-1]
         return price, hist
     except Exception:
@@ -70,10 +74,12 @@ def load_stock(ticker):
 
 def hist_vol(hist, days=60):
     r = np.log(hist["Close"] / hist["Close"].shift(1)).dropna()
+    if r.empty: return 0.3
     return np.clip(r.tail(days).std() * np.sqrt(252), 0.05, 3.0)
 
 def ewma_vol(hist, span=20):
     r = np.log(hist["Close"] / hist["Close"].shift(1)).dropna()
+    if r.empty: return 0.3
     return np.clip(r.ewm(span=span).std().iloc[-1] * np.sqrt(252), 0.05, 3.0)
 
 # ==========================
@@ -98,8 +104,13 @@ def calculate_expected_move(S, sigma, T):
 def calculate_pnl(buy, sell, qty):
     return (sell - buy) * qty
 
+def suggested_action(buy_prob, sell_prob):
+    if buy_prob > 0.7: return "Buy", "green"
+    elif sell_prob > 0.7: return "Sell", "red"
+    else: return "Hold", "orange"
+
 # ==========================
-# RANDOM OPPORTUNITY SCANNER
+# RANDOM OPPORTUNITY
 # ==========================
 WATCHLIST = [
     "AAPL","MSFT","TSLA","GOOGL","AMZN","NVDA","META","NFLX",
@@ -116,6 +127,7 @@ def find_opportunity():
     sell_target = price + calculate_expected_move(price, sigma, T)
     buy_prob = 1 - bs_prob(price, buy_target, sigma, T)
     sell_prob = bs_prob(price, sell_target, sigma, T)
+    action, color = suggested_action(buy_prob, sell_prob)
     return {
         "Ticker": ticker,
         "Price": price,
@@ -123,122 +135,105 @@ def find_opportunity():
         "Sell Target": sell_target,
         "Buy Prob": buy_prob,
         "Sell Prob": sell_prob,
-        "Buy Indicator": interpret_prob(buy_prob)
+        "Action": action,
+        "Color": color,
+        "Hist": hist
     }
 
 # ==========================
 # SIDEBAR
 # ==========================
 with st.sidebar:
-    st.header("🔍 Stock Selection")
-    t = st.text_input("Ticker", placeholder="AAPL").upper()
-    if st.button("Load"):
-        with st.spinner("Fetching stock data..."):
-            price, hist = load_stock(t)
-        st.session_state.ticker = t
-        st.session_state.price = price
+    st.header("🔍 Stock Input")
+    ticker_input = st.text_input("Ticker", placeholder="AAPL").upper()
+    load_stock_btn = st.button("Load Stock")
+
+# ==========================
+# MAIN
+# ==========================
+st.title("📈 Stock Calculator Pro — Smart Dashboard")
+S = None
+hist = None
+
+# --- Load ticker ---
+if load_stock_btn and ticker_input:
+    with st.spinner("Fetching stock data..."):
+        S, hist = load_stock(ticker_input)
+        st.session_state.ticker = ticker_input
+        st.session_state.price = S
         st.session_state.hist = hist
-        st.session_state.buy_price = price * 0.95
-        st.session_state.sell_price = price * 1.05
+        # compute volatility
+        st.session_state.volatility = hist_vol(hist)
+        st.session_state.buy_price = S - calculate_expected_move(S, st.session_state.volatility, 30/365)
+        st.session_state.sell_price = S + calculate_expected_move(S, st.session_state.volatility, 30/365)
 
-    if st.session_state.hist is not None:
-        st.divider()
-        st.metric("Price", f"${st.session_state.price:.2f}")
-        st.session_state.vol_method = st.radio(
-            "Volatility method",
-            ["Historical", "EWMA"]
-        )
-        if st.session_state.vol_method == "Historical":
-            st.session_state.volatility = hist_vol(st.session_state.hist)
-        else:
-            st.session_state.volatility = ewma_vol(st.session_state.hist)
-        st.metric("σ (annual)", f"{st.session_state.volatility*100:.1f}%")
+# fallback
+if st.session_state.hist is not None:
+    S = st.session_state.price
+    hist = st.session_state.hist
 
-# ==========================
-# MAIN LAYOUT
-# ==========================
-st.title("📈 Stock Calculator Pro — GitHub/Streamlit Safe")
-
-if st.session_state.hist is None:
-    st.info("Load a ticker to begin")
-    st.stop()
-
-tab1, tab2, tab3, tab4 = st.tabs(["💰 Trade", "📊 Chart", "📁 Portfolio", "🚀 Opportunity Finder"])
+tab1, tab2, tab3, tab4 = st.tabs(["💰 Trade", "📊 Chart", "📁 Portfolio", "🚀 Opportunity"])
 
 # ==========================
 # TAB 1 — TRADE
 # ==========================
 with tab1:
-    st.subheader("⚡ Trade Presets & Manual Entry")
-    c1, c2, c3 = st.columns(3)
-    if c1.button("Scalp (5d)"): st.session_state.horizon = 5
-    if c2.button("Swing (30d)"): st.session_state.horizon = 30
-    if c3.button("Position (90d)"): st.session_state.horizon = 90
-    st.divider()
+    if hist is None:
+        st.info("Load a ticker to start")
+    else:
+        st.subheader(f"📌 {st.session_state.ticker} — Recommended Trade")
+        sigma = st.session_state.volatility
+        T = st.session_state.horizon / 365
+        buy_target = st.session_state.buy_price
+        sell_target = st.session_state.sell_price
+        buy_prob = 1 - bs_prob(S, buy_target, sigma, T)
+        sell_prob = bs_prob(S, sell_target, sigma, T)
+        action, color = suggested_action(buy_prob, sell_prob)
+        pnl = calculate_pnl(buy_target, sell_target, st.session_state.qty)
 
-    with st.form("trade_form"):
-        c1, c2 = st.columns(2)
-        with c1:
-            buy = st.number_input("Buy Price", value=st.session_state.buy_price)
-            qty = st.number_input("Quantity", min_value=1, value=st.session_state.qty)
-        with c2:
-            sell = st.number_input("Sell Price", value=st.session_state.sell_price)
-            days = st.number_input("Days", min_value=1, value=st.session_state.horizon)
-        submit = st.form_submit_button("Calculate")
+        # --- Metrics layout ---
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Price", f"${S:.2f}")
+        c2.metric("Buy Target", f"${buy_target:.2f}", f"{buy_prob:.1%}")
+        c3.metric("Sell Target", f"${sell_target:.2f}", f"{sell_prob:.1%}")
 
-    if submit:
-        st.session_state.buy_price = buy
-        st.session_state.sell_price = sell
-        st.session_state.qty = qty
-        st.session_state.horizon = days
-
-        S = st.session_state.price
-        σ = st.session_state.volatility
-        T = days / 365
-        buy_p = 1 - bs_prob(S, buy, σ, T)
-        sell_p = bs_prob(S, sell, σ, T)
-        move = calculate_expected_move(S, σ, T)
-        pnl = calculate_pnl(buy, sell, qty)
-
-        c1, c2 = st.columns(2)
-        c1.metric("Buy Probability", f"{buy_p:.1%}", interpret_prob(buy_p))
-        c2.metric("Sell Probability", f"{sell_p:.1%}", interpret_prob(sell_p))
-        st.divider()
+        st.markdown(f"### Suggested Action: <span style='color:{color}'>{action}</span>", unsafe_allow_html=True)
         st.metric("Expected P&L", f"${pnl:,.2f}")
-        if abs(buy - S) > 2 * move: st.warning("Buy target > 2σ away")
-        if abs(sell - S) > 2 * move: st.warning("Sell target > 2σ away")
-        # Portfolio in-memory
-        if st.button("Add to Portfolio"):
+
+        st.divider()
+        with st.form("manual_trade"):
+            qty = st.number_input("Quantity", min_value=1, value=st.session_state.qty)
+            submit_trade = st.form_submit_button("Add Trade to Portfolio")
+        if submit_trade:
             st.session_state.portfolio.append({
                 "Ticker": st.session_state.ticker,
                 "Time": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                "Buy": buy,
-                "Sell": sell,
+                "Buy": buy_target,
+                "Sell": sell_target,
                 "Qty": qty,
                 "PnL": pnl
             })
-            st.success("Trade added to portfolio")
+            st.success("Trade added!")
 
 # ==========================
 # TAB 2 — CHART
 # ==========================
 with tab2:
-    hist = st.session_state.hist
-    S = st.session_state.price
-    σ = st.session_state.volatility
-    T = st.session_state.horizon / 365
-    move = calculate_expected_move(S, σ, T)
-    fig = go.Figure()
-    fig.add_candlestick(
-        x=hist.index, open=hist["Open"], high=hist["High"],
-        low=hist["Low"], close=hist["Close"]
-    )
-    fig.add_hrect(y0=S - move, y1=S + move, fillcolor="green", opacity=0.06, line_width=0)
-    fig.add_hrect(y0=S - 2*move, y1=S + 2*move, fillcolor="red", opacity=0.04, line_width=0)
-    fig.add_hline(y=st.session_state.buy_price, line_dash="dash", line_color="blue")
-    fig.add_hline(y=st.session_state.sell_price, line_dash="dash", line_color="green")
-    fig.update_layout(height=650, title=f"{st.session_state.ticker} — Expected Move", xaxis_rangeslider_visible=False)
-    st.plotly_chart(fig, use_container_width=True)
+    if hist is not None:
+        move = calculate_expected_move(S, st.session_state.volatility, st.session_state.horizon/365)
+        fig = go.Figure()
+        fig.add_candlestick(
+            x=hist.index, open=hist["Open"], high=hist["High"],
+            low=hist["Low"], close=hist["Close"]
+        )
+        fig.add_hrect(y0=S - move, y1=S + move, fillcolor="green", opacity=0.06, line_width=0)
+        fig.add_hrect(y0=S - 2*move, y1=S + 2*move, fillcolor="red", opacity=0.04, line_width=0)
+        fig.add_hline(y=st.session_state.buy_price, line_dash="dash", line_color="blue")
+        fig.add_hline(y=st.session_state.sell_price, line_dash="dash", line_color="green")
+        fig.update_layout(height=650, title=f"{st.session_state.ticker} — Expected Move", xaxis_rangeslider_visible=False)
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("Load a ticker to view chart")
 
 # ==========================
 # TAB 3 — PORTFOLIO
@@ -254,15 +249,23 @@ with tab3:
         st.info("No trades yet")
 
 # ==========================
-# TAB 4 — OPPORTUNITY FINDER
+# TAB 4 — OPPORTUNITY
 # ==========================
 with tab4:
-    st.subheader("🚀 Random Opportunity Scanner")
+    st.subheader("🚀 Random Opportunity Finder")
     if st.button("Find Opportunity"):
-        with st.spinner("Fetching stock data..."):
+        with st.spinner("Fetching random stock..."):
             opp = find_opportunity()
-        st.metric(f"{opp['Ticker']} Price", f"${opp['Price']:.2f}")
-        st.metric(f"Suggested Buy", f"${opp['Buy Target']:.2f}", opp['Buy Indicator'])
-        st.metric(f"Suggested Sell", f"${opp['Sell Target']:.2f}", f"{opp['Sell Prob']:.1%} chance")
-        if opp['Buy Prob'] > 0.7:
-            st.success("Strong Buy Opportunity!")
+        S = opp["Price"]
+        hist = opp["Hist"]
+        st.session_state.ticker = opp["Ticker"]
+        st.session_state.price = S
+        st.session_state.hist = hist
+        st.session_state.buy_price = opp["Buy Target"]
+        st.session_state.sell_price = opp["Sell Target"]
+        st.session_state.volatility = hist_vol(hist)
+        # display
+        st.metric(f"{opp['Ticker']} Price", f"${S:.2f}")
+        st.metric("Buy Target", f"${opp['Buy Target']:.2f}", f"{opp['BuyProb']:.1%}")
+        st.metric("Sell Target", f"${opp['Sell Target']:.2f}", f"{opp['SellProb']:.1%}")
+        st.markdown(f"### Suggested Action: <span style='color:{opp['Color']}'>{opp['Action']}</span>", unsafe_allow_html=True)
