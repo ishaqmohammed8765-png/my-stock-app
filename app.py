@@ -180,7 +180,23 @@ with tab1:
         st.error(f"Risk–Reward Ratio: {RRR:.2f}")
 
     st.metric("Kelly Position Size (Shares)", qty)
-    st.metric("Expected Profit", f"${(sell-buy)*qty:,.2f}")
+    expected_profit = (sell - buy) * qty
+    st.metric("Expected Profit", f"${expected_profit:,.2f}")
+    
+    # ADD TO PORTFOLIO BUTTON
+    st.markdown("---")
+    if st.button("➕ Add to Portfolio", type="primary"):
+        trade = {
+            "Ticker": ticker,
+            "Buy": buy,
+            "Sell": sell,
+            "Stop": stop,
+            "Quantity": qty,
+            "Expected PnL": expected_profit,
+            "RRR": RRR
+        }
+        st.session_state.portfolio.append(trade)
+        st.success(f"✅ Added {ticker} to portfolio!")
 
 # =====================================================
 # CHART TAB
@@ -218,15 +234,18 @@ with tab3:
 # PORTFOLIO TAB
 # =====================================================
 with tab4:
+    st.subheader("Portfolio")
     if not st.session_state.portfolio:
-        st.info("No trades added yet.")
+        st.info("No trades added yet. Go to the Trade tab to add positions.")
     else:
         pf = pd.DataFrame(st.session_state.portfolio)
-        if "Expected PnL" not in pf.columns:
-            pf["Expected PnL"] = 0
-        pf = pf.apply(pd.to_numeric, errors="coerce").fillna(0)
-        st.dataframe(pf)
+        st.dataframe(pf, use_container_width=True)
         st.metric("Total Expected P&L", f"${pf['Expected PnL'].sum():,.2f}")
+        
+        # CLEAR PORTFOLIO BUTTON
+        if st.button("🗑️ Clear Portfolio"):
+            st.session_state.portfolio = []
+            st.rerun()
 
 # =====================================================
 # OPPORTUNITY TAB
@@ -236,35 +255,37 @@ with tab5:
     universe = ["AAPL","MSFT","NVDA","META","AMZN","GOOGL","TSLA","AMD","NFLX","AVGO"]
     candidates = []
 
-    for sym in universe:
-        df_try = load_stock(sym)
-        if df_try.empty or len(df_try) < 60:
-            continue
+    with st.spinner("Scanning market for opportunities..."):
+        for sym in universe:
+            df_try = load_stock(sym)
+            if df_try.empty or len(df_try) < 60:
+                continue
 
-        price_t = df_try["Close"].iloc[-1]
-        ma50 = df_try["Close"].rolling(50).mean().iloc[-1]
-        if price_t < ma50:
-            continue
+            price_t = df_try["Close"].iloc[-1]
+            ma50 = df_try["Close"].rolling(50).mean().iloc[-1]
+            if price_t < ma50:
+                continue
 
-        vol_t = annual_volatility(df_try)
-        move_t = expected_move(price_t, vol_t)
-        buy_t = price_t - move_t
-        sell_t = price_t + move_t
-        stop_t = buy_t - move_t * 0.5
+            vol_t = annual_volatility(df_try)
+            move_t = expected_move(price_t, vol_t)
+            buy_t = price_t - move_t
+            sell_t = price_t + move_t
+            stop_t = buy_t - move_t * 0.5
 
-        prob_t = 1 - prob_hit_mc(price_t, buy_t, vol_t)
-        RRR_t = (sell_t - buy_t) / max(buy_t - stop_t, 0.01)
-        EV = prob_t * (sell_t - buy_t)
+            prob_t = 1 - prob_hit_mc(price_t, buy_t, vol_t)
+            RRR_t = (sell_t - buy_t) / max(buy_t - stop_t, 0.01)
+            EV = prob_t * (sell_t - buy_t)
 
-        if prob_t >= 0.55 and RRR_t >= 1.5:
-            candidates.append((EV, sym, buy_t, sell_t, RRR_t, prob_t))
+            if prob_t >= 0.55 and RRR_t >= 1.5:
+                candidates.append((EV, sym, buy_t, sell_t, RRR_t, prob_t))
 
     if not candidates:
         st.warning("❌ No good opportunities found right now.")
     else:
         best = max(candidates, key=lambda x: x[0])
         _, sym, b, s, r, p = best
-        st.title(sym)
-        st.metric("Buy Target", f"${b:.2f}", f"{p*100:.1f}%")
-        st.metric("Sell Target", f"${s:.2f}")
-        st.metric("Risk–Reward Ratio", f"{r:.2f}")
+        st.success(f"🎯 Best Opportunity: **{sym}**")
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Buy Target", f"${b:.2f}", f"{p*100:.1f}% prob")
+        col2.metric("Sell Target", f"${s:.2f}")
+        col3.metric("Risk–Reward", f"{r:.2f}")
