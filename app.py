@@ -23,7 +23,6 @@ ACCOUNT_SIZE = 10_000
 # =====================================================
 # FUNCTIONS
 # =====================================================
-@st.cache_data(ttl=300)
 def load_stock(ticker):
     """Download stock data safely."""
     try:
@@ -32,10 +31,12 @@ def load_stock(ticker):
         df = stock.history(period="6mo")
         
         if df is None or df.empty:
+            st.error(f"⚠️ No data returned from Yahoo Finance for {ticker}")
             return pd.DataFrame()
         
         # The history() method returns a clean DataFrame with Close column
         if "Close" not in df.columns:
+            st.error(f"⚠️ Data structure issue - no Close column found")
             return pd.DataFrame()
         
         # Remove timezone if present
@@ -47,10 +48,12 @@ def load_stock(ticker):
         df = df.dropna(subset=["Close"])
         
         if len(df) < 20:
+            st.error(f"⚠️ Not enough historical data (only {len(df)} days)")
             return pd.DataFrame()
             
         return df.tail(120)
     except Exception as e:
+        st.error(f"❌ Error loading {ticker}: {str(e)}")
         return pd.DataFrame()
 
 def annual_volatility(df):
