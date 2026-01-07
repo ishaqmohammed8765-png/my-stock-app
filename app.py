@@ -3,6 +3,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+import time
 
 # =====================================================
 # CONFIG
@@ -23,33 +24,25 @@ ACCOUNT_SIZE = 10_000
 # =====================================================
 # FUNCTIONS
 # =====================================================
-@st.cache_data(ttl=3600)  # Cache for 1 hour to avoid rate limits
+@st.cache_data(ttl=3600)
 def load_stock(ticker):
     """Download stock data safely."""
-    import time
-    
     try:
-        # Add small delay to avoid rate limiting
         time.sleep(0.5)
-        
-        # Use Ticker object with timeout
         stock = yf.Ticker(ticker)
         df = stock.history(period="6mo", timeout=10)
         
         if df is None or df.empty:
-            st.warning(f"⚠️ No data available for {ticker}. Yahoo Finance may be rate limiting. Try again in a few minutes or use a different ticker.")
+            st.warning(f"⚠️ No data available for {ticker}. Try again in a few minutes.")
             return pd.DataFrame()
         
-        # The history() method returns a clean DataFrame with Close column
         if "Close" not in df.columns:
             st.error(f"⚠️ Data structure issue - no Close column found")
             return pd.DataFrame()
         
-        # Remove timezone if present
         if hasattr(df.index, 'tz') and df.index.tz is not None:
             df.index = df.index.tz_localize(None)
         
-        # Clean and validate data
         df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
         df = df.dropna(subset=["Close"])
         
@@ -61,7 +54,7 @@ def load_stock(ticker):
     except Exception as e:
         error_msg = str(e)
         if "Rate limit" in error_msg or "Too Many Requests" in error_msg:
-            st.error(f"🚫 Yahoo Finance rate limit reached. Please wait 5-10 minutes before trying again. Cache may help on reload.")
+            st.error(f"🚫 Yahoo Finance rate limit reached. Please wait 5-10 minutes before trying again.")
         else:
             st.error(f"❌ Error loading {ticker}: {error_msg}")
         return pd.DataFrame()
@@ -139,18 +132,26 @@ if "df" not in st.session_state:
 if "ticker" not in st.session_state:
     st.session_state.ticker = ""
 
-
+# =====================================================
+# SIDEBAR
+# =====================================================
+with st.sidebar:
+    st.markdown("### 📊 Stock Calculator Pro")
+    ticker_input = st.text_input("Stock Symbol", value="AAPL").upper()
+    load_button = st.button("Load Stock")
+    
+    st.markdown("---")
+    st.caption("⚠️ **Rate Limit Notice:** If you get rate limit errors, wait 5-10 minutes. Data is cached for 1 hour once loaded.")
 
 # =====================================================
 # LOAD STOCK
 # =====================================================
-if load:
+if load_button:
     df = load_stock(ticker_input)
-    if df.empty:
-        st.error("No data available for this stock.")
-    else:
+    if not df.empty:
         st.session_state.df = df
         st.session_state.ticker = ticker_input
+        st.success(f"✅ Loaded {ticker_input} successfully!")
 
 if st.session_state.df.empty:
     st.info("👈 Enter a stock symbol and press **Load Stock**")
@@ -205,7 +206,6 @@ with tab1:
     expected_profit = (sell - buy) * qty
     st.metric("Expected Profit", f"${expected_profit:,.2f}")
     
-    # ADD TO PORTFOLIO BUTTON
     st.markdown("---")
     if st.button("➕ Add to Portfolio", type="primary"):
         trade = {
@@ -264,7 +264,6 @@ with tab4:
         st.dataframe(pf, use_container_width=True)
         st.metric("Total Expected P&L", f"${pf['Expected PnL'].sum():,.2f}")
         
-        # CLEAR PORTFOLIO BUTTON
         if st.button("🗑️ Clear Portfolio"):
             st.session_state.portfolio = []
             st.rerun()
