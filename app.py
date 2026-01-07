@@ -27,16 +27,36 @@ ACCOUNT_SIZE = 10_000
 def load_stock(ticker):
     """Download stock data safely."""
     try:
-        df = yf.download(ticker, period="6mo", progress=False)
-        if df.empty or "Close" not in df.columns:
+        # Download with specific parameters
+        df = yf.download(ticker, period="6mo", progress=False, auto_adjust=True)
+        
+        if df is None or df.empty:
             return pd.DataFrame()
+        
         df = df.copy()
+        
+        # Handle MultiIndex columns (when multiple tickers)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        
+        # Check for Close column
+        if "Close" not in df.columns:
+            return pd.DataFrame()
+        
+        # Remove timezone if present
         if df.index.tz is not None:
             df.index = df.index.tz_localize(None)
+        
+        # Clean Close data
         df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
         df = df.dropna(subset=["Close"])
+        
+        if df.empty or len(df) < 20:
+            return pd.DataFrame()
+            
         return df.tail(120)
-    except Exception:
+    except Exception as e:
+        st.error(f"Error loading {ticker}: {str(e)}")
         return pd.DataFrame()
 
 def annual_volatility(df):
