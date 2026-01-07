@@ -176,10 +176,15 @@ with tab3:
 
     pnl = []
     for i in range(len(df)-DAYS):
-        entry = df["Close"].iloc[i]
+        entry = float(df["Close"].iloc[i])
         window = df["Close"].iloc[i:i+DAYS]
+        if window.empty:
+            continue
         stop_price = entry - expected_move(entry, annual_volatility(df))*0.5
-        exit_price = window.min() if (window <= stop_price).any() else df["Close"].iloc[i+DAYS]
+        if (window <= stop_price).any():
+            exit_price = float(window[window <= stop_price].iloc[0])
+        else:
+            exit_price = float(df["Close"].iloc[i+DAYS])
         pnl.append(exit_price - entry)
 
     bt = pd.DataFrame({"PnL": pnl})
