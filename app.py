@@ -1,11 +1,12 @@
 """
-Trading Dashboard Pro v2 (Upgraded Foundation)
-- Streamlit UI
-- Alpaca historical + live trades/quotes
-- Risk sizing (Kelly), volatility, ATR, expected move
+Trading Dashboard Pro v2.1 (Upgraded + Fixed)
+- Robust Alpaca historical loader (handles MultiIndex/flat df shapes)
+- Explicit DataFeed for bars
+- Live trades/quotes via websocket in its own thread + asyncio loop
 - Monte Carlo hit probabilities
-- Backtest metrics + scoring recommendation
-Educational use only.
+- Kelly sizing, ATR, vol, expected move
+- Backtest + scoring
+Educational use only. Not financial advice.
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.live import StockDataStream
 from alpaca.data.requests import StockBarsRequest, StockLatestQuoteRequest
 from alpaca.data.timeframe import TimeFrame
+from alpaca.data.enums import DataFeed  # IMPORTANT: enables explicit feed for bars
 
 # =====================================================
 # CONFIG
@@ -56,20 +58,21 @@ MAX_RECONNECT_ATTEMPTS = 8
 MIN_HISTORICAL_DAYS = 40
 MAX_BACKTEST_ITERATIONS = 80
 
-AUTO_REFRESH_MS = 1500  # UI refresh cadence while live feed active
+AUTO_REFRESH_MS = 1500  # refresh cadence while live feed active
 
 SCORE_STRONG_BUY = 80
 SCORE_BUY = 65
 SCORE_CONDITIONAL = 50
 SCORE_HOLD = 35
 
-DEFAULT_FEED = "iex"  # free tier usually supports IEX, SIP requires permissions
+DEFAULT_FEED = "iex"  # websocket feed
+DEFAULT_BARS_FEED = DataFeed.IEX  # historical bars feed (explicit)
 
 # =====================================================
 # UI SETUP
 # =====================================================
 st.set_page_config(
-    page_title="Trading Dashboard Pro v2",
+    page_title="Trading Dashboard Pro v2.1",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -132,7 +135,6 @@ def parse_ts(ts: Any) -> datetime:
             dt = ts.to_pydatetime()
             return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
         if isinstance(ts, str):
-            # Alpaca often returns ISO w/ Z
             s = ts.replace("Z", "+00:00")
             dt = datetime.fromisoformat(s)
             return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
@@ -141,14 +143,21 @@ def parse_ts(ts: Any) -> datetime:
     return utc_now()
 
 
-def safe_mid_quote(q: Dict[str, Any]) -> Optional[float]:
+def safe_mid_quote(q: Optional[Dict[str, Any]]) -> Optional[float]:
+    if not q:
+        return None
     bid = q.get("bid")
     ask = q.get("ask")
     if bid is None or ask is None:
         return None
+    try:
+        bid = float(bid)
+        ask = float(ask)
+    except Exception:
+        return None
     if bid <= 0 or ask <= 0:
         return None
-    return (float(bid) + float(ask)) / 2.0
+    return (bid + ask) / 2.0
 
 
 def clamp(x: float, lo: float, hi: float) -> float:
@@ -165,9 +174,9 @@ def init_state() -> None:
         "api_ok": False,
 
         "ticker": "NVDA",
-        "historical": None,  # pd.DataFrame
-        "latest_quote": None,  # Dict
-        "latest_price": None,  # float
+        "historical": None,       # pd.DataFrame
+        "latest_quote": None,     # Dict
+        "latest_price": None,     # float
 
         "trade_q": queue.Queue(maxsize=QUEUE_MAX_SIZE),
         "quote_q": queue.Queue(maxsize=QUEUE_MAX_SIZE),
@@ -179,6 +188,7 @@ def init_state() -> None:
         "ws_thread": None,
 
         "last_error": "",
+        "last_exception": "",     # full traceback text if desired
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -204,11 +214,18 @@ def stop_live() -> None:
 
 
 # =====================================================
-# WEBSOCKET HANDLER (UPGRADED)
+# WEBSOCKET HANDLER (THREAD + ASYNC LOOP)
 # =====================================================
 class RealtimeStream:
-    def __init__(self, api_key: str, secret_key: str, ticker: str,
-                 trade_q: queue.Queue, quote_q: queue.Queue, feed: str = DEFAULT_FEED):
+    def __init__(
+        self,
+        api_key: str,
+        secret_key: str,
+        ticker: str,
+        trade_q: queue.Queue,
+        quote_q: queue.Queue,
+        feed: str = DEFAULT_FEED,
+    ):
         self.api_key = api_key
         self.secret_key = secret_key
         self.ticker = ticker.upper().strip()
@@ -273,10 +290,7 @@ class RealtimeStream:
             logger.error("quote handler error: %s", e, exc_info=True)
 
     def run_forever(self) -> None:
-        """
-        Run websocket in its own thread with its own asyncio loop.
-        This is the most common failure point in "v1" code.
-        """
+        """Run websocket in its own thread with its own asyncio loop."""
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
@@ -291,15 +305,14 @@ class RealtimeStream:
                 self._stream.subscribe_quotes(self.on_quote, self.ticker)
 
                 logger.info("WS starting for %s (%s)", self.ticker, self.feed)
-                self._stream.run()  # blocks until stop
+                self._stream.run()  # blocks until stop()
 
-                self.reconnects = 0  # clean exit resets reconnect count
+                self.reconnects = 0
             except Exception as e:
                 self.reconnects += 1
                 logger.error("WS error: %s (reconnect %s)", e, self.reconnects, exc_info=True)
                 time.sleep(min(2 ** self.reconnects, 60))
 
-        # cleanup loop
         try:
             loop.stop()
         except Exception:
@@ -316,7 +329,7 @@ class RealtimeStream:
                 try:
                     self._stream.stop()
                 except Exception:
-                    # some versions differ
+                    # Some versions differ
                     try:
                         self._stream.stop_ws()
                     except Exception:
@@ -328,52 +341,84 @@ class RealtimeStream:
 # ALPACA DATA (ROBUST PARSING)
 # =====================================================
 @st.cache_data(ttl=3600, show_spinner=False)
-def load_historical(ticker: str, api_key: str, secret_key: str, days_back: int = 220) -> Optional[pd.DataFrame]:
-    if not validate_api_keys(api_key, secret_key):
+def load_historical(
+    ticker: str,
+    api_key: str,
+    secret_key: str,
+    days_back: int = 220,
+    bars_feed: DataFeed = DEFAULT_BARS_FEED,
+) -> Optional[pd.DataFrame]:
+    """
+    Robust historical loader:
+    - Handles MultiIndex or flat dfs across alpaca-py versions
+    - Explicit DataFeed
+    - Normalizes timestamp column
+    """
+    ticker = (ticker or "").upper().strip()
+    if not validate_api_keys(api_key, secret_key) or not ticker:
         return None
 
     try:
         client = StockHistoricalDataClient(api_key, secret_key)
+
         req = StockBarsRequest(
-            symbol_or_symbols=ticker.upper(),
+            symbol_or_symbols=[ticker],  # list form is safest
             timeframe=TimeFrame.Day,
             start=datetime.utcnow() - timedelta(days=days_back),
             end=datetime.utcnow(),
+            feed=bars_feed,
         )
-        resp = client.get_stock_bars(req)
-        df = resp.df
+
+        bars = client.get_stock_bars(req)
+        df = getattr(bars, "df", None)
         if df is None or df.empty:
             return None
 
-        # bars.df returns MultiIndex [symbol, timestamp] often
-        if ticker.upper() in df.index.get_level_values(0):
-            df = df.xs(ticker.upper(), level=0).reset_index()
+        # MultiIndex: (symbol, timestamp)
+        if isinstance(df.index, pd.MultiIndex) and df.index.nlevels >= 2:
+            try:
+                df = df.xs(ticker, level=0).reset_index()
+            except Exception:
+                # fallback: first symbol
+                sym0 = df.index.get_level_values(0)[0]
+                df = df.xs(sym0, level=0).reset_index()
 
-        needed = {"timestamp", "open", "high", "low", "close", "volume"}
-        if not needed.issubset(set(df.columns)):
+        # Flat df with symbol column
+        elif "symbol" in df.columns:
+            df = df[df["symbol"].astype(str).str.upper() == ticker].copy()
+
+        # Normalize timestamp naming
+        if "timestamp" not in df.columns and "time" in df.columns:
+            df = df.rename(columns={"time": "timestamp"})
+
+        required = {"timestamp", "open", "high", "low", "close", "volume"}
+        if not required.issubset(set(df.columns)):
             return None
 
         df = df.sort_values("timestamp").reset_index(drop=True)
         if len(df) < 30:
             return None
+
         return df
+
     except Exception as e:
-        logger.error("historical load error: %s", e, exc_info=True)
+        logger.error("Historical load error: %s", e, exc_info=True)
         return None
 
 
 def load_latest_quote(ticker: str, api_key: str, secret_key: str) -> Optional[Dict[str, Any]]:
-    if not validate_api_keys(api_key, secret_key):
+    """Robust latest quote loader (handles response wrapper differences)."""
+    ticker = (ticker or "").upper().strip()
+    if not validate_api_keys(api_key, secret_key) or not ticker:
         return None
     try:
         client = StockHistoricalDataClient(api_key, secret_key)
-        req = StockLatestQuoteRequest(symbol_or_symbols=ticker.upper())
+        req = StockLatestQuoteRequest(symbol_or_symbols=ticker)
         resp = client.get_stock_latest_quote(req)
 
-        # alpaca-py versions differ: sometimes resp is dict-like, sometimes .data
         quotes = getattr(resp, "data", resp)
+        q = quotes.get(ticker) if hasattr(quotes, "get") else quotes[ticker]
 
-        q = quotes.get(ticker.upper()) if hasattr(quotes, "get") else quotes[ticker.upper()]
         bid = float(getattr(q, "bid_price", 0.0))
         ask = float(getattr(q, "ask_price", 0.0))
         if bid <= 0 or ask <= 0:
@@ -382,7 +427,7 @@ def load_latest_quote(ticker: str, api_key: str, secret_key: str) -> Optional[Di
         return {
             "type": "quote",
             "ts": utc_now(),
-            "symbol": ticker.upper(),
+            "symbol": ticker,
             "bid": bid,
             "ask": ask,
             "bid_size": int(getattr(q, "bid_size", 0)),
@@ -390,7 +435,7 @@ def load_latest_quote(ticker: str, api_key: str, secret_key: str) -> Optional[Di
             "spread": float(ask - bid),
         }
     except Exception as e:
-        logger.error("latest quote error: %s", e, exc_info=True)
+        logger.error("Latest quote error: %s", e, exc_info=True)
         return None
 
 
@@ -548,7 +593,6 @@ def bt_metrics(bt: pd.DataFrame) -> BacktestResults:
     total = int(len(bt))
 
     win_rate = (wins / total * 100.0) if total else 0.0
-
     total_wins = float(bt.loc[bt["PnL"] > 0, "PnL"].sum()) if wins else 0.0
     total_losses = float(abs(bt.loc[bt["PnL"] < 0, "PnL"].sum())) if losses else 0.0
     pf = (total_wins / total_losses) if total_losses > 0 else 0.0
@@ -579,14 +623,17 @@ def trade_metrics(df: pd.DataFrame, price: float, horizon: int, method: str, acc
     a = atr(df)
 
     ma50 = float(df["close"].rolling(50).mean().iloc[-1]) if len(df) >= 50 else float(price)
-    ma200 = float(df["close"].rolling(200).mean().iloc[-1]) if len(df) >= 200 else float(df["close"].rolling(max(2, len(df)//2)).mean().iloc[-1])
+    ma200 = (
+        float(df["close"].rolling(200).mean().iloc[-1])
+        if len(df) >= 200
+        else float(df["close"].rolling(max(2, len(df) // 2)).mean().iloc[-1])
+    )
 
     move = expected_move(price, v, horizon)
     buy = price - move
     sell = price + move
     stop = buy - (move * STOP_MULT)
 
-    # probabilities
     buy_prob = 1.0 - prob_hit_mc(price, buy, v, horizon, MONTE_CARLO_SIMS, method)
     sell_prob = prob_hit_mc(price, sell, v, horizon, MONTE_CARLO_SIMS, method)
 
@@ -614,68 +661,94 @@ def trade_metrics(df: pd.DataFrame, price: float, horizon: int, method: str, acc
     )
 
 
-def score_decision(price: float, ma50: float, ma200: float,
-                   rrr: float, sh: float, mdd: float, wr: float, pf: float) -> Tuple[int, str, str, str, List[str]]:
+def score_decision(
+    price: float,
+    ma50: float,
+    ma200: float,
+    rrr: float,
+    sh: float,
+    mdd: float,
+    wr: float,
+    pf: float,
+) -> Tuple[int, str, str, str, List[str]]:
     score = 0
     reasons: List[str] = []
 
     # Trend (15)
     if price > ma200 and price > ma50:
-        score += 15; reasons.append("✅ Strong uptrend (above MA50 & MA200)")
+        score += 15
+        reasons.append("✅ Strong uptrend (above MA50 & MA200)")
     elif price > ma200:
-        score += 10; reasons.append("✅ Above MA200")
+        score += 10
+        reasons.append("✅ Above MA200")
     elif price > ma50:
-        score += 5; reasons.append("⚠️ Above MA50 only")
+        score += 5
+        reasons.append("⚠️ Above MA50 only")
     else:
         reasons.append("❌ Below MA50 & MA200")
 
     # RRR (25)
     if rrr >= 3.0:
-        score += 25; reasons.append("✅ Excellent risk/reward (RRR ≥ 3)")
+        score += 25
+        reasons.append("✅ Excellent risk/reward (RRR ≥ 3)")
     elif rrr >= 2.0:
-        score += 20; reasons.append("✅ Strong risk/reward (RRR ≥ 2)")
+        score += 20
+        reasons.append("✅ Strong risk/reward (RRR ≥ 2)")
     elif rrr >= 1.5:
-        score += 12; reasons.append("⚠️ Acceptable risk/reward (RRR ≥ 1.5)")
+        score += 12
+        reasons.append("⚠️ Acceptable risk/reward (RRR ≥ 1.5)")
     else:
         reasons.append("❌ Poor risk/reward")
 
     # Sharpe (25)
     if sh >= 1.5:
-        score += 25; reasons.append("✅ Excellent Sharpe (≥ 1.5)")
+        score += 25
+        reasons.append("✅ Excellent Sharpe (≥ 1.5)")
     elif sh >= 1.0:
-        score += 20; reasons.append("✅ Good Sharpe (≥ 1.0)")
+        score += 20
+        reasons.append("✅ Good Sharpe (≥ 1.0)")
     elif sh >= 0.5:
-        score += 10; reasons.append("⚠️ Moderate Sharpe (≥ 0.5)")
+        score += 10
+        reasons.append("⚠️ Moderate Sharpe (≥ 0.5)")
     else:
         reasons.append("❌ Poor Sharpe")
 
     # Drawdown (15)
     if abs(mdd) <= 0.10:
-        score += 15; reasons.append("✅ Low drawdown (≤ 10%)")
+        score += 15
+        reasons.append("✅ Low drawdown (≤ 10%)")
     elif abs(mdd) <= 0.20:
-        score += 10; reasons.append("✅ Moderate drawdown (≤ 20%)")
+        score += 10
+        reasons.append("✅ Moderate drawdown (≤ 20%)")
     elif abs(mdd) <= 0.30:
-        score += 5; reasons.append("⚠️ High drawdown (≤ 30%)")
+        score += 5
+        reasons.append("⚠️ High drawdown (≤ 30%)")
     else:
         reasons.append("❌ Very high drawdown (> 30%)")
 
     # Win rate (10)
     if wr >= 60:
-        score += 10; reasons.append("✅ High win rate (≥ 60%)")
+        score += 10
+        reasons.append("✅ High win rate (≥ 60%)")
     elif wr >= 50:
-        score += 7; reasons.append("✅ Positive win rate (≥ 50%)")
+        score += 7
+        reasons.append("✅ Positive win rate (≥ 50%)")
     elif wr >= 40:
-        score += 3; reasons.append("⚠️ Below-average win rate (≥ 40%)")
+        score += 3
+        reasons.append("⚠️ Below-average win rate (≥ 40%)")
     else:
         reasons.append("❌ Low win rate (< 40%)")
 
     # Profit factor (10)
     if pf >= 2.0:
-        score += 10; reasons.append("✅ Strong profit factor (≥ 2)")
+        score += 10
+        reasons.append("✅ Strong profit factor (≥ 2)")
     elif pf >= 1.5:
-        score += 7; reasons.append("✅ Good profit factor (≥ 1.5)")
+        score += 7
+        reasons.append("✅ Good profit factor (≥ 1.5)")
     elif pf >= 1.0:
-        score += 3; reasons.append("⚠️ Marginal profit factor (≥ 1)")
+        score += 3
+        reasons.append("⚠️ Marginal profit factor (≥ 1)")
     else:
         reasons.append("❌ Weak profit factor (< 1)")
 
@@ -699,10 +772,10 @@ def score_decision(price: float, ma50: float, ma200: float,
 # =====================================================
 init_state()
 
-st.title("📈 Trading Dashboard Pro v2")
-st.caption("Historical + live analysis (educational only, not financial advice)")
+st.title("📈 Trading Dashboard Pro v2.1")
+st.caption("Historical + live analysis (educational only)")
 
-# Pull secrets if available
+# Load secrets if present
 try:
     s_api = st.secrets.get("ALPACA_KEY", "")
     s_sec = st.secrets.get("ALPACA_SECRET", "")
@@ -715,14 +788,13 @@ if (s_api and s_sec) and not st.session_state.api_ok:
     st.session_state.secret_key = s_sec
     st.session_state.api_ok = True
 
-
-# --- API Config UI
+# --- API keys UI
 if not st.session_state.api_ok:
-    st.info("Enter your Alpaca keys (Paper account is fine).")
-    c1, c2 = st.columns(2)
-    with c1:
+    st.info("Enter your Alpaca keys (Paper account works).")
+    k1, k2 = st.columns(2)
+    with k1:
         api_in = st.text_input("ALPACA_KEY", type="password")
-    with c2:
+    with k2:
         sec_in = st.text_input("ALPACA_SECRET", type="password")
 
     if st.button("Save Keys", type="primary", use_container_width=True):
@@ -732,19 +804,21 @@ if not st.session_state.api_ok:
             st.session_state.api_ok = True
             st.rerun()
         else:
-            st.error("Keys look invalid (too short / empty).")
+            st.error("Keys look invalid (empty/too short).")
     st.stop()
 
-
-# --- Sidebar Controls
+# --- Sidebar controls
 with st.sidebar:
     st.header("⚙️ Controls")
-
     account_size = st.number_input("Account Size ($)", 1000, 5_000_000, 10_000, 1000)
     horizon = st.slider("Time Horizon (days)", 5, 120, 30, 5)
     mc_method = st.selectbox("Monte Carlo shocks", ["student_t", "normal"], index=0)
-    feed = st.selectbox("Market data feed", ["iex", "sip"], index=0)
-    st.caption("Use SIP only if your Alpaca account has SIP permissions.")
+
+    ws_feed = st.selectbox("Live data feed", ["iex", "sip"], index=0)
+    bars_feed_name = st.selectbox("Historical bars feed", ["IEX", "SIP"], index=0)
+    bars_feed = DataFeed.IEX if bars_feed_name == "IEX" else DataFeed.SIP
+
+    st.caption("If you don’t have SIP permissions, keep both on IEX.")
 
     st.markdown("---")
 
@@ -764,7 +838,7 @@ with st.sidebar:
                     st.session_state.ticker,
                     st.session_state.trade_q,
                     st.session_state.quote_q,
-                    feed=feed,
+                    feed=ws_feed,
                 )
                 t = threading.Thread(target=handler.run_forever, daemon=True)
                 t.start()
@@ -773,30 +847,49 @@ with st.sidebar:
                 st.session_state.live_active = True
                 st.rerun()
 
-
-# --- Main ticker load
+# --- Main: ticker load
 c1, c2, c3 = st.columns([2.0, 1.0, 1.0])
 with c1:
     ticker = st.text_input("Ticker", value=st.session_state.ticker).upper().strip()
+
 with c2:
     if st.button("📥 Load Data", type="primary", use_container_width=True):
         stop_live()
         st.session_state.last_error = ""
+        st.session_state.last_exception = ""
+
         with st.spinner(f"Loading {ticker}..."):
-            df = load_historical(ticker, st.session_state.api_key, st.session_state.secret_key)
-            if df is None:
+            try:
+                df = load_historical(
+                    ticker,
+                    st.session_state.api_key,
+                    st.session_state.secret_key,
+                    days_back=260,
+                    bars_feed=bars_feed,
+                )
+                if df is None:
+                    st.session_state.historical = None
+                    st.session_state.ticker = ticker
+                    st.session_state.latest_quote = None
+                    st.session_state.latest_price = None
+                    st.session_state.last_error = (
+                        f"Failed to load historical for {ticker}. "
+                        f"Try switching Historical bars feed to IEX, and confirm your market-data permissions."
+                    )
+                else:
+                    st.session_state.historical = df
+                    st.session_state.ticker = ticker
+
+                    q = load_latest_quote(ticker, st.session_state.api_key, st.session_state.secret_key)
+                    st.session_state.latest_quote = q
+                    st.session_state.latest_price = safe_mid_quote(q) if q else float(df["close"].iloc[-1])
+
+            except Exception as e:
                 st.session_state.historical = None
                 st.session_state.ticker = ticker
-                st.session_state.latest_quote = None
-                st.session_state.latest_price = None
-                st.session_state.last_error = f"Failed to load historical for {ticker}."
-            else:
-                st.session_state.historical = df
-                st.session_state.ticker = ticker
+                st.session_state.last_error = f"Exception while loading {ticker}: {e}"
+                logger.error("Load exception", exc_info=True)
 
-                q = load_latest_quote(ticker, st.session_state.api_key, st.session_state.secret_key)
-                st.session_state.latest_quote = q
-                st.session_state.latest_price = safe_mid_quote(q) if q else float(df["close"].iloc[-1])
         st.rerun()
 
 with c3:
@@ -810,8 +903,7 @@ with c3:
         st.session_state.last_error = ""
         st.rerun()
 
-
-# --- Error display (if any)
+# --- Errors
 if st.session_state.last_error:
     st.error(st.session_state.last_error)
 
@@ -820,7 +912,7 @@ if df is None:
     st.info("Load a ticker to begin.")
     st.stop()
 
-# --- Live refresh if live_active
+# --- Auto refresh during live
 if st.session_state.live_active:
     st.autorefresh(interval=AUTO_REFRESH_MS, key="live_refresh")
 
@@ -838,7 +930,7 @@ def drain(q: queue.Queue, dest: List[Dict[str, Any]], maxlen: int) -> None:
 drain(st.session_state.trade_q, st.session_state.trade_history, MAX_TRADE_HISTORY)
 drain(st.session_state.quote_q, st.session_state.quote_history, MAX_QUOTE_HISTORY)
 
-# Latest quote from live history if present
+# Update latest quote/price from live
 if st.session_state.quote_history:
     st.session_state.latest_quote = st.session_state.quote_history[-1]
     mid = safe_mid_quote(st.session_state.latest_quote)
@@ -847,7 +939,7 @@ if st.session_state.quote_history:
 
 current_price = float(st.session_state.latest_price or df["close"].iloc[-1])
 
-# --- Compute metrics
+# Compute metrics
 bt = backtest(df, horizon)
 btr = bt_metrics(bt)
 tm = trade_metrics(df, current_price, horizon, mc_method, account_size)
@@ -875,7 +967,7 @@ st.markdown("### 📋 Summary")
 for r in reasons:
     st.write(f"- {r}")
 
-# --- Chart
+# Chart
 st.markdown("### 📈 Price + Levels")
 fig = go.Figure()
 fig.add_trace(go.Scatter(x=df["timestamp"], y=df["close"], name="Close"))
@@ -892,7 +984,7 @@ fig.add_hline(y=tm.stop, line_dash="dot", annotation_text="Stop")
 fig.update_layout(height=520, hovermode="x unified", title=f"{st.session_state.ticker} Analysis")
 st.plotly_chart(fig, use_container_width=True)
 
-# --- Backtest section
+# Backtest
 st.markdown("### 📊 Backtest")
 b1, b2, b3, b4 = st.columns(4)
 b1.metric("Trades", btr.total_trades)
@@ -906,7 +998,7 @@ if not bt.empty:
     fig2.update_layout(height=350, title="Equity Curve")
     st.plotly_chart(fig2, use_container_width=True)
 
-# --- Live section
+# Live feed
 if st.session_state.live_active:
     st.markdown("### 🔴 Live Market Feed")
     lc1, lc2 = st.columns(2)
@@ -931,4 +1023,3 @@ if st.session_state.live_active:
 
 st.markdown("---")
 st.caption("⚠️ Educational only. Not financial advice.")
-
