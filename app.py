@@ -20,7 +20,7 @@ VOL_FLOOR = 0.10
 VOL_CAP = 1.5
 KELLY_MAX = 0.15
 KELLY_MIN = 0.01
-MONTE_CARLO_SIMS = 2000
+MONTE_CARLO_SIMS = 1000
 RISK_FREE_RATE = 0.045  # 4.5% annual risk-free rate
 
 # =====================================================
@@ -78,8 +78,8 @@ def load_stock(ticker):
         if len(df) < 60:
             return pd.DataFrame()
         
-        # Limit to last 180 days to prevent data overflow
-        return df.tail(180)
+        # Limit to last 120 days to prevent data overflow
+        return df.tail(120)
     except Exception as e:
         st.error(f"Error loading {ticker}: {str(e)}")
         return pd.DataFrame()
@@ -96,10 +96,10 @@ def annual_volatility(df):
     vol = returns.ewm(span=20).std().iloc[-1] * np.sqrt(252)
     return float(np.clip(vol, VOL_FLOOR, VOL_CAP))
 
-def get_historical_returns(df, days=252):
+def get_historical_returns(df, days=120):
     """Get historical returns for bootstrap sampling."""
     if df.empty or len(df) < days:
-        return np.array([])
+        days = min(len(df), 60)  # Use at least 60 days if available
     
     returns = np.log(df["Close"] / df["Close"].shift(1)).dropna()
     return returns.tail(days).values
@@ -129,7 +129,7 @@ def prob_hit_mc_advanced(S, K, vol, days=30, sims=MONTE_CARLO_SIMS, method="stud
     elif method == "bootstrap" and df_hist is not None:
         # Historical bootstrap
         hist_returns = get_historical_returns(df_hist)
-        if len(hist_returns) < 60:
+        if len(hist_returns) < 30:
             # Fallback to Student's t if insufficient data
             dof = 5
             random_shocks = stats.t.rvs(df=dof, size=(sims, days)) / np.sqrt(dof / (dof - 2))
@@ -313,8 +313,8 @@ def backtest(df, days=30):
     pnl = []
     returns = []
     
-    # Limit backtest iterations to last 90 periods to prevent data overflow
-    max_iterations = min(len(df) - days, 90)
+    # Limit backtest iterations to last 45 periods to prevent data overflow
+    max_iterations = min(len(df) - days, 45)
     start_idx = len(df) - days - max_iterations
     
     for i in range(start_idx, len(df) - days):
@@ -415,8 +415,8 @@ with st.sidebar:
     
     st.markdown("---")
     st.caption("💡 **Tip:** Student's t distribution accounts for market crashes better than normal distribution.")
-    st.caption("⚠️ Data cached for 1 hour. Using last 180 days of data to optimize performance.")
-    st.caption("🔬 Monte Carlo: 2,000 simulations for fast, reliable results.")
+    st.caption("⚠️ Data optimized: 120 days history, 45 backtest periods, 1,000 MC simulations.")
+    st.caption("🚀 Fast & reliable performance for all stocks.")
 
 # =====================================================
 # LOAD STOCK
@@ -658,7 +658,7 @@ with tab2:
 # =====================================================
 with tab3:
     st.subheader("📜 Backtest Results & Risk Metrics")
-    st.info(f"📘 Strategy: {sim_days}-day buy & hold with 50% stop-loss")
+    st.info(f"📘 Strategy: {sim_days}-day buy & hold with 50% stop-loss (last 45 periods)")
     
     bt = backtest(df, sim_days)
     
@@ -775,7 +775,7 @@ with tab4:
                 'Max Loss': '${:,.2f}',
                 'RRR': '{:.2f}x',
                 'Score': '{:.0f}/100'
-            }).background_gradient(subset=['Score'], cmap='RdYlGn', vmin=0, vmax=100),
+            }),
             use_container_width=True,
             height=400
         )
@@ -817,9 +817,9 @@ with tab4:
 # =====================================================
 with tab5:
     st.subheader("🚀 Market Scanner - Best Opportunities")
+    st.caption("🔍 Scanning top 10 tech stocks for optimal performance")
     
-    universe = ["AAPL","MSFT","NVDA","META","AMZN","GOOGL","TSLA","AMD","NFLX","AVGO",
-                "INTC","ORCL","CSCO","ADBE","CRM","PYPL","UBER","ABNB","COIN","RBLX"]
+    universe = ["AAPL","MSFT","NVDA","META","AMZN","GOOGL","TSLA","AMD","NFLX","AVGO"]
     
     scan_button = st.button("🔍 Scan Market", type="primary", use_container_width=True)
     
