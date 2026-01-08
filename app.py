@@ -1,6 +1,5 @@
 """
-Real-Time Trading Dashboard - Improved Edition
-Enhanced with better error handling, performance, and code quality
+Real-Time Trading Dashboard - Complete Fixed Edition
 """
 
 import streamlit as st
@@ -52,7 +51,7 @@ MAX_BACKTEST_ITERATIONS = 45
 MIN_HISTORICAL_DAYS = 30
 
 # UI Constants
-AUTO_REFRESH_INTERVAL = 2.0  # seconds
+AUTO_REFRESH_INTERVAL = 2.0
 
 # Scoring Thresholds
 class ScoringThresholds:
@@ -138,11 +137,6 @@ def validate_api_keys(api_key: str, secret_key: str) -> bool:
     return True
 
 
-def safe_get_session_state(key: str, default=None):
-    """Thread-safe session state getter"""
-    return st.session_state.get(key, default)
-
-
 def initialize_session_state():
     """Initialize all session state variables"""
     defaults = {
@@ -160,6 +154,9 @@ def initialize_session_state():
         'calculations_cache': {},
         'api_configured': False,
         'last_refresh': time.time(),
+        'live_feed_active': False,
+        'api_key': "",
+        'secret_key': "",
     }
     
     for key, value in defaults.items():
@@ -167,11 +164,27 @@ def initialize_session_state():
             st.session_state[key] = value
 
 
+def cleanup_websocket():
+    """Safely cleanup websocket connections"""
+    if st.session_state.websocket_handler:
+        try:
+            st.session_state.websocket_handler.stop_stream()
+        except:
+            pass
+        st.session_state.websocket_handler = None
+    
+    if st.session_state.websocket_thread and st.session_state.websocket_thread.is_alive():
+        st.session_state.websocket_thread.join(timeout=2)
+    
+    st.session_state.websocket_thread = None
+    st.session_state.live_feed_active = False
+
+
 # =====================================================
-# WEBSOCKET HANDLER (IMPROVED)
+# WEBSOCKET HANDLER
 # =====================================================
 class AlpacaRealtimeHandler:
-    """WebSocket handler with improved error handling and lifecycle management"""
+    """WebSocket handler with improved error handling"""
     
     def __init__(self, api_key: str, secret_key: str, ticker: str, 
                  trade_queue: queue.Queue, quote_queue: queue.Queue):
@@ -187,7 +200,7 @@ class AlpacaRealtimeHandler:
         self._lock = threading.Lock()
         
     async def trade_handler(self, data):
-        """Handle incoming trade data with validation"""
+        """Handle incoming trade data"""
         try:
             trade_data = {
                 'type': 'trade',
@@ -198,22 +211,20 @@ class AlpacaRealtimeHandler:
                 'exchange': getattr(data, 'exchange', 'N/A')
             }
             
-            # Validate data
             if trade_data['price'] > 0 and trade_data['size'] > 0:
                 try:
                     self.trade_queue.put_nowait(trade_data)
                 except queue.Full:
-                    logger.warning("Trade queue full, dropping oldest items")
                     try:
                         self.trade_queue.get_nowait()
                         self.trade_queue.put_nowait(trade_data)
                     except:
                         pass
         except Exception as e:
-            logger.error(f"Trade handler error: {e}", exc_info=True)
+            logger.error(f"Trade handler error: {e}")
     
     async def quote_handler(self, data):
-        """Handle incoming quote data with validation"""
+        """Handle incoming quote data"""
         try:
             if data.bid_price <= 0 or data.ask_price <= 0:
                 return
@@ -232,17 +243,16 @@ class AlpacaRealtimeHandler:
             try:
                 self.quote_queue.put_nowait(quote_data)
             except queue.Full:
-                logger.warning("Quote queue full, dropping oldest items")
                 try:
                     self.quote_queue.get_nowait()
                     self.quote_queue.put_nowait(quote_data)
                 except:
                     pass
         except Exception as e:
-            logger.error(f"Quote handler error: {e}", exc_info=True)
+            logger.error(f"Quote handler error: {e}")
     
     def start_stream(self):
-        """Start WebSocket stream with retry logic"""
+        """Start WebSocket stream"""
         self.is_running = True
         
         while self.is_running and self.reconnect_attempts < self.max_reconnect_attempts:
@@ -259,24 +269,16 @@ class AlpacaRealtimeHandler:
                 logger.info(f"Starting stream for {self.ticker}")
                 self.stream.run()
                 
-                # If we get here, connection was successful, reset attempts
                 self.reconnect_attempts = 0
                 
             except Exception as e:
-                logger.error(f"WebSocket error: {e}", exc_info=True)
+                logger.error(f"WebSocket error: {e}")
                 self.reconnect_attempts += 1
                 
                 if self.reconnect_attempts < self.max_reconnect_attempts:
                     wait_time = min(2 ** self.reconnect_attempts, 60)
-                    logger.info(f"Reconnecting in {wait_time} seconds (attempt {self.reconnect_attempts})")
                     time.sleep(wait_time)
                 else:
-                    error_msg = f"Failed to connect after {self.max_reconnect_attempts} attempts"
-                    logger.error(error_msg)
-                    try:
-                        self.trade_queue.put_nowait({'type': 'error', 'message': error_msg})
-                    except:
-                        pass
                     break
     
     def stop_stream(self):
@@ -285,7 +287,6 @@ class AlpacaRealtimeHandler:
             self.is_running = False
             if self.stream:
                 try:
-                    logger.info(f"Stopping stream for {self.ticker}")
                     self.stream.stop()
                 except Exception as e:
                     logger.error(f"Error stopping stream: {e}")
@@ -294,25 +295,13 @@ class AlpacaRealtimeHandler:
 
 
 # =====================================================
-# DATA FUNCTIONS (IMPROVED)
+# DATA FUNCTIONS
 # =====================================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_historical_data(ticker: str, api_key: str, secret_key: str, 
                          days_back: int = 120) -> Optional[pd.DataFrame]:
-    """
-    Fetch historical data from Alpaca with improved error handling
-    
-    Args:
-        ticker: Stock symbol
-        api_key: Alpaca API key
-        secret_key: Alpaca secret key
-        days_back: Number of days of historical data
-        
-    Returns:
-        DataFrame with historical data or None on error
-    """
+    """Fetch historical data from Alpaca"""
     if not validate_api_keys(api_key, secret_key):
-        logger.error("Invalid API keys")
         return None
         
     try:
@@ -329,36 +318,30 @@ def fetch_historical_data(ticker: str, api_key: str, secret_key: str,
         df = bars.df
         
         if df.empty:
-            logger.warning(f"No data returned for {ticker}")
             return None
         
         if ticker in df.index.get_level_values(0):
             df = df.xs(ticker, level=0)
             df = df.reset_index()
             
-            # Validate data quality
             if len(df) < 10:
-                logger.warning(f"Insufficient data for {ticker}: {len(df)} days")
                 return None
                 
-            # Check for required columns
             required_cols = ['close', 'high', 'low', 'volume', 'timestamp']
             if not all(col in df.columns for col in required_cols):
-                logger.error(f"Missing required columns for {ticker}")
                 return None
                 
             return df
         
-        logger.warning(f"Ticker {ticker} not found in response")
         return None
         
     except Exception as e:
-        logger.error(f"Error loading data for {ticker}: {e}", exc_info=True)
+        logger.error(f"Error loading data for {ticker}: {e}")
         return None
 
 
 def get_latest_quote(ticker: str, api_key: str, secret_key: str) -> Optional[Dict]:
-    """Get latest quote with error handling"""
+    """Get latest quote"""
     if not validate_api_keys(api_key, secret_key):
         return None
         
@@ -370,7 +353,6 @@ def get_latest_quote(ticker: str, api_key: str, secret_key: str) -> Optional[Dic
         if ticker in quotes:
             quote = quotes[ticker]
             
-            # Validate quote data
             if quote.bid_price <= 0 or quote.ask_price <= 0:
                 return None
                 
@@ -388,19 +370,10 @@ def get_latest_quote(ticker: str, api_key: str, secret_key: str) -> Optional[Dic
 
 
 # =====================================================
-# ANALYSIS FUNCTIONS (IMPROVED)
+# ANALYSIS FUNCTIONS
 # =====================================================
 def annual_volatility(df: pd.DataFrame, span: int = 20) -> float:
-    """
-    Calculate annualized volatility using EWMA
-    
-    Args:
-        df: DataFrame with 'close' column
-        span: EWMA span for volatility calculation
-        
-    Returns:
-        Annualized volatility (capped between VOL_FLOOR and VOL_CAP)
-    """
+    """Calculate annualized volatility"""
     if df.empty or len(df) < 10:
         return DEFAULT_VOLATILITY
         
@@ -412,7 +385,6 @@ def annual_volatility(df: pd.DataFrame, span: int = 20) -> float:
             
         vol = returns.ewm(span=span).std().iloc[-1] * np.sqrt(TRADING_DAYS_PER_YEAR)
         
-        # Handle NaN or infinite values
         if not np.isfinite(vol):
             return DEFAULT_VOLATILITY
             
@@ -424,7 +396,7 @@ def annual_volatility(df: pd.DataFrame, span: int = 20) -> float:
 
 
 def calculate_atr(df: pd.DataFrame, period: int = 14) -> float:
-    """Calculate Average True Range with error handling"""
+    """Calculate Average True Range"""
     if len(df) < period:
         return 0.0
         
@@ -454,79 +426,35 @@ def expected_move(price: float, vol: float, days: int = 30) -> float:
 def prob_hit_mc_advanced(S: float, K: float, vol: float, days: int = 30, 
                         sims: int = MONTE_CARLO_SIMS, method: str = "student_t",
                         df_hist: Optional[pd.DataFrame] = None) -> float:
-    """
-    Monte Carlo simulation for probability calculation
-    
-    Args:
-        S: Current stock price
-        K: Target price
-        vol: Annualized volatility
-        days: Time horizon in days
-        sims: Number of simulations
-        method: Simulation method ('student_t', 'bootstrap', or 'normal')
-        df_hist: Historical data for bootstrap method
-        
-    Returns:
-        Probability of hitting target price
-    """
+    """Monte Carlo simulation for probability"""
     if vol <= 0 or S <= 0 or K <= 0 or days <= 0:
         return 0.0
     
     try:
         dt = 1 / TRADING_DAYS_PER_YEAR
         
-        # Generate random shocks based on method
         if method == "student_t":
-            dof = 5  # Degrees of freedom for fat tails
+            dof = 5
             random_shocks = stats.t.rvs(df=dof, size=(sims, days)) / np.sqrt(dof / (dof - 2))
-            
-        elif method == "bootstrap" and df_hist is not None and len(df_hist) >= MIN_HISTORICAL_DAYS:
-            returns = np.log(df_hist["close"] / df_hist["close"].shift(1)).dropna()
-            
-            if len(returns) >= MIN_HISTORICAL_DAYS:
-                hist_returns = returns.values
-                random_indices = np.random.randint(0, len(hist_returns), size=(sims, days))
-                random_shocks = hist_returns[random_indices]
-                
-                # Scale to match target volatility
-                current_vol = np.std(hist_returns) * np.sqrt(TRADING_DAYS_PER_YEAR)
-                if current_vol > 0:
-                    random_shocks = random_shocks * (vol / current_vol)
-            else:
-                # Fallback to student_t
-                dof = 5
-                random_shocks = stats.t.rvs(df=dof, size=(sims, days)) / np.sqrt(dof / (dof - 2))
         else:
-            # Normal distribution
             random_shocks = np.random.normal(size=(sims, days))
         
-        # Simulate price paths using geometric Brownian motion
         drift = -0.5 * vol ** 2 * dt
         diffusion = vol * np.sqrt(dt) * random_shocks
         
         price_paths = S * np.exp(np.cumsum(drift + diffusion, axis=1))
         
-        # Check if target is hit in any path
         hits = (price_paths >= K).any(axis=1)
         
         return float(hits.mean())
         
     except Exception as e:
-        logger.error(f"Error in Monte Carlo simulation: {e}")
+        logger.error(f"Error in Monte Carlo: {e}")
         return 0.0
 
 
 def kelly_fraction(df: pd.DataFrame, min_trades: int = 30) -> float:
-    """
-    Calculate Kelly Criterion position sizing
-    
-    Args:
-        df: DataFrame with 'close' column
-        min_trades: Minimum number of data points required
-        
-    Returns:
-        Kelly fraction (capped between KELLY_MIN and KELLY_MAX)
-    """
+    """Calculate Kelly Criterion"""
     if df.empty or len(df) < min_trades:
         return KELLY_MIN
         
@@ -551,23 +479,19 @@ def kelly_fraction(df: pd.DataFrame, min_trades: int = 30) -> float:
             return KELLY_MIN
         
         R = avg_win / avg_loss
-        
-        # Kelly formula: f = p - q/R where p=win_rate, q=loss_rate, R=win/loss ratio
         fraction = win_rate - (loss_rate / R)
-        
-        # Use fractional Kelly (0.5) for safety
         fraction = fraction * 0.5
         
         return float(np.clip(fraction, KELLY_MIN, KELLY_MAX))
         
     except Exception as e:
-        logger.error(f"Error calculating Kelly fraction: {e}")
+        logger.error(f"Error calculating Kelly: {e}")
         return KELLY_MIN
 
 
 def calculate_sharpe_ratio(returns: np.ndarray, 
                           risk_free_rate: float = RISK_FREE_RATE) -> float:
-    """Calculate annualized Sharpe ratio"""
+    """Calculate Sharpe ratio"""
     if len(returns) == 0:
         return 0.0
         
@@ -582,7 +506,7 @@ def calculate_sharpe_ratio(returns: np.ndarray,
         return float(sharpe) if np.isfinite(sharpe) else 0.0
         
     except Exception as e:
-        logger.error(f"Error calculating Sharpe ratio: {e}")
+        logger.error(f"Error calculating Sharpe: {e}")
         return 0.0
 
 
@@ -599,21 +523,12 @@ def calculate_max_drawdown(cumulative_returns: np.ndarray) -> float:
         return max_dd if np.isfinite(max_dd) else 0.0
         
     except Exception as e:
-        logger.error(f"Error calculating max drawdown: {e}")
+        logger.error(f"Error calculating drawdown: {e}")
         return 0.0
 
 
 def backtest_vectorized(df: pd.DataFrame, days: int = 30) -> pd.DataFrame:
-    """
-    Vectorized backtest with improved performance
-    
-    Args:
-        df: Historical data
-        days: Holding period
-        
-    Returns:
-        DataFrame with backtest results
-    """
+    """Vectorized backtest"""
     min_required = days + MIN_HISTORICAL_DAYS
     if df.empty or len(df) < min_required:
         return pd.DataFrame({"PnL": [], "Return": []})
@@ -631,7 +546,6 @@ def backtest_vectorized(df: pd.DataFrame, days: int = 30) -> pd.DataFrame:
             if entry_price <= 0:
                 continue
             
-            # Calculate volatility using historical data up to entry
             historical_data = df.iloc[:actual_idx+1]
             
             if len(historical_data) > 20:
@@ -641,17 +555,14 @@ def backtest_vectorized(df: pd.DataFrame, days: int = 30) -> pd.DataFrame:
             else:
                 vol = DEFAULT_VOLATILITY
             
-            # Calculate stop level
             move = entry_price * vol * np.sqrt(days / TRADING_DAYS_PER_YEAR)
             stop_price = entry_price - move * STOP_MULTIPLIER
             
-            # Get prices for holding period
             window = df["close"].iloc[actual_idx:actual_idx+days]
             
             if len(window) == 0:
                 continue
             
-            # Check for stop hit
             stop_hit_mask = window <= stop_price
             if stop_hit_mask.any():
                 exit_price = window[stop_hit_mask].iloc[0]
@@ -682,7 +593,7 @@ def backtest_vectorized(df: pd.DataFrame, days: int = 30) -> pd.DataFrame:
 
 
 def calculate_backtest_metrics(bt: pd.DataFrame) -> BacktestResults:
-    """Extract metrics from backtest results"""
+    """Extract backtest metrics"""
     if bt.empty or len(bt) == 0:
         return BacktestResults(
             win_rate=0, profit_factor=0, max_drawdown=0, sharpe_ratio=0,
@@ -722,7 +633,7 @@ def calculate_backtest_metrics(bt: pd.DataFrame) -> BacktestResults:
         )
         
     except Exception as e:
-        logger.error(f"Error calculating backtest metrics: {e}")
+        logger.error(f"Error calculating metrics: {e}")
         return BacktestResults(
             win_rate=0, profit_factor=0, max_drawdown=0, sharpe_ratio=0,
             total_trades=0, winning_trades=0, losing_trades=0,
@@ -734,16 +645,11 @@ def evaluate_trade_decision(rrr: float, sharpe: float, max_dd: float,
                            win_rate: float, profit_factor: float, 
                            buy_prob: float, sell_prob: float,
                            price: float, ma_50: float, ma_200: float) -> Tuple[int, str, str, str, List[str]]:
-    """
-    Evaluate trade opportunity and provide recommendation
-    
-    Returns:
-        (score, decision, color, emoji, reasons)
-    """
+    """Evaluate trade opportunity"""
     score = 0
     reasons = []
     
-    # Trend Analysis (max 15 points)
+    # Trend Analysis (15 points)
     if price > ma_200 and price > ma_50:
         score += 15
         reasons.append("✅ Strong uptrend (above 50 & 200 MA)")
@@ -754,10 +660,9 @@ def evaluate_trade_decision(rrr: float, sharpe: float, max_dd: float,
         score += 5
         reasons.append("⚠️ Above 50 MA only")
     else:
-        score += 0
-        reasons.append("❌ Below both MAs (falling knife risk)")
+        reasons.append("❌ Below both MAs")
     
-    # Risk/Reward Ratio (max 25 points)
+    # Risk/Reward (25 points)
     if rrr >= ScoringThresholds.RRR_EXCELLENT:
         score += 25
         reasons.append(f"✅ Excellent RRR (≥{ScoringThresholds.RRR_EXCELLENT})")
@@ -768,10 +673,9 @@ def evaluate_trade_decision(rrr: float, sharpe: float, max_dd: float,
         score += 12
         reasons.append(f"⚠️ Acceptable RRR (≥{ScoringThresholds.RRR_ACCEPTABLE})")
     else:
-        score += 0
         reasons.append(f"❌ Poor RRR (<{ScoringThresholds.RRR_ACCEPTABLE})")
     
-    # Sharpe Ratio (max 25 points)
+    # Sharpe Ratio (25 points)
     if sharpe >= ScoringThresholds.SHARPE_EXCELLENT:
         score += 25
         reasons.append(f"✅ Excellent Sharpe (≥{ScoringThresholds.SHARPE_EXCELLENT})")
@@ -782,10 +686,9 @@ def evaluate_trade_decision(rrr: float, sharpe: float, max_dd: float,
         score += 10
         reasons.append(f"⚠️ Moderate Sharpe (≥{ScoringThresholds.SHARPE_MODERATE})")
     else:
-        score += 0
         reasons.append(f"❌ Poor Sharpe (<{ScoringThresholds.SHARPE_MODERATE})")
     
-    # Max Drawdown (max 15 points)
+    # Max Drawdown (15 points)
     if abs(max_dd) <= ScoringThresholds.DRAWDOWN_LOW:
         score += 15
         reasons.append(f"✅ Low drawdown (≤{ScoringThresholds.DRAWDOWN_LOW*100:.0f}%)")
@@ -796,10 +699,9 @@ def evaluate_trade_decision(rrr: float, sharpe: float, max_dd: float,
         score += 5
         reasons.append(f"⚠️ High drawdown (≤{ScoringThresholds.DRAWDOWN_HIGH*100:.0f}%)")
     else:
-        score += 0
         reasons.append(f"❌ Very high drawdown (>{ScoringThresholds.DRAWDOWN_HIGH*100:.0f}%)")
     
-    # Win Rate (max 10 points)
+    # Win Rate (10 points)
     if win_rate >= ScoringThresholds.WINRATE_HIGH:
         score += 10
         reasons.append(f"✅ High win rate (≥{ScoringThresholds.WINRATE_HIGH}%)")
@@ -810,10 +712,9 @@ def evaluate_trade_decision(rrr: float, sharpe: float, max_dd: float,
         score += 3
         reasons.append(f"⚠️ Below-average win rate (≥{ScoringThresholds.WINRATE_BELOW_AVG}%)")
     else:
-        score += 0
         reasons.append(f"❌ Low win rate (<{ScoringThresholds.WINRATE_BELOW_AVG}%)")
     
-    # Profit Factor (max 10 points)
+    # Profit Factor (10 points)
     if profit_factor >= ScoringThresholds.PROFIT_FACTOR_STRONG:
         score += 10
         reasons.append(f"✅ Strong profit factor (≥{ScoringThresholds.PROFIT_FACTOR_STRONG})")
@@ -824,10 +725,9 @@ def evaluate_trade_decision(rrr: float, sharpe: float, max_dd: float,
         score += 3
         reasons.append(f"⚠️ Marginal profit factor (≥{ScoringThresholds.PROFIT_FACTOR_MARGINAL})")
     else:
-        score += 0
         reasons.append(f"❌ Negative profit factor (<{ScoringThresholds.PROFIT_FACTOR_MARGINAL})")
     
-    # Determine decision based on score
+    # Determine decision
     if score >= SCORE_STRONG_BUY:
         decision = "STRONG BUY"
         color = "success"
@@ -858,7 +758,7 @@ def evaluate_trade_decision(rrr: float, sharpe: float, max_dd: float,
 def calculate_trade_metrics(df: pd.DataFrame, price: float, 
                            sim_days: int, mc_method: str, 
                            account_size: float) -> TradeMetrics:
-    """Calculate all trade metrics in one place"""
+    """Calculate all trade metrics"""
     try:
         vol = annual_volatility(df)
         atr = calculate_atr(df)
@@ -885,61 +785,8 @@ def calculate_trade_metrics(df: pd.DataFrame, price: float,
             rrr=rrr, kelly=kelly, qty=qty, expected_move=move
         )
     except Exception as e:
-        logger.error(f"Error calculating trade metrics: {e}")
+        logger.error(f"Error calculating metrics: {e}")
         raise
-
-
-# =====================================================
-# MARKET SCANNER WITH PARALLEL PROCESSING
-# =====================================================
-def scan_single_stock(symbol: str, api_key: str, secret_key: str, 
-                      sim_days: int, mc_method: str) -> Optional[Dict]:
-    """Scan a single stock (used for parallel processing)"""
-    try:
-        hist = fetch_historical_data(symbol, api_key, secret_key, 120)
-        if hist is None or hist.empty or len(hist) < 60:
-            return None
-        
-        p = hist["close"].iloc[-1]
-        ma50 = hist["close"].rolling(50).mean().iloc[-1] if len(hist) >= 50 else p
-        ma200 = hist["close"].rolling(min(200, len(hist))).mean().iloc[-1]
-        
-        # Trend filter
-        if p < ma50:
-            return None
-        
-        v = annual_volatility(hist)
-        m = expected_move(p, v, sim_days)
-        b = p - m
-        s = p + m
-        st_p = b - m * STOP_MULTIPLIER
-        
-        prob = 1 - prob_hit_mc_advanced(p, b, v, sim_days, MONTE_CARLO_SIMS, mc_method, hist)
-        rrr = (s - b) / max(b - st_p, 0.01)
-        ev = prob * (s - b)
-        
-        trend = 2 if (p > ma200 and p > ma50) else 1
-        
-        # Quality filters
-        if prob >= 0.55 and rrr >= 1.5:
-            return {
-                'Expected Value': ev,
-                'Ticker': symbol,
-                'Price': p,
-                'Buy': b,
-                'Sell': s,
-                'Stop': st_p,
-                'Risk/Reward': rrr,
-                'Probability': prob,
-                'Volatility': v,
-                'Trend': '🟢 Strong' if trend == 2 else '🟡 Moderate'
-            }
-        
-        return None
-        
-    except Exception as e:
-        logger.error(f"Error scanning {symbol}: {e}")
-        return None
 
 
 # =====================================================
@@ -951,116 +798,385 @@ initialize_session_state()
 # MAIN APP
 # =====================================================
 st.title("📈 Trading Dashboard Pro")
-st.caption("Beginner-friendly real-time stock analysis with AI recommendations")
+st.caption("Real-time stock analysis with AI recommendations")
 
 # Get API keys
 try:
-    api_key = st.secrets.get("ALPACA_KEY", "")
-    secret_key = st.secrets.get("ALPACA_SECRET", "")
+    default_api = st.secrets.get("ALPACA_KEY", "")
+    default_secret = st.secrets.get("ALPACA_SECRET", "")
 except:
-    api_key = ""
-    secret_key = ""
+    default_api = ""
+    default_secret = ""
+
+# Set API keys if available from secrets
+if default_api and default_secret and not st.session_state.api_configured:
+    st.session_state.api_key = default_api
+    st.session_state.secret_key = default_secret
+    st.session_state.api_configured = True
 
 # =====================================================
-# STEP-BY-STEP GUIDE
+# STEP 1: API CONFIGURATION (ONLY SHOW IF NOT CONFIGURED)
 # =====================================================
-st.markdown("---")
-
-# STEP 1: API CONFIGURATION
-with st.expander("📝 **STEP 1: Configure API Keys**", expanded=not st.session_state.api_configured):
-    st.markdown("""
-    ### Get Your FREE API Keys (Takes 2 minutes)
-    
-    1. Go to **[alpaca.markets](https://alpaca.markets)** and click "Sign Up"
-    2. Choose **"Paper Trading"** (NO REAL MONEY - It's free practice!)
-    3. After signup, go to **"API Keys"** in the menu
-    4. Click **"Generate New Keys"** and copy both keys
-    5. Paste them below 👇
-    """)
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        if api_key:
-            st.success("✅ API Key loaded from secrets")
-        else:
-            api_key = st.text_input(
+if not st.session_state.api_configured:
+    st.markdown("---")
+    with st.container():
+        st.markdown("### 📝 STEP 1: Configure API Keys")
+        st.markdown("""
+        #### Get Your FREE API Keys (Takes 2 minutes)
+        
+        1. Go to **[alpaca.markets](https://alpaca.markets)** and click "Sign Up"
+        2. Choose **"Paper Trading"** (NO REAL MONEY - It's free practice!)
+        3. After signup, go to **"API Keys"** in the menu
+        4. Click **"Generate New Keys"** and copy both keys
+        5. Paste them below 👇
+        """)
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            api_key_input = st.text_input(
                 "🔑 API Key",
                 type="password",
                 placeholder="PKXXXXXXXXXXXXXXXX",
                 help="Your Alpaca API Key (starts with 'PK')"
             )
-    
-    with col2:
-        if secret_key:
-            st.success("✅ Secret Key loaded from secrets")
-        else:
-            secret_key = st.text_input(
+        
+        with col2:
+            secret_key_input = st.text_input(
                 "🔐 Secret Key",
                 type="password",
                 placeholder="Your secret key here",
                 help="Your Alpaca Secret Key"
             )
+        
+        if st.button("✅ Confirm API Keys", type="primary", use_container_width=True):
+            if validate_api_keys(api_key_input, secret_key_input):
+                st.session_state.api_key = api_key_input
+                st.session_state.secret_key = secret_key_input
+                st.session_state.api_configured = True
+                st.success("✅ API Keys Configured! Proceeding to stock selection...")
+                time.sleep(1)
+                st.rerun()
+            else:
+                st.error("❌ Invalid API keys. Please check and try again.")
     
-    if validate_api_keys(api_key, secret_key):
-        st.session_state.api_configured = True
-        st.success("✅ **API Keys Configured!** You can now proceed to Step 2.")
-    elif api_key or secret_key:
-        st.error("❌ Invalid API keys. Please check and try again.")
+    st.stop()
 
-st.markdown("---")
-
+# =====================================================
 # STEP 2: STOCK SELECTION
-with st.expander("📊 **STEP 2: Choose a Stock & Load Data**", 
-                expanded=st.session_state.api_configured and not st.session_state.historical_data):
-    st.markdown("""
-    ### Popular Stocks to Try:
-    - **NVDA** - NVIDIA (AI/Chips)
-    - **AAPL** - Apple
-    - **TSLA** - Tesla
-    - **MSFT** - Microsoft
-    - **GOOGL** - Google
-    """)
-    
-    col1, col2 = st.columns([2, 1])
-    
-    with col1:
-        ticker_input = st.text_input(
-            "Stock Ticker Symbol",
-            value="NVDA",
-            placeholder="Enter ticker (e.g., AAPL, TSLA)"
-        ).upper()
-    
-    with col2:
-        st.markdown("<br>", unsafe_allow_html=True)
-        load_button = st.button(
-            "📥 **LOAD DATA**",
-            type="primary",
-            use_container_width=True,
-            disabled=not st.session_state.api_configured
-        )
-    
-    if load_button:
-        if not validate_api_keys(api_key, secret_key):
-            st.error("❌ Please configure valid API keys in Step 1 first!")
-        else:
-            with st.spinner(f"⏳ Loading {ticker_input} data..."):
-                hist_data = fetch_historical_data(ticker_input, api_key, secret_key)
-                
-                if hist_data is not None:
-                    st.session_state.historical_data = hist_data
-                    st.session_state.current_ticker = ticker_input
-                    st.session_state.calculations_cache = {}
-                    
-                    quote = get_latest_quote(ticker_input, api_key, secret_key)
-                    if quote:
-                        st.session_state.latest_quote = quote
-                        st.session_state.latest_price = (quote['bid'] + quote['ask']) / 2
-                    
-                    st.success(f"✅ Loaded {len(hist_data)} days for {ticker_input}")
-                    st.balloons()
-                    time.sleep(1)
-                    st.rerun()
-                else:
-                    st.error(f"❌ Failed to load {ticker_input}. Check ticker and try again.")
+# =====================================================
+st.markdown("---")
+st.markdown("### 📊 Select a Stock")
 
+col1, col2 = st.columns([2, 1])
+
+with col1:
+    ticker_input = st.text_input(
+        "Stock Ticker Symbol",
+        value=st.session_state.current_ticker or "NVDA",
+        placeholder="Enter ticker (e.g., AAPL, TSLA)"
+    ).upper()
+
+with col2:
+    st.markdown("<br>", unsafe_allow_html=True)
+    load_button = st.button(
+        "📥 **LOAD DATA**",
+        type="primary",
+        use_container_width=True
+    )
+
+if load_button and ticker_input:
+    with st.spinner(f"⏳ Loading {ticker_input} data..."):
+        # Clean up old websocket
+        cleanup_websocket()
+        
+        hist_data = fetch_historical_data(
+            ticker_input, 
+            st.session_state.api_key, 
+            st.session_state.secret_key
+        )
+        
+        if hist_data is not None:
+            st.session_state.historical_data = hist_data
+            st.session_state.current_ticker = ticker_input
+            st.session_state.calculations_cache = {}
+            
+            quote = get_latest_quote(
+                ticker_input, 
+                st.session_state.api_key, 
+                st.session_state.secret_key
+            )
+            if quote:
+                st.session_state.latest_quote = quote
+                st.session_state.latest_price = (quote['bid'] + quote['ask']) / 2
+            
+            st.success(f"✅ Loaded {len(hist_data)} days for {ticker_input}")
+            time.sleep(1)
+            st.rerun()
+        else:
+            st.error(f"❌ Failed to load {ticker_input}. Check ticker and try again.")
+
+# =====================================================
+# MAIN ANALYSIS (ONLY SHOW IF DATA LOADED)
+# =====================================================
+if st.session_state.historical_data is not None:
+    df = st.session_state.historical_data
+    ticker = st.session_state.current_ticker
+    
+    st.markdown("---")
+    
+    # Sidebar controls
+    with st.sidebar:
+        st.header("⚙️ Settings")
+        
+        account_size = st.number_input(
+            "💰 Account Size ($)",
+            min_value=1000,
+            max_value=1000000,
+            value=10000,
+            step=1000
+        )
+        
+        sim_days = st.slider(
+            "📅 Time Horizon (Days)",
+            min_value=5,
+            max_value=90,
+            value=30,
+            step=5
+        )
+        
+        mc_method = st.selectbox(
+            "🎲 Simulation Method",
+            ["student_t", "normal"],
+            help="Student-t accounts for fat tails"
+        )
+        
+        st.markdown("---")
+        
+        # Live Feed Toggle
+        if st.button(
+            "🔴 Stop Live Feed" if st.session_state.live_feed_active else "🟢 Start Live Feed",
+            use_container_width=True
+        ):
+            if st.session_state.live_feed_active:
+                cleanup_websocket()
+                st.success("Live feed stopped")
+            else:
+                # Start websocket
+                handler = AlpacaRealtimeHandler(
+                    st.session_state.api_key,
+                    st.session_state.secret_key,
+                    ticker,
+                    st.session_state.trade_queue,
+                    st.session_state.quote_queue
+                )
+                
+                thread = threading.Thread(target=handler.start_stream, daemon=True)
+                thread.start()
+                
+                st.session_state.websocket_handler = handler
+                st.session_state.websocket_thread = thread
+                st.session_state.live_feed_active = True
+                st.success("Live feed started!")
+            
+            time.sleep(1)
+            st.rerun()
+    
+    # Get current price
+    if st.session_state.latest_price:
+        current_price = st.session_state.latest_price
+    else:
+        current_price = df["close"].iloc[-1]
+    
+    # Calculate metrics
+    try:
+        metrics = calculate_trade_metrics(
+            df, current_price, sim_days, mc_method, account_size
+        )
+        
+        # Run backtest
+        bt = backtest_vectorized(df, sim_days)
+        bt_metrics = calculate_backtest_metrics(bt)
+        
+        # Evaluate decision
+        score, decision, color, emoji, reasons = evaluate_trade_decision(
+            metrics.rrr,
+            bt_metrics.sharpe_ratio,
+            bt_metrics.max_drawdown,
+            bt_metrics.win_rate,
+            bt_metrics.profit_factor,
+            metrics.buy_prob,
+            metrics.sell_prob,
+            current_price,
+            metrics.ma_50,
+            metrics.ma_200
+        )
+        
+        # Display recommendation
+        st.markdown(f"## {emoji} Trade Recommendation: **{decision}**")
+        st.markdown(f"**Score: {score}/100**")
+        
+        # Metrics display
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.metric("Current Price", f"${current_price:.2f}")
+            st.metric("Buy Level", f"${metrics.buy:.2f}", f"{((metrics.buy/current_price-1)*100):.1f}%")
+        
+        with col2:
+            st.metric("Sell Target", f"${metrics.sell:.2f}", f"{((metrics.sell/current_price-1)*100):.1f}%")
+            st.metric("Stop Loss", f"${metrics.stop:.2f}", f"{((metrics.stop/current_price-1)*100):.1f}%")
+        
+        with col3:
+            st.metric("Risk/Reward Ratio", f"{metrics.rrr:.2f}")
+            st.metric("Position Size", f"{metrics.qty} shares")
+        
+        with col4:
+            st.metric("Win Rate", f"{bt_metrics.win_rate:.1f}%")
+            st.metric("Sharpe Ratio", f"{bt_metrics.sharpe_ratio:.2f}")
+        
+        # Reasons
+        st.markdown("### 📋 Analysis Summary")
+        for reason in reasons:
+            st.markdown(f"- {reason}")
+        
+        # Chart
+        st.markdown("### 📈 Price Chart with Levels")
+        
+        fig = go.Figure()
+        
+        # Price line
+        fig.add_trace(go.Scatter(
+            x=df['timestamp'],
+            y=df['close'],
+            name='Price',
+            line=dict(color='#2196F3', width=2)
+        ))
+        
+        # Moving averages
+        if len(df) >= 50:
+            ma50 = df['close'].rolling(50).mean()
+            fig.add_trace(go.Scatter(
+                x=df['timestamp'],
+                y=ma50,
+                name='MA50',
+                line=dict(color='#FF9800', width=1, dash='dash')
+            ))
+        
+        if len(df) >= 200:
+            ma200 = df['close'].rolling(200).mean()
+            fig.add_trace(go.Scatter(
+                x=df['timestamp'],
+                y=ma200,
+                name='MA200',
+                line=dict(color='#9C27B0', width=1, dash='dash')
+            ))
+        
+        # Trade levels
+        fig.add_hline(y=metrics.buy, line_dash="dot", line_color="green", 
+                     annotation_text="Buy Level")
+        fig.add_hline(y=metrics.sell, line_dash="dot", line_color="blue", 
+                     annotation_text="Sell Target")
+        fig.add_hline(y=metrics.stop, line_dash="dot", line_color="red", 
+                     annotation_text="Stop Loss")
+        
+        fig.update_layout(
+            title=f"{ticker} Price Analysis",
+            xaxis_title="Date",
+            yaxis_title="Price ($)",
+            height=500,
+            hovermode='x unified'
+        )
+        
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # Backtest results
+        if not bt.empty:
+            st.markdown("### 📊 Backtest Performance")
+            
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                st.metric("Total Trades", bt_metrics.total_trades)
+                st.metric("Winning Trades", bt_metrics.winning_trades)
+            
+            with col2:
+                st.metric("Profit Factor", f"{bt_metrics.profit_factor:.2f}")
+                st.metric("Max Drawdown", f"{bt_metrics.max_drawdown*100:.1f}%")
+            
+            with col3:
+                st.metric("Avg Win", f"${bt_metrics.avg_win:.2f}")
+                st.metric("Avg Loss", f"${bt_metrics.avg_loss:.2f}")
+            
+            # Equity curve
+            fig_bt = go.Figure()
+            
+            fig_bt.add_trace(go.Scatter(
+                y=bt['CumPnL'],
+                name='Cumulative P&L',
+                line=dict(color='#4CAF50', width=2)
+            ))
+            
+            fig_bt.update_layout(
+                title="Backtest Equity Curve",
+                xaxis_title="Trade Number",
+                yaxis_title="Cumulative P&L ($)",
+                height=400
+            )
+            
+            st.plotly_chart(fig_bt, use_container_width=True)
+        
+        # Live feed display
+        if st.session_state.live_feed_active:
+            st.markdown("### 🔴 Live Market Data")
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.markdown("**Recent Trades**")
+                trade_placeholder = st.empty()
+                
+                # Get recent trades from queue
+                trades = []
+                while not st.session_state.trade_queue.empty():
+                    try:
+                        trade = st.session_state.trade_queue.get_nowait()
+                        st.session_state.trade_history.append(trade)
+                        if len(st.session_state.trade_history) > MAX_TRADE_HISTORY:
+                            st.session_state.trade_history.pop(0)
+                    except:
+                        break
+                
+                if st.session_state.trade_history:
+                    recent_trades = st.session_state.trade_history[-5:]
+                    for trade in reversed(recent_trades):
+                        st.text(f"{trade['timestamp'].strftime('%H:%M:%S')} | "
+                               f"${trade['price']:.2f} | {trade['size']} shares")
+            
+            with col2:
+                st.markdown("**Live Quote**")
+                
+                # Get latest quote
+                while not st.session_state.quote_queue.empty():
+                    try:
+                        quote = st.session_state.quote_queue.get_nowait()
+                        st.session_state.latest_quote = quote
+                    except:
+                        break
+                
+                if st.session_state.latest_quote:
+                    q = st.session_state.latest_quote
+                    st.text(f"Bid: ${q['bid']:.2f} ({q['bid_size']})")
+                    st.text(f"Ask: ${q['ask']:.2f} ({q['ask_size']})")
+                    st.text(f"Spread: ${q['spread']:.4f}")
+        
+    except Exception as e:
+        st.error(f"Error in analysis: {e}")
+        logger.error(f"Analysis error: {e}", exc_info=True)
+
+else:
+    st.info("👆 Please load stock data to begin analysis")
+
+# Footer
+st.markdown("---")
+st.caption("⚠️ This is for educational purposes only. Not financial advice.")
