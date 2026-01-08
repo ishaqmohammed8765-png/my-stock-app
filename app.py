@@ -21,7 +21,23 @@ VOL_CAP = 1.5
 KELLY_MAX = 0.15
 KELLY_MIN = 0.01
 MONTE_CARLO_SIMS = 1000
-RISK_FREE_RATE = 0.045  # 4.5% annual risk-free rate
+
+# Dynamic risk-free rate (updated on load)
+@st.cache_data(ttl=3600)
+def get_risk_free_rate():
+    """Fetch current 10-year Treasury yield as risk-free rate."""
+    try:
+        tnx = yf.Ticker("^TNX")
+        hist = tnx.history(period="5d")
+        if not hist.empty:
+            # TNX returns percentage (e.g., 4.5 for 4.5%)
+            rate = float(hist["Close"].iloc[-1]) / 100
+            return max(0.01, min(rate, 0.10))  # Cap between 1% and 10%
+    except:
+        pass
+    return 0.045  # Fallback to 4.5%
+
+RISK_FREE_RATE = get_risk_free_rate()
 
 # =====================================================
 # DECORATORS
@@ -203,23 +219,38 @@ def calculate_sharpe_ratio(returns, risk_free_rate=RISK_FREE_RATE):
     
     return float(sharpe)
 
-def evaluate_trade_decision(RRR, sharpe, max_dd, win_rate, profit_factor, buy_prob, sell_prob):
+def evaluate_trade_decision(RRR, sharpe, max_dd, win_rate, profit_factor, buy_prob, sell_prob, price, ma_50, ma_200):
     """
     Evaluate whether to take a trade based on multiple criteria.
+    Now includes trend filter to avoid "falling knife" scenarios.
     Returns: (score, decision, reasoning)
     """
     score = 0
     reasons = []
     
-    # Risk-Reward Ratio (0-30 points)
+    # Trend Filter (0-15 points) - NEW: Prevents buying in strong downtrends
+    if price > ma_200 and price > ma_50:
+        score += 15
+        reasons.append("✅ Strong uptrend (above 50 & 200 MA)")
+    elif price > ma_200:
+        score += 10
+        reasons.append("✅ Above 200 MA (long-term uptrend)")
+    elif price > ma_50:
+        score += 5
+        reasons.append("⚠️ Above 50 MA only (weak trend)")
+    else:
+        score += 0
+        reasons.append("❌ Below both MAs (falling knife risk)")
+    
+    # Risk-Reward Ratio (0-25 points, reduced from 30)
     if RRR >= 3.0:
-        score += 30
+        score += 25
         reasons.append("✅ Excellent RRR (≥3.0)")
     elif RRR >= 2.0:
-        score += 25
+        score += 20
         reasons.append("✅ Strong RRR (≥2.0)")
     elif RRR >= 1.5:
-        score += 15
+        score += 12
         reasons.append("⚠️ Acceptable RRR (≥1.5)")
     else:
         score += 0
@@ -239,12 +270,12 @@ def evaluate_trade_decision(RRR, sharpe, max_dd, win_rate, profit_factor, buy_pr
         score += 0
         reasons.append("❌ Poor Sharpe (<0.5)")
     
-    # Max Drawdown (0-20 points) - lower is better
+    # Max Drawdown (0-15 points, reduced from 20)
     if abs(max_dd) <= 0.10:
-        score += 20
+        score += 15
         reasons.append("✅ Low drawdown (≤10%)")
     elif abs(max_dd) <= 0.20:
-        score += 15
+        score += 10
         reasons.append("✅ Moderate drawdown (≤20%)")
     elif abs(max_dd) <= 0.30:
         score += 5
@@ -253,15 +284,15 @@ def evaluate_trade_decision(RRR, sharpe, max_dd, win_rate, profit_factor, buy_pr
         score += 0
         reasons.append("❌ Very high drawdown (>30%)")
     
-    # Win Rate (0-15 points)
+    # Win Rate (0-10 points, reduced from 15)
     if win_rate >= 60:
-        score += 15
+        score += 10
         reasons.append("✅ High win rate (≥60%)")
     elif win_rate >= 50:
-        score += 10
+        score += 7
         reasons.append("✅ Positive win rate (≥50%)")
     elif win_rate >= 40:
-        score += 5
+        score += 3
         reasons.append("⚠️ Below-average win rate (≥40%)")
     else:
         score += 0
@@ -281,7 +312,7 @@ def evaluate_trade_decision(RRR, sharpe, max_dd, win_rate, profit_factor, buy_pr
         score += 0
         reasons.append("❌ Negative profit factor (<1.0)")
     
-    # Determine decision
+    # Determine decision (scoring updated for new 100-point scale)
     if score >= 80:
         decision = "STRONG BUY"
         color = "success"
@@ -294,61 +325,72 @@ def evaluate_trade_decision(RRR, sharpe, max_dd, win_rate, profit_factor, buy_pr
         decision = "CONDITIONAL BUY"
         color = "warning"
         emoji = "🟡"
+        reasons.append("💡 Review trend and timing carefully")
     elif score >= 35:
         decision = "HOLD"
         color = "warning"
         emoji = "🟡"
+        reasons.append("⏸️ Wait for better setup")
     else:
         decision = "AVOID"
         color = "error"
         emoji = "🔴"
+        reasons.append("🛑 Risk too high or downtrend active")
     
     return score, decision, color, emoji, reasons
 
-def backtest(df, days=30):
-    """Enhanced backtest with risk metrics."""
+def backtest_vectorized(df, days=30):
+    """
+    Vectorized backtest with no look-ahead bias.
+    Each trade only uses data available at entry time.
+    """
     if df.empty or len(df) < days + 30:
         return pd.DataFrame({"PnL": [], "Return": []})
     
-    pnl = []
-    returns = []
-    
-    # Limit backtest iterations to last 45 periods to prevent data overflow
     max_iterations = min(len(df) - days, 45)
     start_idx = len(df) - days - max_iterations
     
-    for i in range(start_idx, len(df) - days):
-        entry = df["Close"].iloc[i]
-        window = df["Close"].iloc[i:i+days].copy()
+    entries = df["Close"].iloc[start_idx:len(df)-days].values
+    n_trades = len(entries)
+    
+    pnl = np.zeros(n_trades)
+    returns = np.zeros(n_trades)
+    
+    for i in range(n_trades):
+        actual_idx = start_idx + i
+        entry_price = df["Close"].iloc[actual_idx]
+        
+        # Calculate volatility using ONLY data up to entry point (no look-ahead)
+        historical_data = df.iloc[:actual_idx+1]
+        if len(historical_data) > 20:
+            log_returns = np.log(historical_data["Close"] / historical_data["Close"].shift(1)).dropna()
+            vol = log_returns.ewm(span=20).std().iloc[-1] * np.sqrt(252)
+            vol = float(np.clip(vol, VOL_FLOOR, VOL_CAP))
+        else:
+            vol = 0.30
         
         # Calculate stop-loss
-        vol_at_entry = annual_volatility(df.iloc[:i+1]) if i > 20 else annual_volatility(df)
-        stop_price = entry - expected_move(entry, vol_at_entry, days) * 0.5
+        move = entry_price * vol * np.sqrt(days / 252)
+        stop_price = entry_price - move * 0.5
         
-        window = pd.to_numeric(window, errors="coerce").dropna()
-        if window.empty:
-            continue
+        # Get forward window (this is the actual holding period)
+        window = df["Close"].iloc[actual_idx:actual_idx+days]
         
         # Check for stop-loss hit
-        hits = window[window <= stop_price]
-        exit_price = float(hits.iloc[0]) if not hits.empty else float(window.iloc[-1])
+        stop_hit_mask = window <= stop_price
+        if stop_hit_mask.any():
+            exit_price = window[stop_hit_mask].iloc[0]
+        else:
+            exit_price = window.iloc[-1]
         
-        trade_pnl = exit_price - entry
-        trade_return = (exit_price - entry) / entry
-        
-        pnl.append(trade_pnl)
-        returns.append(trade_return)
-    
-    if not pnl:
-        return pd.DataFrame({"PnL": [], "Return": []})
+        pnl[i] = exit_price - entry_price
+        returns[i] = (exit_price - entry_price) / entry_price
     
     bt = pd.DataFrame({
         "PnL": pnl,
         "Return": returns
     })
     
-    bt["PnL"] = pd.to_numeric(bt["PnL"], errors="coerce").fillna(0)
-    bt["Return"] = pd.to_numeric(bt["Return"], errors="coerce").fillna(0)
     bt["CumPnL"] = bt["PnL"].cumsum()
     bt["CumReturn"] = (1 + bt["Return"]).cumprod() - 1
     
@@ -414,9 +456,11 @@ with st.sidebar:
     )
     
     st.markdown("---")
-    st.caption("💡 **Tip:** Student's t distribution accounts for market crashes better than normal distribution.")
-    st.caption("⚠️ Data optimized: 120 days history, 45 backtest periods, 1,000 MC simulations.")
-    st.caption("🚀 Fast & reliable performance for all stocks.")
+    st.caption("💡 **Student's t-distribution** accounts for fat tails and market crashes")
+    st.caption("📊 **Trend filter** prevents 'falling knife' trades")
+    st.caption("🔬 **Vectorized backtest** with no look-ahead bias")
+    st.caption(f"🏦 **Dynamic risk-free rate**: {RISK_FREE_RATE*100:.2f}% (10Y Treasury)")
+    st.caption("⚡ Optimized: 120 days, 45 backtest periods, 1K simulations")
 
 # =====================================================
 # LOAD STOCK
@@ -448,6 +492,10 @@ if cache_key not in st.session_state.calculations_cache:
     price = float(df["Close"].iloc[-1])
     vol = annual_volatility(df)
     
+    # Calculate moving averages for trend filter
+    ma_50 = df["Close"].rolling(50).mean().iloc[-1] if len(df) >= 50 else price
+    ma_200 = df["Close"].rolling(200).mean().iloc[-1] if len(df) >= 200 else df["Close"].rolling(len(df)//2).mean().iloc[-1]
+    
     move = expected_move(price, vol, sim_days)
     buy = price - move
     sell = price + move
@@ -465,6 +513,8 @@ if cache_key not in st.session_state.calculations_cache:
     st.session_state.calculations_cache[cache_key] = {
         "price": price,
         "vol": vol,
+        "ma_50": ma_50,
+        "ma_200": ma_200,
         "move": move,
         "buy": buy,
         "sell": sell,
@@ -480,6 +530,8 @@ if cache_key not in st.session_state.calculations_cache:
 calc = st.session_state.calculations_cache[cache_key]
 price = calc["price"]
 vol = calc["vol"]
+ma_50 = calc["ma_50"]
+ma_200 = calc["ma_200"]
 buy = calc["buy"]
 sell = calc["sell"]
 stop = calc["stop"]
@@ -505,10 +557,24 @@ with tab1:
     # Price metrics
     col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("Current Price", f"${price:.2f}")
-    col2.metric("Volatility (Annual)", f"{vol*100:.1f}%")
-    col3.metric("Expected Move", f"${calc['move']:.2f}")
-    col4.metric("Kelly %", f"{kelly*100:.1f}%")
-    col5.metric("Shares", qty)
+    col2.metric("50-Day MA", f"${ma_50:.2f}", 
+                delta=f"{((price/ma_50 - 1)*100):.1f}%" if ma_50 > 0 else None,
+                delta_color="normal")
+    col3.metric("200-Day MA", f"${ma_200:.2f}",
+                delta=f"{((price/ma_200 - 1)*100):.1f}%" if ma_200 > 0 else None,
+                delta_color="normal")
+    col4.metric("Volatility", f"{vol*100:.1f}%")
+    col5.metric("Kelly %", f"{kelly*100:.1f}%")
+    
+    # Trend status
+    if price > ma_50 and price > ma_200:
+        st.success("🟢 **Strong Uptrend** - Price above both 50 & 200-day moving averages")
+    elif price > ma_50:
+        st.info("🟡 **Moderate Trend** - Price above 50-day MA only")
+    elif price > ma_200:
+        st.warning("🟡 **Mixed Signals** - Price above 200-day MA but below 50-day MA")
+    else:
+        st.error("🔴 **Downtrend Warning** - Price below both moving averages (falling knife risk)")
     
     st.markdown("---")
     
@@ -530,21 +596,21 @@ with tab1:
     
     st.markdown("---")
     
-    # Run backtest for decision analysis
-    bt = backtest(df, sim_days)
+    # Run backtest for decision analysis (vectorized, no look-ahead bias)
+    bt = backtest_vectorized(df, sim_days)
     
     # Calculate backtest metrics
     if not bt.empty and len(bt) > 0:
         win_rate = (bt["PnL"] > 0).mean() * 100
         profit_factor = bt[bt["PnL"]>0]["PnL"].sum() / max(abs(bt[bt["PnL"]<0]["PnL"].sum()), 0.01)
         max_dd = calculate_max_drawdown(bt["CumReturn"].values)
-        sharpe = calculate_sharpe_ratio(bt["Return"].values)
+        sharpe = calculate_sharpe_ratio(bt["Return"].values, RISK_FREE_RATE)
     else:
         win_rate = profit_factor = max_dd = sharpe = 0
     
-    # Get trade decision
+    # Get trade decision (now includes trend filter)
     score, decision, color, emoji, reasons = evaluate_trade_decision(
-        RRR, sharpe, max_dd, win_rate, profit_factor, buy_prob, sell_prob
+        RRR, sharpe, max_dd, win_rate, profit_factor, buy_prob, sell_prob, price, ma_50, ma_200
     )
     
     # Display decision
@@ -568,15 +634,16 @@ with tab1:
     st.markdown("---")
     
     # Risk-Reward analysis
-    st.subheader("⚖️ Risk-Reward Analysis")
-    col1, col2, col3 = st.columns(3)
+    st.subheader("⚖️ Position Sizing & Risk")
+    col1, col2, col3, col4 = st.columns(4)
     
     expected_profit = (sell - buy) * qty
     max_loss = (buy - stop) * qty
     
-    col1.metric("Risk-Reward Ratio", f"{RRR:.2f}x")
-    col2.metric("Expected Profit", f"${expected_profit:,.2f}")
-    col3.metric("Maximum Loss", f"${max_loss:,.2f}")
+    col1.metric("Shares to Buy", qty)
+    col2.metric("Risk-Reward Ratio", f"{RRR:.2f}x")
+    col3.metric("Expected Profit", f"${expected_profit:,.2f}")
+    col4.metric("Maximum Loss", f"${max_loss:,.2f}")
     
     # Backtest summary metrics
     st.subheader("📊 Historical Performance")
@@ -627,6 +694,23 @@ with tab2:
         row=1, col=1
     )
     
+    # Moving averages
+    if len(df) >= 50:
+        ma50_series = df["Close"].rolling(50).mean()
+        fig.add_trace(
+            go.Scatter(x=df.index, y=ma50_series, name="50-Day MA", 
+                      line=dict(color="orange", width=1, dash="dot")),
+            row=1, col=1
+        )
+    
+    if len(df) >= 100:
+        ma200_series = df["Close"].rolling(min(200, len(df))).mean()
+        fig.add_trace(
+            go.Scatter(x=df.index, y=ma200_series, name="200-Day MA", 
+                      line=dict(color="purple", width=1, dash="dot")),
+            row=1, col=1
+        )
+    
     # Trade levels
     colors = {"Buy": "green", "Sell": "red", "Stop": "orange"}
     for y_val, name in [(buy, "Buy"), (sell, "Sell"), (stop, "Stop")]:
@@ -658,9 +742,10 @@ with tab2:
 # =====================================================
 with tab3:
     st.subheader("📜 Backtest Results & Risk Metrics")
-    st.info(f"📘 Strategy: {sim_days}-day buy & hold with 50% stop-loss (last 45 periods)")
+    st.info(f"📘 Vectorized backtest: {sim_days}-day hold with 50% stop-loss (last 45 periods, no look-ahead bias)")
+    st.caption(f"🏦 Risk-free rate: {RISK_FREE_RATE*100:.2f}% (live 10-year Treasury)")
     
-    bt = backtest(df, sim_days)
+    bt = backtest_vectorized(df, sim_days)
     
     if not bt.empty and len(bt) > 0:
         # Calculate metrics
@@ -817,7 +902,7 @@ with tab4:
 # =====================================================
 with tab5:
     st.subheader("🚀 Market Scanner - Best Opportunities")
-    st.caption("🔍 Scanning top 10 tech stocks for optimal performance")
+    st.caption("🔍 Scanning top 10 tech stocks | ✅ Trend filter active (50-day MA minimum)")
     
     universe = ["AAPL","MSFT","NVDA","META","AMZN","GOOGL","TSLA","AMD","NFLX","AVGO"]
     
@@ -838,9 +923,12 @@ with tab5:
             
             try:
                 price_t = df_try["Close"].iloc[-1]
-                ma50 = df_try["Close"].rolling(50).mean().iloc[-1]
                 
-                # Only consider stocks above 50-day MA
+                # Calculate moving averages
+                ma50 = df_try["Close"].rolling(50).mean().iloc[-1] if len(df_try) >= 50 else price_t
+                ma200 = df_try["Close"].rolling(min(200, len(df_try))).mean().iloc[-1]
+                
+                # Trend filter: Only consider stocks in uptrend (above 50 MA)
                 if price_t < ma50:
                     continue
                 
@@ -854,8 +942,15 @@ with tab5:
                 RRR_t = (sell_t - buy_t) / max(buy_t - stop_t, 0.01)
                 EV = prob_t * (sell_t - buy_t)
                 
-                # Filter criteria
-                if prob_t >= 0.55 and RRR_t >= 1.5:
+                # Trend score bonus
+                trend_score = 0
+                if price_t > ma200 and price_t > ma50:
+                    trend_score = 2  # Strong uptrend
+                elif price_t > ma50:
+                    trend_score = 1  # Moderate uptrend
+                
+                # Filter criteria (tightened with trend requirement)
+                if prob_t >= 0.55 and RRR_t >= 1.5 and trend_score >= 1:
                     candidates.append({
                         'EV': EV,
                         'Ticker': sym,
@@ -865,7 +960,8 @@ with tab5:
                         'Stop': stop_t,
                         'RRR': RRR_t,
                         'Prob': prob_t,
-                        'Vol': vol_t
+                        'Vol': vol_t,
+                        'Trend': '🟢 Strong' if trend_score == 2 else '🟡 Moderate'
                     })
             except Exception:
                 continue
@@ -886,24 +982,25 @@ with tab5:
             st.markdown("### 🏆 Top 3 Opportunities")
             
             for i, row in candidates_df.head(3).iterrows():
-                with st.expander(f"#{candidates_df.index.get_loc(i)+1} - {row['Ticker']} (EV: ${row['EV']:.2f})", expanded=True):
+                with st.expander(f"#{candidates_df.index.get_loc(i)+1} - {row['Ticker']} {row['Trend']} (EV: ${row['EV']:.2f})", expanded=True):
                     col1, col2, col3, col4 = st.columns(4)
                     col1.metric("Current Price", f"${row['Price']:.2f}")
                     col2.metric("Buy Target", f"${row['Buy']:.2f}")
                     col3.metric("Sell Target", f"${row['Sell']:.2f}")
                     col4.metric("Stop Loss", f"${row['Stop']:.2f}")
                     
-                    col1, col2, col3 = st.columns(3)
+                    col1, col2, col3, col4 = st.columns(4)
                     col1.metric("Probability", f"{row['Prob']*100:.1f}%")
                     col2.metric("Risk-Reward", f"{row['RRR']:.2f}x")
                     col3.metric("Volatility", f"{row['Vol']*100:.1f}%")
+                    col4.metric("Trend", row['Trend'])
             
             st.markdown("---")
             st.markdown("### 📋 All Opportunities")
             
             # Display full table
             st.dataframe(
-                candidates_df[['Ticker', 'Price', 'Buy', 'Sell', 'RRR', 'Prob', 'EV']].style.format({
+                candidates_df[['Ticker', 'Price', 'Buy', 'Sell', 'RRR', 'Prob', 'Trend', 'EV']].style.format({
                     'Price': '${:.2f}',
                     'Buy': '${:.2f}',
                     'Sell': '${:.2f}',
