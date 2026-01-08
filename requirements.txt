@@ -1,8 +1,24 @@
-streamlit
-streamlit-autorefresh
-yfinance
-pandas
-numpy
-requests
-plotly
-scipy
+# Core Streamlit Framework
+streamlit>=1.29.0
+
+# Alpaca Markets API (Real-time and Historical Data)
+alpaca-py>=0.13.0
+
+# Data Manipulation and Analysis
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Scientific Computing and Statistics
+scipy>=1.10.0
+
+# Visualization
+plotly>=5.17.0
+
+# WebSocket Support
+websockets>=11.0
+
+# Date/Time Utilities
+python-dateutil>=2.8.2
+
+# Additional Utilities
+requests>=2.31.0
