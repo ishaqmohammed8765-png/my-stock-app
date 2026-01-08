@@ -20,7 +20,7 @@ VOL_FLOOR = 0.10
 VOL_CAP = 1.5
 KELLY_MAX = 0.15
 KELLY_MIN = 0.01
-MONTE_CARLO_SIMS = 5000
+MONTE_CARLO_SIMS = 2000
 RISK_FREE_RATE = 0.045  # 4.5% annual risk-free rate
 
 # =====================================================
@@ -77,8 +77,9 @@ def load_stock(ticker):
         
         if len(df) < 60:
             return pd.DataFrame()
-            
-        return df
+        
+        # Limit to last 180 days to prevent data overflow
+        return df.tail(180)
     except Exception as e:
         st.error(f"Error loading {ticker}: {str(e)}")
         return pd.DataFrame()
@@ -202,6 +203,108 @@ def calculate_sharpe_ratio(returns, risk_free_rate=RISK_FREE_RATE):
     
     return float(sharpe)
 
+def evaluate_trade_decision(RRR, sharpe, max_dd, win_rate, profit_factor, buy_prob, sell_prob):
+    """
+    Evaluate whether to take a trade based on multiple criteria.
+    Returns: (score, decision, reasoning)
+    """
+    score = 0
+    reasons = []
+    
+    # Risk-Reward Ratio (0-30 points)
+    if RRR >= 3.0:
+        score += 30
+        reasons.append("✅ Excellent RRR (≥3.0)")
+    elif RRR >= 2.0:
+        score += 25
+        reasons.append("✅ Strong RRR (≥2.0)")
+    elif RRR >= 1.5:
+        score += 15
+        reasons.append("⚠️ Acceptable RRR (≥1.5)")
+    else:
+        score += 0
+        reasons.append("❌ Poor RRR (<1.5)")
+    
+    # Sharpe Ratio (0-25 points)
+    if sharpe >= 1.5:
+        score += 25
+        reasons.append("✅ Excellent Sharpe (≥1.5)")
+    elif sharpe >= 1.0:
+        score += 20
+        reasons.append("✅ Good Sharpe (≥1.0)")
+    elif sharpe >= 0.5:
+        score += 10
+        reasons.append("⚠️ Moderate Sharpe (≥0.5)")
+    else:
+        score += 0
+        reasons.append("❌ Poor Sharpe (<0.5)")
+    
+    # Max Drawdown (0-20 points) - lower is better
+    if abs(max_dd) <= 0.10:
+        score += 20
+        reasons.append("✅ Low drawdown (≤10%)")
+    elif abs(max_dd) <= 0.20:
+        score += 15
+        reasons.append("✅ Moderate drawdown (≤20%)")
+    elif abs(max_dd) <= 0.30:
+        score += 5
+        reasons.append("⚠️ High drawdown (≤30%)")
+    else:
+        score += 0
+        reasons.append("❌ Very high drawdown (>30%)")
+    
+    # Win Rate (0-15 points)
+    if win_rate >= 60:
+        score += 15
+        reasons.append("✅ High win rate (≥60%)")
+    elif win_rate >= 50:
+        score += 10
+        reasons.append("✅ Positive win rate (≥50%)")
+    elif win_rate >= 40:
+        score += 5
+        reasons.append("⚠️ Below-average win rate (≥40%)")
+    else:
+        score += 0
+        reasons.append("❌ Low win rate (<40%)")
+    
+    # Profit Factor (0-10 points)
+    if profit_factor >= 2.0:
+        score += 10
+        reasons.append("✅ Strong profit factor (≥2.0)")
+    elif profit_factor >= 1.5:
+        score += 7
+        reasons.append("✅ Good profit factor (≥1.5)")
+    elif profit_factor >= 1.0:
+        score += 3
+        reasons.append("⚠️ Marginal profit factor (≥1.0)")
+    else:
+        score += 0
+        reasons.append("❌ Negative profit factor (<1.0)")
+    
+    # Determine decision
+    if score >= 80:
+        decision = "STRONG BUY"
+        color = "success"
+        emoji = "🟢"
+    elif score >= 65:
+        decision = "BUY"
+        color = "success"
+        emoji = "🟢"
+    elif score >= 50:
+        decision = "CONDITIONAL BUY"
+        color = "warning"
+        emoji = "🟡"
+    elif score >= 35:
+        decision = "HOLD"
+        color = "warning"
+        emoji = "🟡"
+    else:
+        decision = "AVOID"
+        color = "error"
+        emoji = "🔴"
+    
+    return score, decision, color, emoji, reasons
+
 def backtest(df, days=30):
     """Enhanced backtest with risk metrics."""
     if df.empty or len(df) < days + 30:
@@ -210,7 +313,11 @@ def backtest(df, days=30):
     pnl = []
     returns = []
     
-    for i in range(len(df) - days):
+    # Limit backtest iterations to last 90 periods to prevent data overflow
+    max_iterations = min(len(df) - days, 90)
+    start_idx = len(df) - days - max_iterations
+    
+    for i in range(start_idx, len(df) - days):
         entry = df["Close"].iloc[i]
         window = df["Close"].iloc[i:i+days].copy()
         
@@ -276,10 +383,10 @@ with st.sidebar:
     # Account size
     account_size = st.number_input(
         "Account Size ($)",
-        min_value=1000,
+        min_value=10,
         max_value=10000000,
         value=10000,
-        step=1000,
+        step=10,
         key="account_size"
     )
     
@@ -308,7 +415,8 @@ with st.sidebar:
     
     st.markdown("---")
     st.caption("💡 **Tip:** Student's t distribution accounts for market crashes better than normal distribution.")
-    st.caption("⚠️ Data cached for 1 hour to avoid rate limits.")
+    st.caption("⚠️ Data cached for 1 hour. Using last 180 days of data to optimize performance.")
+    st.caption("🔬 Monte Carlo: 2,000 simulations for fast, reliable results.")
 
 # =====================================================
 # LOAD STOCK
@@ -422,6 +530,43 @@ with tab1:
     
     st.markdown("---")
     
+    # Run backtest for decision analysis
+    bt = backtest(df, sim_days)
+    
+    # Calculate backtest metrics
+    if not bt.empty and len(bt) > 0:
+        win_rate = (bt["PnL"] > 0).mean() * 100
+        profit_factor = bt[bt["PnL"]>0]["PnL"].sum() / max(abs(bt[bt["PnL"]<0]["PnL"].sum()), 0.01)
+        max_dd = calculate_max_drawdown(bt["CumReturn"].values)
+        sharpe = calculate_sharpe_ratio(bt["Return"].values)
+    else:
+        win_rate = profit_factor = max_dd = sharpe = 0
+    
+    # Get trade decision
+    score, decision, color, emoji, reasons = evaluate_trade_decision(
+        RRR, sharpe, max_dd, win_rate, profit_factor, buy_prob, sell_prob
+    )
+    
+    # Display decision
+    st.subheader("🎯 Trade Recommendation")
+    
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        st.metric("Decision Score", f"{score}/100")
+        if color == "success":
+            st.success(f"{emoji} **{decision}**")
+        elif color == "warning":
+            st.warning(f"{emoji} **{decision}**")
+        else:
+            st.error(f"{emoji} **{decision}**")
+    
+    with col2:
+        st.markdown("**Key Factors:**")
+        for reason in reasons:
+            st.markdown(f"- {reason}")
+    
+    st.markdown("---")
+    
     # Risk-Reward analysis
     st.subheader("⚖️ Risk-Reward Analysis")
     col1, col2, col3 = st.columns(3)
@@ -433,13 +578,13 @@ with tab1:
     col2.metric("Expected Profit", f"${expected_profit:,.2f}")
     col3.metric("Maximum Loss", f"${max_loss:,.2f}")
     
-    # Color-coded assessment
-    if RRR >= 2:
-        st.success(f"✅ **Excellent** - Risk-reward ratio of {RRR:.2f} indicates strong trade setup")
-    elif RRR >= 1.5:
-        st.warning(f"⚠️ **Acceptable** - Risk-reward ratio of {RRR:.2f} is reasonable but not ideal")
-    else:
-        st.error(f"❌ **Poor** - Risk-reward ratio of {RRR:.2f} is too low for this trade")
+    # Backtest summary metrics
+    st.subheader("📊 Historical Performance")
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Win Rate", f"{win_rate:.1f}%")
+    col2.metric("Profit Factor", f"{profit_factor:.2f}")
+    col3.metric("Sharpe Ratio", f"{sharpe:.2f}")
+    col4.metric("Max Drawdown", f"{max_dd*100:.1f}%")
     
     st.markdown("---")
     
@@ -454,7 +599,8 @@ with tab1:
             "Expected PnL": round(expected_profit, 2),
             "Max Loss": round(max_loss, 2),
             "RRR": round(RRR, 2),
-            "Method": mc_method
+            "Decision": decision,
+            "Score": score
         }
         st.session_state.portfolio.append(trade)
         st.success(f"✅ Added {ticker} to portfolio!")
@@ -627,8 +773,9 @@ with tab4:
                 'Stop': '${:.2f}',
                 'Expected PnL': '${:,.2f}',
                 'Max Loss': '${:,.2f}',
-                'RRR': '{:.2f}x'
-            }),
+                'RRR': '{:.2f}x',
+                'Score': '{:.0f}/100'
+            }).background_gradient(subset=['Score'], cmap='RdYlGn', vmin=0, vmax=100),
             use_container_width=True,
             height=400
         )
