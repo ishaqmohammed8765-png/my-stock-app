@@ -1,14 +1,27 @@
 """
-Trading Dashboard Pro (Clean Edition)
-- Alpaca historical + latest quote
-- Optional live trades/quotes (websocket in thread w/ asyncio loop)
-- Volatility, ATR, expected move, Monte Carlo hit probabilities
-- Kelly sizing, simple backtest, scoring recommendation
+Trading Dashboard Pro — Simple UI (No Advanced)
 Educational only. Not financial advice.
+
+Minimal controls:
+- Ticker
+- Account size
+- Horizon
+- Load/Refresh
+- Start/Stop Live
+
+Background defaults (safe):
+- Monte Carlo: student_t
+- Historical feed: IEX
+- Live feed: iex
+- Kelly sizing: half-kelly + caps (10% max allocation, 2% max risk/trade)
+- Backtest: entry next-day open, slippage 5 bps, commission $0
+- Rate limit 429 backoff
+- Websocket cleanup via atexit
 """
 
 from __future__ import annotations
 
+import atexit
 import asyncio
 import logging
 import queue
@@ -41,7 +54,7 @@ except Exception:
 # CONFIG
 # =========================
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("dash")
+log = logging.getLogger("dash_simple")
 
 TRADING_DAYS = 252
 RISK_FREE = 0.045
@@ -49,7 +62,6 @@ RISK_FREE = 0.045
 VOL_FLOOR, VOL_CAP, VOL_DEFAULT = 0.10, 1.50, 0.30
 KELLY_MIN, KELLY_MAX = 0.01, 0.15
 STOP_MULT = 0.50
-
 MC_SIMS = 1000
 
 QUEUE_MAX = 1500
@@ -67,7 +79,15 @@ SCORE_BUY = 65
 SCORE_CONDITIONAL = 50
 SCORE_HOLD = 35
 
-DEFAULT_WS_FEED = "iex"
+# Background defaults (no UI controls)
+MC_METHOD = "student_t"
+BARS_FEED = "IEX"
+WS_FEED = "iex"
+
+MAX_ALLOC_PCT = 0.10  # 10% of equity max position
+MAX_RISK_PCT = 0.02   # 2% of equity max risk per trade
+SLIPPAGE_BPS = 5
+COMMISSION = 0.0
 
 
 # =========================
@@ -89,6 +109,9 @@ class TradeMetrics:
     kelly: float
     qty: int
     expected_move: float
+    risk_per_share: float
+    cap_alloc_qty: int
+    cap_risk_qty: int
 
 
 @dataclass(frozen=True)
@@ -160,12 +183,21 @@ def drain(q: queue.Queue, dest: List[Dict[str, Any]], maxlen: int) -> None:
             del dest[: len(dest) - maxlen]
 
 
+def is_rate_limit_error(e: Exception) -> bool:
+    s = str(e).lower()
+    return ("429" in s) or ("too many requests" in s) or ("rate limit" in s)
+
+
+def backoff_seconds(attempt: int) -> float:
+    return float(min(2 ** attempt, 30))
+
+
 # =========================
 # LIVE STREAM
 # =========================
 class RealtimeStream:
     def __init__(self, api_key: str, secret_key: str, ticker: str,
-                 trade_q: queue.Queue, quote_q: queue.Queue, feed: str = DEFAULT_WS_FEED):
+                 trade_q: queue.Queue, quote_q: queue.Queue, feed: str = WS_FEED):
         self.api_key = api_key
         self.secret_key = secret_key
         self.ticker = ticker.upper().strip()
@@ -184,8 +216,13 @@ class RealtimeStream:
             sz = int(getattr(data, "size", 0))
             if px <= 0 or sz <= 0:
                 return
-            payload = {"type": "trade", "ts": parse_ts(getattr(data, "timestamp", None)),
-                       "symbol": getattr(data, "symbol", self.ticker), "price": px, "size": sz}
+            payload = {
+                "type": "trade",
+                "ts": parse_ts(getattr(data, "timestamp", None)),
+                "symbol": getattr(data, "symbol", self.ticker),
+                "price": px,
+                "size": sz,
+            }
             try:
                 self.trade_q.put_nowait(payload)
             except queue.Full:
@@ -203,12 +240,16 @@ class RealtimeStream:
             ask = float(getattr(data, "ask_price", 0.0))
             if bid <= 0 or ask <= 0:
                 return
-            payload = {"type": "quote", "ts": parse_ts(getattr(data, "timestamp", None)),
-                       "symbol": getattr(data, "symbol", self.ticker),
-                       "bid": bid, "ask": ask,
-                       "bid_size": int(getattr(data, "bid_size", 0)),
-                       "ask_size": int(getattr(data, "ask_size", 0)),
-                       "spread": float(ask - bid)}
+            payload = {
+                "type": "quote",
+                "ts": parse_ts(getattr(data, "timestamp", None)),
+                "symbol": getattr(data, "symbol", self.ticker),
+                "bid": bid,
+                "ask": ask,
+                "bid_size": int(getattr(data, "bid_size", 0)),
+                "ask_size": int(getattr(data, "ask_size", 0)),
+                "spread": float(ask - bid),
+            }
             try:
                 self.quote_q.put_nowait(payload)
             except queue.Full:
@@ -257,7 +298,7 @@ class RealtimeStream:
 
 
 # =========================
-# ALPACA LOADERS (ROBUST)
+# ALPACA LOADERS
 # =========================
 def _bars_to_df(bars_obj: Any) -> Optional[pd.DataFrame]:
     df = getattr(bars_obj, "df", None)
@@ -284,8 +325,8 @@ def _bars_to_df(bars_obj: Any) -> Optional[pd.DataFrame]:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_historical(ticker: str, api_key: str, secret_key: str,
-                    days_back: int = 260, feed_str: str = "IEX") -> Tuple[Optional[pd.DataFrame], Dict[str, Any]]:
-    dbg: Dict[str, Any] = {"ticker": ticker, "feed": feed_str, "steps": []}
+                    days_back: int = 260) -> Tuple[Optional[pd.DataFrame], Dict[str, Any]]:
+    dbg: Dict[str, Any] = {"ticker": ticker, "feed": BARS_FEED, "steps": []}
 
     ticker = (ticker or "").upper().strip()
     if not validate_keys(api_key, secret_key) or not ticker:
@@ -302,21 +343,36 @@ def load_historical(ticker: str, api_key: str, secret_key: str,
 
     feed_val = None
     if HAS_DATAFEED:
-        feed_val = DataFeed.SIP if feed_str.upper() == "SIP" else DataFeed.IEX
+        feed_val = DataFeed.SIP if BARS_FEED.upper() == "SIP" else DataFeed.IEX
 
-    # try with feed, fallback without feed for older alpaca-py
     try:
         if feed_val is not None:
             req = StockBarsRequest(**base, feed=feed_val)
             dbg["steps"].append("bars request WITH feed")
         else:
             req = StockBarsRequest(**base)
-            dbg["steps"].append("bars request WITHOUT feed (no DataFeed)")
-        bars = client.get_stock_bars(req)
+            dbg["steps"].append("bars request WITHOUT feed")
     except TypeError as e:
-        dbg["steps"].append(f"feed not supported -> retry: {e}")
+        dbg["steps"].append(f"feed not supported building request -> {e}")
         req = StockBarsRequest(**base)
-        bars = client.get_stock_bars(req)
+
+    bars = None
+    for attempt in range(6):
+        try:
+            bars = client.get_stock_bars(req)
+            break
+        except Exception as e:
+            if is_rate_limit_error(e):
+                wait = backoff_seconds(attempt)
+                dbg["steps"].append(f"429 rate limit -> sleep {wait:.0f}s")
+                time.sleep(wait)
+                continue
+            dbg["error"] = f"Exception: {e}"
+            return None, dbg
+
+    if bars is None:
+        dbg["error"] = "Failed to fetch bars"
+        return None, dbg
 
     raw = _bars_to_df(bars)
     if raw is None or raw.empty:
@@ -330,7 +386,7 @@ def load_historical(ticker: str, api_key: str, secret_key: str,
             dbg["steps"].append("MultiIndex xs(symbol)")
         except Exception:
             df = df.reset_index()
-            dbg["steps"].append("MultiIndex reset_index fallback")
+            dbg["steps"].append("MultiIndex reset fallback")
 
     if "symbol" in df.columns:
         df["symbol"] = df["symbol"].astype(str).str.upper()
@@ -341,13 +397,17 @@ def load_historical(ticker: str, api_key: str, secret_key: str,
 
     required = {"timestamp", "open", "high", "low", "close", "volume"}
     if not required.issubset(df.columns):
-        dbg["error"] = f"Missing columns: {sorted(list(required - set(df.columns)))}"
+        dbg["error"] = "Missing required columns"
         dbg["columns"] = list(df.columns)
         return None, dbg
 
     df = df.sort_values("timestamp").reset_index(drop=True)
+    if len(df) < 30:
+        dbg["error"] = f"Too few rows ({len(df)})"
+        return None, dbg
+
     dbg["rows"] = int(len(df))
-    return (df if len(df) >= 30 else None), dbg
+    return df, dbg
 
 
 def load_latest_quote(ticker: str, api_key: str, secret_key: str) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
@@ -418,17 +478,25 @@ def expected_move(price: float, vol: float, days: int) -> float:
 def prob_hit_mc(S: float, K: float, vol: float, days: int, sims: int, method: str) -> float:
     if S <= 0 or K <= 0 or vol <= 0 or days <= 0 or sims <= 0:
         return 0.0
+
     dt = 1 / TRADING_DAYS
     try:
         if method == "student_t":
             dof = 5
             shocks = stats.t.rvs(df=dof, size=(sims, days)) / np.sqrt(dof / (dof - 2))
         else:
-            shocks = np.random.normal(size=(sims, days))
+            shocks = np.random.standard_normal((sims, days))
+
         drift = -0.5 * (vol ** 2) * dt
         diffusion = vol * np.sqrt(dt) * shocks
         paths = S * np.exp(np.cumsum(drift + diffusion, axis=1))
-        return float((paths >= K).any(axis=1).mean())
+
+        if K >= S:
+            hit = np.any(paths >= K, axis=1)
+        else:
+            hit = np.any(paths <= K, axis=1)
+
+        return float(hit.mean())
     except Exception:
         return 0.0
 
@@ -449,7 +517,7 @@ def kelly(df: pd.DataFrame, min_trades: int = 60) -> float:
     if al <= 0 or aw <= 0:
         return KELLY_MIN
     R = aw / al
-    f = (wr - ((1 - wr) / R)) * 0.5  # half-kelly
+    f = (wr - ((1 - wr) / R)) * 0.5
     return clamp(float(f), KELLY_MIN, KELLY_MAX)
 
 
@@ -476,16 +544,18 @@ def max_drawdown(cumret: np.ndarray) -> float:
 def backtest(df: pd.DataFrame, horizon: int) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
-    if len(df) < horizon + MIN_HIST_DAYS:
+    if len(df) < horizon + MIN_HIST_DAYS + 2:
         return pd.DataFrame()
 
-    iters = min(len(df) - horizon, MAX_BT_ITERS)
-    start = len(df) - horizon - iters
+    iters = min(len(df) - horizon - 1, MAX_BT_ITERS)
+    start = len(df) - horizon - iters - 1
 
     out = []
+    slip = SLIPPAGE_BPS / 10000.0
+
     for i in range(iters):
         idx = start + i
-        entry = float(df["close"].iloc[idx])
+        entry = float(df["open"].iloc[idx + 1])  # next day open
         if entry <= 0:
             continue
 
@@ -493,15 +563,18 @@ def backtest(df: pd.DataFrame, horizon: int) -> pd.DataFrame:
         move = expected_move(entry, v, horizon)
         stop = entry - (move * STOP_MULT)
 
-        window = df["close"].iloc[idx : idx + horizon]
+        window = df["close"].iloc[idx + 1: idx + 1 + horizon]
         if window.empty:
             continue
 
         stop_hit = window[window <= stop]
         exit_px = float(stop_hit.iloc[0]) if not stop_hit.empty else float(window.iloc[-1])
 
-        pnl = exit_px - entry
-        ret = pnl / entry
+        entry_eff = entry * (1 + slip)
+        exit_eff = exit_px * (1 - slip)
+
+        pnl = (exit_eff - entry_eff) - COMMISSION
+        ret = pnl / entry_eff
         out.append({"PnL": pnl, "Return": ret})
 
     if not out:
@@ -536,7 +609,7 @@ def bt_stats(bt: pd.DataFrame) -> BacktestResults:
     return BacktestResults(win_rate, pf, mdd, sh, total, wins, losses, avg_win, avg_loss, total_pnl)
 
 
-def compute_trade_metrics(df: pd.DataFrame, price: float, horizon: int, method: str, acct: float) -> TradeMetrics:
+def compute_trade_metrics(df: pd.DataFrame, price: float, horizon: int, acct: float) -> TradeMetrics:
     v = annual_vol(df)
     a = atr(df)
 
@@ -548,140 +621,157 @@ def compute_trade_metrics(df: pd.DataFrame, price: float, horizon: int, method: 
     sell = price + move
     stop = buy - (move * STOP_MULT)
 
-    buy_prob = 1.0 - prob_hit_mc(price, buy, v, horizon, MC_SIMS, method)
-    sell_prob = prob_hit_mc(price, sell, v, horizon, MC_SIMS, method)
+    buy_prob = 1.0 - prob_hit_mc(price, buy, v, horizon, MC_SIMS, MC_METHOD)
+    sell_prob = prob_hit_mc(price, sell, v, horizon, MC_SIMS, MC_METHOD)
 
     risk_per_share = max(buy - stop, 0.01)
     rrr = (sell - buy) / risk_per_share
 
     k = kelly(df)
-    qty = int((acct * k) / risk_per_share)
+    raw_qty = int((acct * k) / risk_per_share)
 
-    return TradeMetrics(price, v, a, ma50, ma200, buy, sell, stop, buy_prob, sell_prob, rrr, k, max(qty, 0), move)
+    cap_alloc_qty = int((acct * MAX_ALLOC_PCT) / max(price, 0.01))
+    cap_risk_qty = int((acct * MAX_RISK_PCT) / risk_per_share)
+
+    qty = max(0, min(raw_qty, cap_alloc_qty, cap_risk_qty))
+
+    return TradeMetrics(
+        price=price, vol=v, atr=a, ma50=ma50, ma200=ma200,
+        buy=buy, sell=sell, stop=stop,
+        buy_prob=float(buy_prob), sell_prob=float(sell_prob),
+        rrr=float(rrr), kelly=float(k), qty=int(qty),
+        expected_move=float(move),
+        risk_per_share=float(risk_per_share),
+        cap_alloc_qty=int(cap_alloc_qty),
+        cap_risk_qty=int(cap_risk_qty),
+    )
 
 
-def score_decision(price: float, ma50: float, ma200: float, rrr: float, sh: float, mdd: float, wr: float, pf: float):
+def score_decision(price: float, ma50: float, ma200: float, rrr: float,
+                   sh: float, mdd: float, wr: float, pf: float) -> Tuple[int, str, str, List[str]]:
     score = 0
     reasons: List[str] = []
 
-    # Trend (15)
     if price > ma200 and price > ma50:
-        score += 15; reasons.append("✅ Strong uptrend (above MA50 & MA200)")
+        score += 15; reasons.append("Uptrend: above MA50 & MA200")
     elif price > ma200:
-        score += 10; reasons.append("✅ Above MA200")
+        score += 10; reasons.append("Trend: above MA200")
     elif price > ma50:
-        score += 5; reasons.append("⚠️ Above MA50 only")
+        score += 5; reasons.append("Trend: above MA50 only")
     else:
-        reasons.append("❌ Below MA50 & MA200")
+        reasons.append("Trend: below MA50 & MA200")
 
-    # RRR (25)
     if rrr >= 3.0:
-        score += 25; reasons.append("✅ Excellent risk/reward (RRR ≥ 3)")
+        score += 25; reasons.append("Risk/Reward: excellent")
     elif rrr >= 2.0:
-        score += 20; reasons.append("✅ Strong risk/reward (RRR ≥ 2)")
+        score += 20; reasons.append("Risk/Reward: strong")
     elif rrr >= 1.5:
-        score += 12; reasons.append("⚠️ Acceptable risk/reward (RRR ≥ 1.5)")
+        score += 12; reasons.append("Risk/Reward: acceptable")
     else:
-        reasons.append("❌ Poor risk/reward")
+        reasons.append("Risk/Reward: poor")
 
-    # Sharpe (25)
     if sh >= 1.5:
-        score += 25; reasons.append("✅ Excellent Sharpe (≥ 1.5)")
+        score += 25; reasons.append("Backtest Sharpe: excellent")
     elif sh >= 1.0:
-        score += 20; reasons.append("✅ Good Sharpe (≥ 1.0)")
+        score += 20; reasons.append("Backtest Sharpe: good")
     elif sh >= 0.5:
-        score += 10; reasons.append("⚠️ Moderate Sharpe (≥ 0.5)")
+        score += 10; reasons.append("Backtest Sharpe: moderate")
     else:
-        reasons.append("❌ Poor Sharpe")
+        reasons.append("Backtest Sharpe: poor")
 
-    # Drawdown (15)
     if abs(mdd) <= 0.10:
-        score += 15; reasons.append("✅ Low drawdown (≤ 10%)")
+        score += 15; reasons.append("Drawdown: low")
     elif abs(mdd) <= 0.20:
-        score += 10; reasons.append("✅ Moderate drawdown (≤ 20%)")
+        score += 10; reasons.append("Drawdown: moderate")
     elif abs(mdd) <= 0.30:
-        score += 5; reasons.append("⚠️ High drawdown (≤ 30%)")
+        score += 5; reasons.append("Drawdown: high")
     else:
-        reasons.append("❌ Very high drawdown (> 30%)")
+        reasons.append("Drawdown: very high")
 
-    # Winrate (10)
     if wr >= 60:
-        score += 10; reasons.append("✅ High win rate (≥ 60%)")
+        score += 10; reasons.append("Win rate: high")
     elif wr >= 50:
-        score += 7; reasons.append("✅ Positive win rate (≥ 50%)")
+        score += 7; reasons.append("Win rate: positive")
     elif wr >= 40:
-        score += 3; reasons.append("⚠️ Below-average win rate (≥ 40%)")
+        score += 3; reasons.append("Win rate: below avg")
     else:
-        reasons.append("❌ Low win rate (< 40%)")
+        reasons.append("Win rate: low")
 
-    # Profit factor (10)
     if pf >= 2.0:
-        score += 10; reasons.append("✅ Strong profit factor (≥ 2)")
+        score += 10; reasons.append("Profit factor: strong")
     elif pf >= 1.5:
-        score += 7; reasons.append("✅ Good profit factor (≥ 1.5)")
+        score += 7; reasons.append("Profit factor: good")
     elif pf >= 1.0:
-        score += 3; reasons.append("⚠️ Marginal profit factor (≥ 1)")
+        score += 3; reasons.append("Profit factor: marginal")
     else:
-        reasons.append("❌ Weak profit factor (< 1)")
+        reasons.append("Profit factor: weak")
 
     if score >= SCORE_STRONG_BUY:
         return score, "STRONG BUY", "🟢", reasons
     if score >= SCORE_BUY:
         return score, "BUY", "🟢", reasons
     if score >= SCORE_CONDITIONAL:
-        reasons.append("💡 Timing matters — consider entry confirmation")
-        return score, "CONDITIONAL BUY", "🟡", reasons
+        reasons.append("Timing matters — consider confirmation")
+        return score, "CONDITIONAL", "🟡", reasons
     if score >= SCORE_HOLD:
-        reasons.append("⏸️ Wait for a better setup")
+        reasons.append("Wait for a cleaner setup")
         return score, "HOLD", "🟡", reasons
 
-    reasons.append("🛑 Risk too high vs reward")
+    reasons.append("Risk too high vs reward")
     return score, "AVOID", "🔴", reasons
+
+
+def score_gauge(score: int, label: str) -> go.Figure:
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=score,
+        title={"text": f"Score — {label}"},
+        gauge={
+            "axis": {"range": [0, 100]},
+            "steps": [
+                {"range": [0, SCORE_HOLD], "color": "rgba(255,0,0,0.20)"},
+                {"range": [SCORE_HOLD, SCORE_CONDITIONAL], "color": "rgba(255,165,0,0.20)"},
+                {"range": [SCORE_CONDITIONAL, SCORE_BUY], "color": "rgba(255,255,0,0.20)"},
+                {"range": [SCORE_BUY, 100], "color": "rgba(0,255,0,0.20)"},
+            ],
+            "threshold": {"line": {"width": 3}, "value": score},
+        },
+    ))
+    fig.update_layout(height=260, margin=dict(l=20, r=20, t=60, b=10))
+    return fig
 
 
 # =========================
 # STREAMLIT APP
 # =========================
-st.set_page_config(page_title="Trading Dashboard Pro (Clean)", page_icon="📈", layout="wide")
-st.title("📈 Trading Dashboard Pro (Clean)")
-st.caption("Educational only — not financial advice.")
+st.set_page_config(page_title="Trading Dashboard (Simple)", page_icon="📈", layout="wide")
 
-# Session state
-if "api_ok" not in st.session_state:
-    st.session_state.api_ok = False
-if "api_key" not in st.session_state:
-    st.session_state.api_key = ""
-if "secret_key" not in st.session_state:
-    st.session_state.secret_key = ""
-if "ticker" not in st.session_state:
-    st.session_state.ticker = "NVDA"
-if "historical" not in st.session_state:
-    st.session_state.historical = None
-if "latest_quote" not in st.session_state:
-    st.session_state.latest_quote = None
-if "latest_price" not in st.session_state:
-    st.session_state.latest_price = None
-if "trade_q" not in st.session_state:
-    st.session_state.trade_q = queue.Queue(maxsize=QUEUE_MAX)
-if "quote_q" not in st.session_state:
-    st.session_state.quote_q = queue.Queue(maxsize=QUEUE_MAX)
-if "trade_history" not in st.session_state:
-    st.session_state.trade_history = []
-if "quote_history" not in st.session_state:
-    st.session_state.quote_history = []
-if "live_active" not in st.session_state:
-    st.session_state.live_active = False
-if "ws_handler" not in st.session_state:
-    st.session_state.ws_handler = None
-if "ws_thread" not in st.session_state:
-    st.session_state.ws_thread = None
-if "last_error" not in st.session_state:
-    st.session_state.last_error = ""
-if "debug" not in st.session_state:
-    st.session_state.debug = {}
+def init_state() -> None:
+    defaults = {
+        "api_ok": False,
+        "api_key": "",
+        "secret_key": "",
+        "ticker": "NVDA",
+        "historical": None,
+        "latest_quote": None,
+        "latest_price": None,
+        "trade_q": queue.Queue(maxsize=QUEUE_MAX),
+        "quote_q": queue.Queue(maxsize=QUEUE_MAX),
+        "trade_history": [],
+        "quote_history": [],
+        "live_active": False,
+        "ws_handler": None,
+        "ws_thread": None,
+        "last_error": "",
+        "debug": {},
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
+init_state()
 
-def stop_live():
+def stop_live() -> None:
     handler = st.session_state.ws_handler
     thread = st.session_state.ws_thread
     if handler:
@@ -695,8 +785,12 @@ def stop_live():
     st.session_state.ws_thread = None
     st.session_state.live_active = False
 
+atexit.register(lambda: stop_live())
 
-# Secrets (optional)
+st.title("📈 Trading Dashboard")
+st.caption("Simple controls. Safe defaults. Educational only — not financial advice.")
+
+# ---- Secrets
 try:
     s_api = st.secrets.get("ALPACA_KEY", "")
     s_sec = st.secrets.get("ALPACA_SECRET", "")
@@ -709,9 +803,9 @@ if (s_api and s_sec) and not st.session_state.api_ok:
     st.session_state.secret_key = s_sec
     st.session_state.api_ok = True
 
-# API input
+# ---- API input
 if not st.session_state.api_ok:
-    st.info("Enter your Alpaca API keys.")
+    st.info("Enter your Alpaca API keys (paper keys are fine).")
     a1, a2 = st.columns(2)
     with a1:
         api_in = st.text_input("ALPACA_KEY", type="password")
@@ -727,107 +821,95 @@ if not st.session_state.api_ok:
             st.error("Keys look invalid (empty/too short).")
     st.stop()
 
-# Sidebar controls
-with st.sidebar:
-    st.header("⚙️ Controls")
-    account_size = st.number_input("Account Size ($)", 1000, 5_000_000, 10_000, 1000)
-    horizon = st.slider("Time Horizon (days)", 5, 120, 30, 5)
-    mc_method = st.selectbox("Monte Carlo shocks", ["student_t", "normal"], index=0)
+# ---- Minimal controls
+top = st.container(border=True)
+with top:
+    c1, c2, c3, c4 = st.columns([1.4, 1.1, 1.1, 1.1])
+    with c1:
+        ticker = st.text_input("Ticker", value=st.session_state.ticker).upper().strip()
+    with c2:
+        account_size = st.number_input("Account ($)", min_value=1000, max_value=5_000_000, value=10_000, step=1000)
+    with c3:
+        horizon = st.select_slider("Horizon", options=[7, 14, 30, 60, 90], value=30)
+    with c4:
+        st.write("")
+        load_btn = st.button("Load / Refresh", type="primary", use_container_width=True)
 
-    st.markdown("---")
-    bars_feed = st.selectbox("Historical feed", ["IEX", "SIP"], index=0)
-    ws_feed = st.selectbox("Live WS feed", ["iex", "sip"], index=0)
+# ---- Load data
+if load_btn:
+    stop_live()
+    st.session_state.last_error = ""
+    st.session_state.debug = {}
 
-    st.markdown("---")
-    if st.session_state.live_active:
-        if st.button("🔴 Stop Live Feed", use_container_width=True):
-            stop_live()
-            st.rerun()
-    else:
-        if st.button("🟢 Start Live Feed", use_container_width=True):
-            if st.session_state.historical is None:
-                st.warning("Load a ticker first.")
-            else:
-                stop_live()
-                handler = RealtimeStream(
-                    st.session_state.api_key,
-                    st.session_state.secret_key,
-                    st.session_state.ticker,
-                    st.session_state.trade_q,
-                    st.session_state.quote_q,
-                    feed=ws_feed,
-                )
-                t = threading.Thread(target=handler.run, daemon=True)
-                t.start()
-                st.session_state.ws_handler = handler
-                st.session_state.ws_thread = t
-                st.session_state.live_active = True
-                st.rerun()
+    with st.spinner(f"Loading {ticker}..."):
+        df, dbg = load_historical(ticker, st.session_state.api_key, st.session_state.secret_key)
+        q, qdbg = load_latest_quote(ticker, st.session_state.api_key, st.session_state.secret_key)
+        st.session_state.debug = {"historical": dbg, "quote": qdbg}
 
-# Main: ticker load
-c1, c2, c3 = st.columns([2.0, 1.0, 1.0])
-with c1:
-    ticker = st.text_input("Ticker", value=st.session_state.ticker).upper().strip()
+        st.session_state.ticker = ticker
+        st.session_state.latest_quote = q
+        st.session_state.latest_price = mid_from_quote(q)
 
-with c2:
-    if st.button("📥 Load Data", type="primary", use_container_width=True):
-        stop_live()
-        st.session_state.last_error = ""
-        st.session_state.debug = {}
-        with st.spinner(f"Loading {ticker}..."):
-            try:
-                df, dbg = load_historical(ticker, st.session_state.api_key, st.session_state.secret_key, feed_str=bars_feed)
-                q, qdbg = load_latest_quote(ticker, st.session_state.api_key, st.session_state.secret_key)
-                st.session_state.debug = {"historical": dbg, "quote": qdbg}
+        if df is None:
+            st.session_state.historical = None
+            st.session_state.last_error = str(dbg.get("error") or "Failed to load historical data.")
+        else:
+            st.session_state.historical = df
+            if st.session_state.latest_price is None:
+                st.session_state.latest_price = float(df["close"].iloc[-1])
 
-                if df is None:
-                    st.session_state.historical = None
-                    st.session_state.ticker = ticker
-                    st.session_state.latest_quote = q
-                    st.session_state.latest_price = mid_from_quote(q)
-                    st.session_state.last_error = f"Failed to load historical for {ticker} (open Debug)."
-                else:
-                    st.session_state.historical = df
-                    st.session_state.ticker = ticker
-                    st.session_state.latest_quote = q
-                    st.session_state.latest_price = mid_from_quote(q) if q else float(df["close"].iloc[-1])
-            except Exception as e:
-                st.session_state.last_error = f"Load error: {e}"
-        st.rerun()
+    st.rerun()
 
-with c3:
-    if st.button("🧹 Reset", use_container_width=True):
-        stop_live()
-        st.session_state.historical = None
-        st.session_state.latest_quote = None
-        st.session_state.latest_price = None
-        st.session_state.trade_history = []
-        st.session_state.quote_history = []
-        st.session_state.last_error = ""
-        st.session_state.debug = {}
-        st.rerun()
-
+# ---- Error banner (friendly)
 if st.session_state.last_error:
-    st.error(st.session_state.last_error)
-
-if st.session_state.debug:
-    with st.expander("🛠 Debug"):
-        st.json(st.session_state.debug)
+    msg = st.session_state.last_error
+    if "429" in msg or "rate" in msg.lower():
+        st.warning("Rate limit hit. Wait ~30–60 seconds and press Load / Refresh again.")
+    st.error(msg)
 
 df = st.session_state.historical
 if df is None:
-    st.info("Load a ticker to begin.")
+    st.info("Press **Load / Refresh** to start.")
     st.stop()
 
-# Auto refresh on live
+# ---- Live toggle (simple)
+live_box = st.container(border=True)
+with live_box:
+    l1, l2, l3 = st.columns([1.0, 1.0, 3.0])
+    with l1:
+        live_btn = st.button("Stop Live" if st.session_state.live_active else "Start Live", use_container_width=True)
+    with l2:
+        st.caption(f"Feed: {WS_FEED.upper()}")
+    with l3:
+        st.caption("Live is optional — analysis works without it.")
+
+if live_btn:
+    if st.session_state.live_active:
+        stop_live()
+    else:
+        stop_live()
+        handler = RealtimeStream(
+            st.session_state.api_key,
+            st.session_state.secret_key,
+            st.session_state.ticker,
+            st.session_state.trade_q,
+            st.session_state.quote_q,
+            feed=WS_FEED,
+        )
+        t = threading.Thread(target=handler.run, daemon=True)
+        t.start()
+        st.session_state.ws_handler = handler
+        st.session_state.ws_thread = t
+        st.session_state.live_active = True
+    st.rerun()
+
 if st.session_state.live_active:
     st.autorefresh(interval=AUTO_REFRESH_MS, key="live_refresh")
 
-# Drain queues -> history
+# ---- Drain live data
 drain(st.session_state.trade_q, st.session_state.trade_history, MAX_TRADES)
 drain(st.session_state.quote_q, st.session_state.quote_history, MAX_QUOTES)
 
-# Update quote/price from live
 if st.session_state.quote_history:
     st.session_state.latest_quote = st.session_state.quote_history[-1]
     mid = mid_from_quote(st.session_state.latest_quote)
@@ -836,86 +918,105 @@ if st.session_state.quote_history:
 
 current_price = float(st.session_state.latest_price or df["close"].iloc[-1])
 
-# Compute analytics
+# ---- Compute
 bt = backtest(df, horizon)
 btr = bt_stats(bt)
-tm = compute_trade_metrics(df, current_price, horizon, mc_method, account_size)
+
+tm = compute_trade_metrics(df=df, price=current_price, horizon=horizon, acct=float(account_size))
 score, decision, emoji, reasons = score_decision(
-    current_price, tm.ma50, tm.ma200, tm.rrr, btr.sharpe_ratio, btr.max_drawdown, btr.win_rate, btr.profit_factor
+    current_price, tm.ma50, tm.ma200, tm.rrr,
+    btr.sharpe_ratio, btr.max_drawdown, btr.win_rate, btr.profit_factor
 )
 
-st.markdown(f"## {emoji} Recommendation: **{decision}**")
-st.markdown(f"**Score: {score}/100**")
+# ---- Dashboard layout
+row = st.container()
+left, right = row.columns([1.4, 1.0], vertical_alignment="top")
 
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("Current Price", f"${current_price:,.2f}")
-m1.metric("Volatility (ann.)", f"{tm.vol:.2f}")
+with left:
+    st.subheader(f"{emoji} {st.session_state.ticker} — {decision}")
+    st.caption(f"Price: ${current_price:,.2f} • Horizon: {horizon}d • Live: {'ON' if st.session_state.live_active else 'OFF'}")
 
-m2.metric("Buy Level", f"${tm.buy:,.2f}", f"{(tm.buy/current_price - 1)*100:.1f}%")
-m2.metric("Stop Loss", f"${tm.stop:,.2f}", f"{(tm.stop/current_price - 1)*100:.1f}%")
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Buy", f"${tm.buy:,.2f}", f"{(tm.buy/current_price - 1)*100:.1f}%")
+    k2.metric("Sell", f"${tm.sell:,.2f}", f"{(tm.sell/current_price - 1)*100:.1f}%")
+    k3.metric("Stop", f"${tm.stop:,.2f}", f"{(tm.stop/current_price - 1)*100:.1f}%")
+    k4.metric("Position", f"{tm.qty} shares")
 
-m3.metric("Sell Target", f"${tm.sell:,.2f}", f"{(tm.sell/current_price - 1)*100:.1f}%")
-m3.metric("RRR", f"{tm.rrr:.2f}")
+    s1, s2, s3, s4 = st.columns(4)
+    s1.metric("Vol (ann.)", f"{tm.vol:.2f}")
+    s2.metric("ATR", f"{tm.atr:.2f}")
+    s3.metric("RRR", f"{tm.rrr:.2f}")
+    s4.metric("Kelly (half)", f"{tm.kelly:.3f}")
 
-m4.metric("Kelly Fraction", f"{tm.kelly:.3f}")
-m4.metric("Position Size", f"{tm.qty} shares")
+    with st.expander("Why this decision"):
+        for r in reasons:
+            st.write(f"- {r}")
+        st.caption(
+            f"Safety caps: max alloc {int(MAX_ALLOC_PCT*100)}% (cap {tm.cap_alloc_qty} shares), "
+            f"max risk {int(MAX_RISK_PCT*100)}% (cap {tm.cap_risk_qty} shares). "
+            f"Backtest: entry next-day open, slippage {SLIPPAGE_BPS} bps."
+        )
 
-st.markdown("### 📋 Summary")
-for r in reasons:
-    st.write(f"- {r}")
+with right:
+    st.plotly_chart(score_gauge(score, decision), use_container_width=True)
 
-# Chart
-st.markdown("### 📈 Price + Levels")
-fig = go.Figure()
-fig.add_trace(go.Scatter(x=df["timestamp"], y=df["close"], name="Close"))
+# ---- Tabs
+tab1, tab2, tab3 = st.tabs(["Chart", "Backtest", "Live"])
 
-if len(df) >= 50:
-    fig.add_trace(go.Scatter(x=df["timestamp"], y=df["close"].rolling(50).mean(), name="MA50"))
-if len(df) >= 200:
-    fig.add_trace(go.Scatter(x=df["timestamp"], y=df["close"].rolling(200).mean(), name="MA200"))
+with tab1:
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df["timestamp"], y=df["close"], name="Close"))
+    if len(df) >= 50:
+        fig.add_trace(go.Scatter(x=df["timestamp"], y=df["close"].rolling(50).mean(), name="MA50"))
+    if len(df) >= 200:
+        fig.add_trace(go.Scatter(x=df["timestamp"], y=df["close"].rolling(200).mean(), name="MA200"))
 
-fig.add_hline(y=tm.buy, line_dash="dot", annotation_text="Buy")
-fig.add_hline(y=tm.sell, line_dash="dot", annotation_text="Sell")
-fig.add_hline(y=tm.stop, line_dash="dot", annotation_text="Stop")
+    fig.add_hline(y=tm.buy, line_dash="dot", annotation_text="Buy")
+    fig.add_hline(y=tm.sell, line_dash="dot", annotation_text="Sell")
+    fig.add_hline(y=tm.stop, line_dash="dot", annotation_text="Stop")
 
-fig.update_layout(height=520, hovermode="x unified", title=f"{st.session_state.ticker} Analysis")
-st.plotly_chart(fig, use_container_width=True)
+    fig.update_layout(height=520, hovermode="x unified", title=f"{st.session_state.ticker} Price")
+    st.plotly_chart(fig, use_container_width=True)
 
-# Backtest
-st.markdown("### 📊 Backtest")
-b1, b2, b3, b4 = st.columns(4)
-b1.metric("Trades", btr.total_trades)
-b2.metric("Win Rate", f"{btr.win_rate:.1f}%")
-b3.metric("Profit Factor", f"{btr.profit_factor:.2f}")
-b4.metric("Sharpe", f"{btr.sharpe_ratio:.2f}")
+with tab2:
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Trades", btr.total_trades)
+    c2.metric("Win Rate", f"{btr.win_rate:.1f}%")
+    c3.metric("Profit Factor", f"{btr.profit_factor:.2f}")
+    c4.metric("Sharpe", f"{btr.sharpe_ratio:.2f}")
 
-if not bt.empty:
-    fig2 = go.Figure()
-    fig2.add_trace(go.Scatter(y=bt["CumPnL"], name="Cum PnL"))
-    fig2.update_layout(height=350, title="Equity Curve")
-    st.plotly_chart(fig2, use_container_width=True)
+    c5, c6, c7, c8 = st.columns(4)
+    c5.metric("Max Drawdown", f"{btr.max_drawdown*100:.1f}%")
+    c6.metric("Total PnL", f"${btr.total_pnl:,.2f}")
+    c7.metric("Avg Win", f"${btr.avg_win:,.2f}")
+    c8.metric("Avg Loss", f"${btr.avg_loss:,.2f}")
 
-# Live
-if st.session_state.live_active:
-    st.markdown("### 🔴 Live Market Feed")
-    l1, l2 = st.columns(2)
+    if not bt.empty:
+        fig_bt = go.Figure()
+        fig_bt.add_trace(go.Scatter(y=bt["CumPnL"], name="Cumulative PnL"))
+        fig_bt.update_layout(height=360, title="Equity Curve")
+        st.plotly_chart(fig_bt, use_container_width=True)
 
-    with l1:
-        st.markdown("**Recent Trades**")
-        for t in reversed(st.session_state.trade_history[-10:]):
-            ts = parse_ts(t.get("ts")).strftime("%H:%M:%S")
-            st.text(f"{ts} | ${t.get('price', 0):.2f} | {t.get('size', 0)}")
-
-    with l2:
-        st.markdown("**Latest Quote**")
-        q = st.session_state.latest_quote or {}
-        bid, ask = q.get("bid"), q.get("ask")
-        if bid and ask:
-            st.text(f"Bid: ${bid:.2f} ({q.get('bid_size','?')})")
-            st.text(f"Ask: ${ask:.2f} ({q.get('ask_size','?')})")
-            st.text(f"Spread: ${q.get('spread', 0):.4f}")
-        else:
-            st.text("No quote yet...")
+with tab3:
+    if not st.session_state.live_active:
+        st.info("Live is OFF. Click **Start Live** above if you want streaming trades/quotes.")
+    else:
+        l1, l2 = st.columns(2)
+        with l1:
+            st.markdown("**Recent Trades**")
+            for t in reversed(st.session_state.trade_history[-12:]):
+                ts = parse_ts(t.get("ts")).strftime("%H:%M:%S")
+                st.text(f"{ts} | ${t.get('price', 0):.2f} | {t.get('size', 0)}")
+        with l2:
+            st.markdown("**Latest Quote**")
+            q = st.session_state.latest_quote or {}
+            bid, ask = q.get("bid"), q.get("ask")
+            if bid and ask:
+                st.text(f"Bid: ${bid:.2f} ({q.get('bid_size','?')})")
+                st.text(f"Ask: ${ask:.2f} ({q.get('ask_size','?')})")
+                st.text(f"Spread: ${q.get('spread', 0):.4f}")
+            else:
+                st.text("No quote yet...")
 
 st.markdown("---")
 st.caption("⚠️ Educational only. Not financial advice.")
