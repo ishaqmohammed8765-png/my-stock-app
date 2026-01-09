@@ -1,6 +1,18 @@
-import pandas as pd
+# utils/indicators.py
 import numpy as np
-from utils.config import CFG  # This pulls in the settings you just saved
+import pandas as pd
+from .config import CFG  # or: from utils.config import CFG
+
+def add_indicators_inplace(df: pd.DataFrame) -> None:
+    # compute indicators and add columns to df inplace
+    # e.g. df["rsi"] = ...
+    pass
+
+def market_regime_at(market_df: pd.DataFrame, idx: int, ma_len: int = 200) -> bool:
+    # return True for risk-on, False for risk-off (example)
+    # e.g. market close > MA200 at idx
+    return True
+
 
 def _fs(s: pd.Series) -> pd.Series:
     """Converts a series to numeric/float safely."""
