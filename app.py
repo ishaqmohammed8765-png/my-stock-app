@@ -15,6 +15,42 @@ except Exception:
 
 
 # ---------------------------
+# Page config MUST be first
+# ---------------------------
+st.set_page_config(
+    page_title="Pro Algo Trader",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ---------------------------
+# Light UI polish (CSS)
+# ---------------------------
+st.markdown(
+    """
+<style>
+/* Tighten spacing a bit */
+.block-container { padding-top: 1.2rem; padding-bottom: 1.5rem; }
+[data-testid="stSidebar"] .block-container { padding-top: 1rem; }
+h1 { margin-bottom: 0.5rem; }
+h2, h3 { margin-top: 0.6rem; }
+
+/* Make metrics/cards feel tighter */
+[data-testid="stMetric"] { padding: 0.2rem 0.2rem; }
+
+/* Reduce expander padding slightly */
+[data-testid="stExpander"] details { padding: 0.25rem 0; }
+
+/* Remove some extra space under chart containers */
+div[data-testid="stVerticalBlock"] > div:has(> div[data-testid="stArrowVegaLiteChart"]) { margin-bottom: 0.25rem; }
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+
+# ---------------------------
 # Helpers
 # ---------------------------
 def has_keys(api_key: str, sec_key: str) -> bool:
@@ -31,59 +67,61 @@ def ss_get(name, default):
 api_key = st.secrets.get("ALPACA_KEY", "")
 sec_key = st.secrets.get("ALPACA_SECRET", "")
 
-st.set_page_config(page_title="Pro Algo Trader", layout="wide")
 st.title("📈 Modular Algorithmic Dashboard")
 
 
 # ---------------------------
-# Sidebar
+# Sidebar (tight + grouped)
 # ---------------------------
 with st.sidebar:
     st.header("Settings")
 
-    symbol = st.text_input("Stock Symbol", value="AAPL", key="symbol").upper().strip()
+    # Use a form so the UI doesn't look scattered and actions feel consistent
+    with st.form("settings_form", clear_on_submit=False):
+        symbol = st.text_input("Stock Symbol", value=ss_get("symbol", "AAPL")).upper().strip()
 
-    col_a, col_b = st.columns(2)
-    with col_a:
-        load_btn = st.button("🔄 Load/Refresh", use_container_width=True, key="load_btn")
-    with col_b:
-        run_backtest = st.button("🚀 Run Backtest", use_container_width=True, key="run_backtest")
+        c1, c2 = st.columns(2)
+        with c1:
+            mode = st.selectbox("Entry mode", ["pullback", "breakout"], index=0)
+        with c2:
+            horizon = st.number_input("Max hold (bars)", min_value=1, max_value=200, value=int(ss_get("horizon", 20)))
 
-    st.divider()
+        with st.expander("Advanced strategy params", expanded=False):
+            atr_entry = st.number_input("ATR entry", 0.0, 10.0, float(ss_get("atr_entry", 1.0)), 0.1)
+            atr_stop = st.number_input("ATR stop", 0.1, 20.0, float(ss_get("atr_stop", 2.0)), 0.1)
+            atr_target = st.number_input("ATR target", 0.1, 50.0, float(ss_get("atr_target", 3.0)), 0.1)
 
-    mode = st.selectbox("Entry mode", ["pullback", "breakout"], index=0, key="mode")
-    horizon = st.number_input("Max hold (bars)", min_value=1, max_value=200, value=20, key="horizon")
+            rsi_min = st.number_input("RSI min", 0.0, 100.0, float(ss_get("rsi_min", 30.0)))
+            rsi_max = st.number_input("RSI max", 0.0, 100.0, float(ss_get("rsi_max", 70.0)))
 
-    with st.expander("Advanced strategy params", expanded=False):
-        atr_entry = st.number_input("ATR entry", 0.0, 10.0, 1.0, 0.1, key="atr_entry")
-        atr_stop = st.number_input("ATR stop", 0.1, 20.0, 2.0, 0.1, key="atr_stop")
-        atr_target = st.number_input("ATR target", 0.1, 50.0, 3.0, 0.1, key="atr_target")
+            rvol_min = st.number_input("RVOL min", 0.0, 10.0, float(ss_get("rvol_min", 1.2)))
+            vol_max = st.number_input("Max annual vol", 0.0, 5.0, float(ss_get("vol_max", 1.0)))
 
-        rsi_min = st.number_input("RSI min", 0.0, 100.0, 30.0, key="rsi_min")
-        rsi_max = st.number_input("RSI max", 0.0, 100.0, 70.0, key="rsi_max")
+            cooldown_bars = st.number_input("Cooldown bars", 0, 200, int(ss_get("cooldown_bars", 5)))
 
-        rvol_min = st.number_input("RVOL min", 0.0, 10.0, 1.2, key="rvol_min")
-        vol_max = st.number_input("Max annual vol", 0.0, 5.0, 1.0, key="vol_max")
+            include_spread_penalty = st.checkbox("Include spread penalty", value=bool(ss_get("include_spread_penalty", True)))
+            assumed_spread_bps = st.number_input("Assumed spread (bps)", 0.0, 200.0, float(ss_get("assumed_spread_bps", 5.0)))
 
-        cooldown_bars = st.number_input("Cooldown bars", 0, 200, 5, key="cooldown_bars")
+            start_equity = st.number_input(
+                "Starting equity ($)",
+                min_value=1_000.0,
+                max_value=10_000_000.0,
+                value=float(ss_get("start_equity", 100_000.0)),
+                step=1_000.0,
+            )
 
-        include_spread_penalty = st.checkbox("Include spread penalty", value=True, key="include_spread_penalty")
-        assumed_spread_bps = st.number_input("Assumed spread (bps)", 0.0, 200.0, 5.0, key="assumed_spread_bps")
+            require_risk_on = st.checkbox(
+                "Require risk-on regime (needs market_df)",
+                value=bool(ss_get("require_risk_on", False)),
+            )
 
-        start_equity = st.number_input(
-            "Starting equity ($)",
-            min_value=1_000.0,
-            max_value=10_000_000.0,
-            value=100_000.0,
-            step=1_000.0,
-            key="start_equity",
-        )
+        st.divider()
 
-        require_risk_on = st.checkbox(
-            "Require risk-on regime (needs market_df)",
-            value=False,
-            key="require_risk_on",
-        )
+        b1, b2 = st.columns(2)
+        with b1:
+            load_btn = st.form_submit_button("🔄 Load/Refresh", use_container_width=True)
+        with b2:
+            run_backtest = st.form_submit_button("🚀 Run Backtest", use_container_width=True)
 
     st.divider()
     if has_keys(api_key, sec_key):
@@ -94,7 +132,7 @@ with st.sidebar:
 
 
 # ---------------------------
-# Block if no keys (since your loader uses Alpaca)
+# Block if no keys (since loader uses Alpaca)
 # ---------------------------
 if not has_keys(api_key, sec_key):
     st.stop()
@@ -108,6 +146,24 @@ if "df_raw" not in st.session_state:
     st.session_state.debug_info = None
     st.session_state.sanity = None
     st.session_state.last_symbol = None
+
+
+# Persist sidebar values (so they survive reruns)
+st.session_state["symbol"] = symbol
+st.session_state["mode"] = mode
+st.session_state["horizon"] = horizon
+st.session_state["atr_entry"] = atr_entry
+st.session_state["atr_stop"] = atr_stop
+st.session_state["atr_target"] = atr_target
+st.session_state["rsi_min"] = rsi_min
+st.session_state["rsi_max"] = rsi_max
+st.session_state["rvol_min"] = rvol_min
+st.session_state["vol_max"] = vol_max
+st.session_state["cooldown_bars"] = cooldown_bars
+st.session_state["include_spread_penalty"] = include_spread_penalty
+st.session_state["assumed_spread_bps"] = assumed_spread_bps
+st.session_state["start_equity"] = start_equity
+st.session_state["require_risk_on"] = require_risk_on
 
 
 # ---------------------------
@@ -132,15 +188,14 @@ if needs_load:
             except Exception as e:
                 st.session_state.sanity = {"ok": False, "error": str(e)}
 
-
 df = st.session_state.df_raw
 debug_info = st.session_state.debug_info
 sanity = st.session_state.sanity
 
 if df is None or getattr(df, "empty", True):
     st.error(f"Could not load data for {symbol}.")
-    if debug_info:
-        st.write("Loader debug:", debug_info)
+    with st.expander("Loader debug", expanded=True):
+        st.json(debug_info or {})
     st.stop()
 
 
@@ -163,52 +218,57 @@ tab1, tab2, tab3 = st.tabs(["📊 Dashboard", "🧪 Backtest", "📡 Live"])
 # Tab 1: Dashboard
 # ---------------------------
 with tab1:
-    left, right = st.columns([2, 1])
+    left, right = st.columns([2.2, 1.0], gap="large")
 
     with left:
         st.subheader(f"{symbol} — Price & Trend")
+
         cols_to_plot = [c for c in ["close", "ma50", "ma200"] if c in df_chart.columns]
-        if cols_to_plot:
-            st.line_chart(df_chart[cols_to_plot])
-        else:
-            st.line_chart(df_chart[["close"]] if "close" in df_chart.columns else df_chart)
+        if not cols_to_plot:
+            cols_to_plot = ["close"] if "close" in df_chart.columns else list(df_chart.columns[:1])
+
+        # Smaller, consistent height helps a lot
+        st.line_chart(df_chart[cols_to_plot], height=360)
 
     with right:
         st.subheader("Data integrity")
+
         if isinstance(sanity, dict):
             if sanity.get("ok", True):
                 st.success("Sanity checks: OK")
             else:
                 st.warning("Sanity checks: warnings")
-            st.json(sanity)
+
+            with st.expander("Details", expanded=False):
+                st.json(sanity)
         else:
             st.info("No sanity report available.")
 
         st.subheader("Debug")
-        if debug_info is not None:
-            st.write(debug_info)
-        else:
-            st.caption("No debug info returned by loader.")
+        with st.expander("Loader debug", expanded=False):
+            st.json(debug_info or {})
 
     st.divider()
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3 = st.columns(3, gap="large")
     with c1:
+        st.subheader("RSI(14)")
         if "rsi14" in df_chart.columns:
-            st.subheader("RSI(14)")
-            st.line_chart(df_chart[["rsi14"]])
+            st.line_chart(df_chart[["rsi14"]], height=220)
         else:
             st.caption("RSI not available.")
+
     with c2:
+        st.subheader("RVOL")
         if "rvol" in df_chart.columns:
-            st.subheader("RVOL")
-            st.line_chart(df_chart[["rvol"]])
+            st.line_chart(df_chart[["rvol"]], height=220)
         else:
             st.caption("RVOL not available.")
+
     with c3:
+        st.subheader("Ann. Vol (proxy)")
         if "vol_ann" in df_chart.columns:
-            st.subheader("Ann. Vol (proxy)")
-            st.line_chart(df_chart[["vol_ann"]])
+            st.line_chart(df_chart[["vol_ann"]], height=220)
         else:
             st.caption("Vol proxy not available.")
 
@@ -250,7 +310,7 @@ with tab2:
                     atr_entry=_atr_entry,
                     atr_stop=_atr_stop,
                     atr_target=_atr_target,
-                    require_risk_on=_risk_on,     # now actually respects the checkbox
+                    require_risk_on=_risk_on,
                     rsi_min=_rsi_min,
                     rsi_max=_rsi_max,
                     rvol_min=_rvol_min,
@@ -281,14 +341,14 @@ with tab2:
             else:
                 win_rate, avg_win, avg_loss = np.nan, np.nan, np.nan
 
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Trades", f"{len(t)}")
-            c2.metric("Win rate", f"{win_rate:.1%}" if np.isfinite(win_rate) else "—")
-            c3.metric("Avg win (per share)", f"{avg_win:.3f}" if np.isfinite(avg_win) else "—")
-            c4.metric("Avg loss (per share)", f"{avg_loss:.3f}" if np.isfinite(avg_loss) else "—")
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Trades", f"{len(t)}")
+            m2.metric("Win rate", f"{win_rate:.1%}" if np.isfinite(win_rate) else "—")
+            m3.metric("Avg win (per share)", f"{avg_win:.3f}" if np.isfinite(avg_win) else "—")
+            m4.metric("Avg loss (per share)", f"{avg_loss:.3f}" if np.isfinite(avg_loss) else "—")
 
             st.subheader("Trades")
-            st.dataframe(t, use_container_width=True)
+            st.dataframe(t, use_container_width=True, height=420)
 
             csv = t.to_csv(index=False).encode("utf-8")
             st.download_button(
@@ -301,7 +361,7 @@ with tab2:
 
         st.subheader("Latest backtest data snapshot")
         try:
-            st.dataframe(results.tail(50), use_container_width=True)
+            st.dataframe(results.tail(50), use_container_width=True, height=420)
         except Exception:
             st.caption("No results dataframe returned by backtester.")
     else:
@@ -318,7 +378,6 @@ with tab3:
     else:
         st.subheader("Live (placeholder)")
 
-        # Minimal safe UI stub; actual streaming depends on your RealtimeStream design.
         col1, col2 = st.columns(2)
         with col1:
             st.button("▶️ Start Live", use_container_width=True, disabled=True)
