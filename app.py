@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 
-from utils.config import validate_keys
 from utils.data_loader import load_historical, sanity_check_bars
 from utils.indicators import add_indicators_inplace
 from utils.backtester import backtest_strategy
@@ -16,6 +15,17 @@ except Exception:
 
 
 # ---------------------------
+# Helpers
+# ---------------------------
+def has_keys(api_key: str, sec_key: str) -> bool:
+    return bool(api_key and sec_key and str(api_key).strip() and str(sec_key).strip())
+
+
+def ss_get(name, default):
+    return st.session_state.get(name, default)
+
+
+# ---------------------------
 # Secrets (no manual key entry)
 # ---------------------------
 api_key = st.secrets.get("ALPACA_KEY", "")
@@ -24,42 +34,41 @@ sec_key = st.secrets.get("ALPACA_SECRET", "")
 st.set_page_config(page_title="Pro Algo Trader", layout="wide")
 st.title("📈 Modular Algorithmic Dashboard")
 
+
 # ---------------------------
 # Sidebar
 # ---------------------------
 with st.sidebar:
     st.header("Settings")
 
-    symbol = st.text_input("Stock Symbol", value="AAPL").upper()
+    symbol = st.text_input("Stock Symbol", value="AAPL", key="symbol").upper().strip()
 
     col_a, col_b = st.columns(2)
     with col_a:
-        load_btn = st.button("🔄 Load/Refresh", use_container_width=True)
+        load_btn = st.button("🔄 Load/Refresh", use_container_width=True, key="load_btn")
     with col_b:
-        run_backtest = st.button("🚀 Run Backtest", use_container_width=True)
+        run_backtest = st.button("🚀 Run Backtest", use_container_width=True, key="run_backtest")
 
     st.divider()
 
-    # Minimal always-visible controls
-    mode = st.selectbox("Entry mode", ["pullback", "breakout"], index=0)
-    horizon = st.number_input("Max hold (bars)", min_value=1, max_value=200, value=20)
+    mode = st.selectbox("Entry mode", ["pullback", "breakout"], index=0, key="mode")
+    horizon = st.number_input("Max hold (bars)", min_value=1, max_value=200, value=20, key="horizon")
 
-    # Advanced controls hidden by default
     with st.expander("Advanced strategy params", expanded=False):
-        atr_entry = st.number_input("ATR entry", 0.0, 10.0, 1.0, 0.1)
-        atr_stop = st.number_input("ATR stop", 0.1, 20.0, 2.0, 0.1)
-        atr_target = st.number_input("ATR target", 0.1, 50.0, 3.0, 0.1)
+        atr_entry = st.number_input("ATR entry", 0.0, 10.0, 1.0, 0.1, key="atr_entry")
+        atr_stop = st.number_input("ATR stop", 0.1, 20.0, 2.0, 0.1, key="atr_stop")
+        atr_target = st.number_input("ATR target", 0.1, 50.0, 3.0, 0.1, key="atr_target")
 
-        rsi_min = st.number_input("RSI min", 0.0, 100.0, 30.0)
-        rsi_max = st.number_input("RSI max", 0.0, 100.0, 70.0)
+        rsi_min = st.number_input("RSI min", 0.0, 100.0, 30.0, key="rsi_min")
+        rsi_max = st.number_input("RSI max", 0.0, 100.0, 70.0, key="rsi_max")
 
-        rvol_min = st.number_input("RVOL min", 0.0, 10.0, 1.2)
-        vol_max = st.number_input("Max annual vol", 0.0, 5.0, 1.0)
+        rvol_min = st.number_input("RVOL min", 0.0, 10.0, 1.2, key="rvol_min")
+        vol_max = st.number_input("Max annual vol", 0.0, 5.0, 1.0, key="vol_max")
 
-        cooldown_bars = st.number_input("Cooldown bars", 0, 200, 5)
+        cooldown_bars = st.number_input("Cooldown bars", 0, 200, 5, key="cooldown_bars")
 
-        include_spread_penalty = st.checkbox("Include spread penalty", value=True)
-        assumed_spread_bps = st.number_input("Assumed spread (bps)", 0.0, 200.0, 5.0)
+        include_spread_penalty = st.checkbox("Include spread penalty", value=True, key="include_spread_penalty")
+        assumed_spread_bps = st.number_input("Assumed spread (bps)", 0.0, 200.0, 5.0, key="assumed_spread_bps")
 
         start_equity = st.number_input(
             "Starting equity ($)",
@@ -67,13 +76,17 @@ with st.sidebar:
             max_value=10_000_000.0,
             value=100_000.0,
             step=1_000.0,
+            key="start_equity",
         )
 
-        # Regime filter is only meaningful if you actually pass market_df
-        require_risk_on = st.checkbox("Require risk-on regime (needs market_df)", value=False)
+        require_risk_on = st.checkbox(
+            "Require risk-on regime (needs market_df)",
+            value=False,
+            key="require_risk_on",
+        )
 
-    # Key status
-    if validate_keys(api_key, sec_key):
+    st.divider()
+    if has_keys(api_key, sec_key):
         st.success("Alpaca keys loaded from Secrets ✅")
     else:
         st.error("Missing Alpaca keys in Secrets ❌")
@@ -83,46 +96,68 @@ with st.sidebar:
 # ---------------------------
 # Block if no keys (since your loader uses Alpaca)
 # ---------------------------
-if not validate_keys(api_key, sec_key):
+if not has_keys(api_key, sec_key):
     st.stop()
 
 
 # ---------------------------
-# Data load (cache in session_state so tabs feel “feature-rich”)
+# Session state init
 # ---------------------------
 if "df_raw" not in st.session_state:
     st.session_state.df_raw = None
     st.session_state.debug_info = None
     st.session_state.sanity = None
+    st.session_state.last_symbol = None
 
-if load_btn or (st.session_state.df_raw is None):
-    df, debug_info = load_historical(symbol, api_key, sec_key)
-    st.session_state.df_raw = df
-    st.session_state.debug_info = debug_info
 
-    try:
-        st.session_state.sanity = sanity_check_bars(df) if df is not None else None
-    except Exception:
-        st.session_state.sanity = None
+# ---------------------------
+# Load / Refresh
+# ---------------------------
+needs_load = load_btn or (st.session_state.df_raw is None) or (st.session_state.last_symbol != symbol)
+
+if needs_load:
+    with st.spinner(f"Loading historical data for {symbol}..."):
+        try:
+            df, debug_info = load_historical(symbol, api_key, sec_key)
+        except Exception as e:
+            st.session_state.df_raw = None
+            st.session_state.debug_info = {"error": str(e)}
+            st.session_state.sanity = None
+        else:
+            st.session_state.df_raw = df
+            st.session_state.debug_info = debug_info
+            st.session_state.last_symbol = symbol
+            try:
+                st.session_state.sanity = sanity_check_bars(df) if df is not None else None
+            except Exception as e:
+                st.session_state.sanity = {"ok": False, "error": str(e)}
 
 
 df = st.session_state.df_raw
 debug_info = st.session_state.debug_info
 sanity = st.session_state.sanity
 
-if df is None or df.empty:
+if df is None or getattr(df, "empty", True):
     st.error(f"Could not load data for {symbol}.")
+    if debug_info:
+        st.write("Loader debug:", debug_info)
     st.stop()
 
 
 # Prep indicators for dashboard charts (use copy)
 df_chart = df.copy()
-add_indicators_inplace(df_chart)
+try:
+    add_indicators_inplace(df_chart)
+except Exception as e:
+    st.warning("Indicators failed to compute — showing raw price only.")
+    st.caption(str(e))
+
 
 # ---------------------------
 # Tabs
 # ---------------------------
 tab1, tab2, tab3 = st.tabs(["📊 Dashboard", "🧪 Backtest", "📡 Live"])
+
 
 # ---------------------------
 # Tab 1: Dashboard
@@ -133,7 +168,10 @@ with tab1:
     with left:
         st.subheader(f"{symbol} — Price & Trend")
         cols_to_plot = [c for c in ["close", "ma50", "ma200"] if c in df_chart.columns]
-        st.line_chart(df_chart[cols_to_plot])
+        if cols_to_plot:
+            st.line_chart(df_chart[cols_to_plot])
+        else:
+            st.line_chart(df_chart[["close"]] if "close" in df_chart.columns else df_chart)
 
     with right:
         st.subheader("Data integrity")
@@ -159,14 +197,20 @@ with tab1:
         if "rsi14" in df_chart.columns:
             st.subheader("RSI(14)")
             st.line_chart(df_chart[["rsi14"]])
+        else:
+            st.caption("RSI not available.")
     with c2:
         if "rvol" in df_chart.columns:
             st.subheader("RVOL")
             st.line_chart(df_chart[["rvol"]])
+        else:
+            st.caption("RVOL not available.")
     with c3:
         if "vol_ann" in df_chart.columns:
             st.subheader("Ann. Vol (proxy)")
             st.line_chart(df_chart[["vol_ann"]])
+        else:
+            st.caption("Vol proxy not available.")
 
 
 # ---------------------------
@@ -174,83 +218,78 @@ with tab1:
 # ---------------------------
 with tab2:
     st.subheader("Backtest")
-
     st.caption("Tip: if you get 0 trades, loosen filters (RVOL min down, vol max up, RSI range wider).")
 
-    # Ensure advanced defaults exist even if expander never opened (Streamlit sometimes delays widget init)
-    # We'll provide safe fallbacks.
-    def _ss(name, default):
-        return st.session_state.get(name, default)
+    # Collect params safely
+    _atr_entry = float(ss_get("atr_entry", 1.0))
+    _atr_stop = float(ss_get("atr_stop", 2.0))
+    _atr_target = float(ss_get("atr_target", 3.0))
+    _rsi_min = float(ss_get("rsi_min", 30.0))
+    _rsi_max = float(ss_get("rsi_max", 70.0))
+    _rvol_min = float(ss_get("rvol_min", 1.2))
+    _vol_max = float(ss_get("vol_max", 1.0))
+    _cooldown = int(ss_get("cooldown_bars", 5))
+    _spread_on = bool(ss_get("include_spread_penalty", True))
+    _spread_bps = float(ss_get("assumed_spread_bps", 5.0))
+    _equity = float(ss_get("start_equity", 100000.0))
+    _risk_on = bool(ss_get("require_risk_on", False))
+    _horizon = int(ss_get("horizon", 20))
+    _mode = str(ss_get("mode", "pullback"))
 
-    # Use the variables from sidebar if they exist, otherwise default to safe values.
-    # (If sidebar expander was never opened, variables still exist because widgets were created.)
-    try:
-        _atr_entry = float(atr_entry)
-        _atr_stop = float(atr_stop)
-        _atr_target = float(atr_target)
-        _rsi_min = float(rsi_min)
-        _rsi_max = float(rsi_max)
-        _rvol_min = float(rvol_min)
-        _vol_max = float(vol_max)
-        _cooldown = int(cooldown_bars)
-        _spread_on = bool(include_spread_penalty)
-        _spread_bps = float(assumed_spread_bps)
-        _equity = float(start_equity)
-        _risk_on = bool(require_risk_on)
-    except Exception:
-        _atr_entry, _atr_stop, _atr_target = 1.0, 2.0, 3.0
-        _rsi_min, _rsi_max = 30.0, 70.0
-        _rvol_min, _vol_max = 1.2, 1.0
-        _cooldown = 5
-        _spread_on, _spread_bps = True, 5.0
-        _equity = 100000.0
-        _risk_on = False
+    if _risk_on:
+        st.warning("Risk-on regime filter is ON, but market_df is not loaded in app.py yet — results may be wrong/empty.")
 
     if run_backtest:
-        # NOTE: market_df=None, so regime filter should be off unless you implement market_df loading.
-        results, trades = backtest_strategy(
-            df=df,
-            market_df=None,
-            horizon=int(horizon),
-            mode=str(mode),
-            atr_entry=_atr_entry,
-            atr_stop=_atr_stop,
-            atr_target=_atr_target,
-            require_risk_on=False if True else _risk_on,  # keep False unless market_df is supplied
-            rsi_min=_rsi_min,
-            rsi_max=_rsi_max,
-            rvol_min=_rvol_min,
-            vol_max=_vol_max,
-            cooldown_bars=_cooldown,
-            include_spread_penalty=_spread_on,
-            assumed_spread_bps=_spread_bps,
-            start_equity=_equity,
-        )
+        with st.spinner("Running backtest..."):
+            try:
+                results, trades = backtest_strategy(
+                    df=df,
+                    market_df=None,               # TODO: wire this if you want regime logic
+                    horizon=_horizon,
+                    mode=_mode,
+                    atr_entry=_atr_entry,
+                    atr_stop=_atr_stop,
+                    atr_target=_atr_target,
+                    require_risk_on=_risk_on,     # now actually respects the checkbox
+                    rsi_min=_rsi_min,
+                    rsi_max=_rsi_max,
+                    rvol_min=_rvol_min,
+                    vol_max=_vol_max,
+                    cooldown_bars=_cooldown,
+                    include_spread_penalty=_spread_on,
+                    assumed_spread_bps=_spread_bps,
+                    start_equity=_equity,
+                )
+            except Exception as e:
+                st.error("Backtest failed.")
+                st.caption(str(e))
+                st.stop()
 
         st.success("Backtest completed ✅")
 
-        # Quick metrics (based on pnl_per_share; sizing not included)
-        if trades is None or trades.empty:
+        if trades is None or getattr(trades, "empty", True):
             st.info("No trades generated with current params.")
         else:
             t = trades.copy()
-            wins = (t["pnl_per_share"] > 0).sum()
-            losses = (t["pnl_per_share"] <= 0).sum()
-            win_rate = wins / max(1, len(t))
 
-            avg_win = t.loc[t["pnl_per_share"] > 0, "pnl_per_share"].mean()
-            avg_loss = t.loc[t["pnl_per_share"] <= 0, "pnl_per_share"].mean()
+            # Basic metrics (per-share)
+            if "pnl_per_share" in t.columns:
+                wins = (t["pnl_per_share"] > 0).sum()
+                win_rate = wins / max(1, len(t))
+                avg_win = t.loc[t["pnl_per_share"] > 0, "pnl_per_share"].mean()
+                avg_loss = t.loc[t["pnl_per_share"] <= 0, "pnl_per_share"].mean()
+            else:
+                win_rate, avg_win, avg_loss = np.nan, np.nan, np.nan
 
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Trades", f"{len(t)}")
-            c2.metric("Win rate", f"{win_rate:.1%}")
+            c2.metric("Win rate", f"{win_rate:.1%}" if np.isfinite(win_rate) else "—")
             c3.metric("Avg win (per share)", f"{avg_win:.3f}" if np.isfinite(avg_win) else "—")
             c4.metric("Avg loss (per share)", f"{avg_loss:.3f}" if np.isfinite(avg_loss) else "—")
 
             st.subheader("Trades")
             st.dataframe(t, use_container_width=True)
 
-            # Download
             csv = t.to_csv(index=False).encode("utf-8")
             st.download_button(
                 "⬇️ Download trades CSV",
@@ -261,7 +300,10 @@ with tab2:
             )
 
         st.subheader("Latest backtest data snapshot")
-        st.dataframe(results.tail(50), use_container_width=True)
+        try:
+            st.dataframe(results.tail(50), use_container_width=True)
+        except Exception:
+            st.caption("No results dataframe returned by backtester.")
     else:
         st.info("Click **🚀 Run Backtest** in the sidebar.")
 
@@ -274,5 +316,14 @@ with tab3:
         st.info("Live module not available (or import failed).")
         st.caption("If you want live streaming, paste your utils/live_stream.py and I’ll wire it back in safely.")
     else:
-        st.info("Live streaming tab is ready to be wired up.")
-        st.caption("Next step: add Start/Stop controls and stream output rendering.")
+        st.subheader("Live (placeholder)")
+
+        # Minimal safe UI stub; actual streaming depends on your RealtimeStream design.
+        col1, col2 = st.columns(2)
+        with col1:
+            st.button("▶️ Start Live", use_container_width=True, disabled=True)
+        with col2:
+            st.button("⏹ Stop Live", use_container_width=True, disabled=True)
+
+        st.info("Live streaming is detected, but not wired into UI yet.")
+        st.caption("Once you paste utils/live_stream.py, I’ll connect Start/Stop + live chart + last tick table.")
