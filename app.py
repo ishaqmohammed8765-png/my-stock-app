@@ -1,13 +1,15 @@
 # app.py
 from __future__ import annotations
 
-from typing import Any, Optional
+from dataclasses import dataclass
+from typing import Any, Optional, Tuple, Dict, List
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+# Your modular project imports (kept)
 from utils.data_loader import load_historical, sanity_check_bars
 from utils.indicators import add_indicators_inplace
 from utils.backtester import backtest_strategy
@@ -25,6 +27,13 @@ try:
 except Exception:
     LIVE_AVAILABLE = False
 
+# Optional: Yahoo fallback
+YF_AVAILABLE = True
+try:
+    import yfinance as yf  # pip install yfinance
+except Exception:
+    YF_AVAILABLE = False
+
 
 # ---------------------------
 # Page config MUST be first
@@ -37,48 +46,71 @@ st.set_page_config(
 )
 
 # ---------------------------
-# Minimal UI polish
+# UI polish (modern + cleaner)
 # ---------------------------
 st.markdown(
     """
 <style>
-.block-container { padding-top: 1.0rem; padding-bottom: 1.2rem; }
+/* tighter overall spacing */
+.block-container { padding-top: 0.9rem; padding-bottom: 1.1rem; max-width: 1320px; }
 [data-testid="stSidebar"] .block-container { padding-top: 0.8rem; }
-h1 { margin-bottom: 0.2rem; }
-h2, h3 { margin-top: 0.6rem; }
-[data-testid="stMetric"] { padding: 0.15rem 0.15rem; }
+
+/* headings */
+h1 { margin-bottom: 0.15rem; letter-spacing: -0.3px; }
+h2 { margin-top: 0.6rem; margin-bottom: 0.25rem; letter-spacing: -0.2px; }
+h3 { margin-top: 0.6rem; margin-bottom: 0.25rem; }
+
+/* metrics compact */
+[data-testid="stMetric"] { padding: 0.1rem 0.15rem; border-radius: 10px; }
+[data-testid="stMetricLabel"] p { font-size: 0.86rem; opacity: 0.85; }
+[data-testid="stMetricValue"] div { font-size: 1.35rem; }
+
+/* subtle cards */
+div[data-testid="stVerticalBlockBorderWrapper"]{
+  border-radius: 16px;
+}
+
+/* muted small text */
 .small-muted { color: rgba(250,250,250,0.65); font-size: 0.9rem; }
+
+/* buttons */
+.stButton button { border-radius: 14px; }
+.stDownloadButton button { border-radius: 14px; }
+
+/* code */
 code { font-size: 0.92rem; }
+
+/* hide streamlit footer */
+footer { visibility: hidden; }
 </style>
 """,
     unsafe_allow_html=True,
 )
 
-
 # ---------------------------
-# Robust session init
+# Session init
 # ---------------------------
 def _ss_setdefault(key: str, value: Any) -> None:
     if key not in st.session_state:
         st.session_state[key] = value
 
 
-# Core data state
+# Core state
 _ss_setdefault("df_raw", None)
 _ss_setdefault("df_chart", None)
-_ss_setdefault("sanity", None)
 _ss_setdefault("load_error", None)
 _ss_setdefault("ind_error", None)
 _ss_setdefault("last_symbol", None)
 _ss_setdefault("last_loaded_at", None)
+_ss_setdefault("data_source", None)
 
-# Backtest persistence (so results don't vanish on rerun/tab switch)
+# Backtest persistence
 _ss_setdefault("bt_results", None)
 _ss_setdefault("bt_trades", None)
 _ss_setdefault("bt_error", None)
 _ss_setdefault("bt_params_sig", None)
 
-# Live state
+# Live
 _ss_setdefault("live_stream", None)
 _ss_setdefault("live_rows", [])
 _ss_setdefault("live_autorefresh", True)
@@ -88,15 +120,15 @@ _ss_setdefault("live_last_symbol", None)
 # ---------------------------
 # Helpers
 # ---------------------------
-def has_keys(api_key: str, sec_key: str) -> bool:
-    return bool(api_key and sec_key and str(api_key).strip() and str(sec_key).strip())
-
-
 def ss_get(name: str, default: Any) -> Any:
     return st.session_state.get(name, default)
 
 
-def _safe_float(x) -> float:
+def has_keys(api_key: str, sec_key: str) -> bool:
+    return bool(api_key and sec_key and str(api_key).strip() and str(sec_key).strip())
+
+
+def _safe_float(x: Any) -> float:
     try:
         v = float(x)
         return v if np.isfinite(v) else np.nan
@@ -112,7 +144,6 @@ def _as_utc_dtindex(df: pd.DataFrame) -> pd.DataFrame:
     elif isinstance(out.index, pd.DatetimeIndex):
         out = out.sort_index()
         if out.index.tz is None:
-            # treat naive as UTC to keep behavior consistent
             out.index = out.index.tz_localize("UTC")
         else:
             out.index = out.index.tz_convert("UTC")
@@ -120,38 +151,78 @@ def _as_utc_dtindex(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _tail_for_plot(df: pd.DataFrame, n: int) -> pd.DataFrame:
-    n = int(max(50, n))
+    n = int(max(80, n))
     return df.tail(n) if len(df) > n else df
 
 
-def plot_lines(df: pd.DataFrame, cols: list[str], *, title: str, height: int = 420) -> go.Figure:
+def _ensure_ohlcv_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalize common naming variants into open/high/low/close/volume.
+    Keeps additional columns if present.
+    """
+    if df is None or getattr(df, "empty", True):
+        return df
+    out = df.copy()
+    cols = {c.lower(): c for c in out.columns}
+    mapping = {}
+    for want in ["open", "high", "low", "close", "volume"]:
+        if want in out.columns:
+            continue
+        if want in cols:
+            mapping[cols[want]] = want
+        else:
+            # common variants
+            variants = {
+                "open": ["o", "opn"],
+                "high": ["h"],
+                "low": ["l"],
+                "close": ["c", "adj close", "adj_close", "adjclose"],
+                "volume": ["v", "vol"],
+            }.get(want, [])
+            for v in variants:
+                if v in cols:
+                    mapping[cols[v]] = want
+                    break
+    if mapping:
+        out = out.rename(columns=mapping)
+    return out
+
+
+def plot_price(df: pd.DataFrame, symbol: str) -> go.Figure:
     x = df.index
     fig = go.Figure()
-    for c in cols:
-        if c in df.columns:
-            fig.add_trace(go.Scatter(x=x, y=df[c], mode="lines", name=c))
+    if all(c in df.columns for c in ["open", "high", "low", "close"]):
+        fig.add_trace(
+            go.Candlestick(
+                x=x,
+                open=df["open"],
+                high=df["high"],
+                low=df["low"],
+                close=df["close"],
+                name="Price",
+                showlegend=False,
+            )
+        )
+    else:
+        fig.add_trace(go.Scatter(x=x, y=df.get("close", pd.Series(index=x, dtype=float)), mode="lines", name="close"))
+
+    for ma_col, label in [("ma50", "MA50"), ("ma200", "MA200")]:
+        if ma_col in df.columns:
+            fig.add_trace(go.Scatter(x=x, y=df[ma_col], mode="lines", name=label))
+
     fig.update_layout(
-        title=title,
-        height=height,
-        margin=dict(l=10, r=10, t=45, b=10),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        title=f"{symbol} — Price",
+        height=520,
+        margin=dict(l=10, r=10, t=50, b=10),
         hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
     fig.update_xaxes(showgrid=False)
     fig.update_yaxes(showgrid=True)
     return fig
 
 
-def plot_indicator(
-    df: pd.DataFrame,
-    col: str,
-    *,
-    title: str,
-    height: int = 240,
-    hlines=None,
-    y0=None,
-    y1=None,
-) -> go.Figure:
+def plot_indicator(df: pd.DataFrame, col: str, title: str, height: int = 260, hlines: Optional[List[float]] = None, y0=None, y1=None) -> go.Figure:
     x = df.index
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=x, y=df[col], mode="lines", name=col))
@@ -162,8 +233,8 @@ def plot_indicator(
         title=title,
         height=height,
         margin=dict(l=10, r=10, t=45, b=10),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         hovermode="x unified",
+        showlegend=False,
     )
     fig.update_xaxes(showgrid=False)
     fig.update_yaxes(showgrid=True)
@@ -172,7 +243,7 @@ def plot_indicator(
     return fig
 
 
-def compute_lookback_low_high(df_ind: pd.DataFrame, lookback: int) -> tuple[float, float]:
+def compute_lookback_low_high(df_ind: pd.DataFrame, lookback: int) -> Tuple[float, float]:
     lb = int(max(10, lookback))
     tail = df_ind.tail(lb)
     if tail.empty or ("low" not in tail.columns) or ("high" not in tail.columns):
@@ -182,13 +253,13 @@ def compute_lookback_low_high(df_ind: pd.DataFrame, lookback: int) -> tuple[floa
     return lo, hi
 
 
-def detect_big_jump(df: pd.DataFrame, *, thresh: float = 0.18) -> Optional[dict]:
-    """Flag max |close-to-close| jump. Heuristic for split/corp action/data issues."""
+def detect_big_jump(df: pd.DataFrame, thresh: float = 0.18) -> Optional[Dict[str, Any]]:
     if df is None or getattr(df, "empty", True) or "close" not in df.columns:
         return None
     c = pd.to_numeric(df["close"], errors="coerce")
     r = c.pct_change().abs()
-    if r.dropna().empty:
+    r = r.dropna()
+    if r.empty:
         return None
     idx = r.idxmax()
     v = _safe_float(r.loc[idx]) if idx in r.index else np.nan
@@ -199,25 +270,22 @@ def detect_big_jump(df: pd.DataFrame, *, thresh: float = 0.18) -> Optional[dict]
 
 def compute_trade_plan_breakout(
     df_ind: pd.DataFrame,
-    *,
     atr_entry: float,
     atr_stop: float,
     atr_target: float,
     assumed_spread_bps: float,
     include_spread_penalty: bool,
-) -> dict:
-    """Breakout-only trade plan using ATR multiples."""
+) -> Dict[str, Any]:
     last = df_ind.iloc[-1]
     close = _safe_float(last.get("close", np.nan))
     atr = _safe_float(last.get("atr14", np.nan))
 
     if not np.isfinite(close) or not np.isfinite(atr) or atr <= 0:
-        return {"entry": np.nan, "stop": np.nan, "target": np.nan, "rr": np.nan, "entry_type": "—"}
+        return {"entry": np.nan, "stop": np.nan, "target": np.nan, "rr": np.nan, "entry_type": "—", "atr": atr}
 
     entry = close + float(atr_entry) * atr
     entry_type = "Breakout (stop trigger)"
 
-    # mild penalty to reflect worse-than-ideal fill
     if include_spread_penalty and assumed_spread_bps > 0 and np.isfinite(entry):
         entry = entry * (1.0 + assumed_spread_bps / 10000.0)
 
@@ -228,21 +296,28 @@ def compute_trade_plan_breakout(
     reward = target - entry
     rr = (reward / risk) if risk > 0 else np.nan
 
-    return {"entry": entry, "stop": stop, "target": target, "rr": rr, "entry_type": entry_type}
+    return {"entry": entry, "stop": stop, "target": target, "rr": rr, "entry_type": entry_type, "atr": atr}
 
 
-def compute_recommendation(
+@dataclass(frozen=True)
+class SignalScore:
+    label: str
+    score: int
+    summary: str
+    reasons: List[str]
+
+
+def compute_signal_score(
     df_ind: pd.DataFrame,
-    *,
     rsi_min: float,
     rsi_max: float,
     rvol_min: float,
     vol_max: float,
-) -> tuple[str, str]:
+) -> SignalScore:
     need = ["close", "ma50", "ma200", "rsi14", "rvol", "vol_ann", "atr14"]
     missing = [c for c in need if c not in df_ind.columns]
     if missing:
-        return "HOLD", "Indicators not ready yet."
+        return SignalScore("WAIT", 0, "Indicators not ready.", [f"Missing: {', '.join(missing[:6])}"])
 
     last = df_ind.iloc[-1]
     close = _safe_float(last.get("close"))
@@ -253,33 +328,68 @@ def compute_recommendation(
     vol_ann = _safe_float(last.get("vol_ann"))
     atr = _safe_float(last.get("atr14"))
 
-    vals = np.array([close, rsi, rvol, vol_ann, atr], dtype="float64")
+    vals = np.array([close, ma50, ma200, rsi, rvol, vol_ann, atr], dtype="float64")
     if not np.isfinite(vals).all():
-        return "HOLD", "Waiting for enough history to compute indicators."
+        return SignalScore("WAIT", 0, "Waiting for enough history.", ["Non-finite indicator values"])
 
-    reasons = []
-    if rsi < float(rsi_min) or rsi > float(rsi_max):
-        reasons.append("RSI filter not met")
-    if rvol < float(rvol_min):
-        reasons.append("RVOL too low")
-    if vol_ann > float(vol_max):
-        reasons.append("Vol too high")
+    reasons: List[str] = []
+    score = 50  # base
 
-    uptrend = np.isfinite(ma50) and np.isfinite(ma200) and (close > ma50 > ma200)
-    downtrend = np.isfinite(ma50) and np.isfinite(ma200) and (close < ma50 < ma200)
-
-    if reasons:
-        return "HOLD", " / ".join(reasons)
-
+    # Trend
+    uptrend = (close > ma50 > ma200)
+    downtrend = (close < ma50 < ma200)
     if uptrend:
-        return "BUY", "Filters pass + uptrend."
-    if downtrend:
-        return "SELL", "Filters pass but trend down."
-    return "HOLD", "Filters pass, trend unclear."
+        score += 22
+        reasons.append("Uptrend (close > MA50 > MA200)")
+    elif downtrend:
+        score -= 22
+        reasons.append("Downtrend (close < MA50 < MA200)")
+    else:
+        reasons.append("Trend mixed (MA stack not aligned)")
+
+    # RSI band (soft)
+    if rsi < rsi_min:
+        score -= 10
+        reasons.append(f"RSI below min ({rsi:.1f} < {rsi_min:.0f})")
+    elif rsi > rsi_max:
+        score -= 10
+        reasons.append(f"RSI above max ({rsi:.1f} > {rsi_max:.0f})")
+    else:
+        score += 6
+        reasons.append(f"RSI in range ({rsi:.1f})")
+
+    # RVOL (soft)
+    if rvol < rvol_min:
+        score -= 10
+        reasons.append(f"RVOL low ({rvol:.2f} < {rvol_min:.2f})")
+    else:
+        score += 8
+        reasons.append(f"RVOL ok ({rvol:.2f})")
+
+    # Vol cap (soft)
+    if vol_ann > vol_max:
+        score -= 10
+        reasons.append(f"Vol high ({vol_ann:.2f} > {vol_max:.2f})")
+    else:
+        score += 6
+        reasons.append(f"Vol ok ({vol_ann:.2f})")
+
+    # Clamp and label
+    score = int(np.clip(score, 0, 100))
+    if score >= 70 and uptrend:
+        label = "BUY"
+        summary = "Favorable trend + filters mostly supportive."
+    elif score <= 30 and downtrend:
+        label = "SELL"
+        summary = "Bearish conditions dominate."
+    else:
+        label = "HOLD"
+        summary = "Mixed/neutral conditions (or filters not strong enough)."
+
+    return SignalScore(label, score, summary, reasons)
 
 
 def equity_and_drawdown_from_trades(trades: pd.DataFrame, start_equity: float = 100000.0):
-    """Best-effort equity curve from trades."""
     if trades is None or getattr(trades, "empty", True):
         return None, None
 
@@ -288,24 +398,27 @@ def equity_and_drawdown_from_trades(trades: pd.DataFrame, start_equity: float = 
 
     if "equity" in t.columns:
         eq = pd.to_numeric(t["equity"], errors="coerce").dropna()
-        eq.index = np.arange(len(eq))
     elif "pnl" in t.columns:
         pnl = pd.to_numeric(t["pnl"], errors="coerce").fillna(0.0)
         eq = start_equity + pnl.cumsum()
-        eq.index = np.arange(len(eq))
     elif ("pnl_per_share" in t.columns) and ("qty" in t.columns):
         pps = pd.to_numeric(t["pnl_per_share"], errors="coerce").fillna(0.0)
         qty = pd.to_numeric(t["qty"], errors="coerce").fillna(0.0)
         pnl = (pps * qty).astype("float64")
         eq = start_equity + pnl.cumsum()
-        eq.index = np.arange(len(eq))
 
     if eq is None or len(eq) < 2:
         return None, None
 
+    eq = eq.reset_index(drop=True)
     peak = eq.cummax()
     dd = (eq / peak) - 1.0
     return eq, dd
+
+
+def _bt_params_signature(**kwargs) -> str:
+    items = sorted((k, str(v)) for k, v in kwargs.items())
+    return "|".join([f"{k}={v}" for k, v in items])
 
 
 def _live_running(stream_obj) -> bool:
@@ -315,8 +428,17 @@ def _live_running(stream_obj) -> bool:
         return False
 
 
-def _live_msgs_to_df(rows: list[Any]) -> pd.DataFrame:
-    """Convert alpaca quote objects/dicts to a tidy dataframe."""
+def _stop_live_stream() -> None:
+    stream = st.session_state.get("live_stream")
+    try:
+        if stream is not None:
+            stream.stop()
+    except Exception:
+        pass
+    st.session_state["live_stream"] = None
+
+
+def _live_msgs_to_df(rows: List[Any]) -> pd.DataFrame:
     def to_dict(x: Any) -> dict:
         if isinstance(x, dict):
             return x
@@ -359,47 +481,83 @@ def _live_msgs_to_df(rows: list[Any]) -> pd.DataFrame:
     return df
 
 
-def _bt_params_signature(**kwargs) -> str:
-    # Stable-ish signature so we can tell when displayed trades match current params
-    items = sorted((k, str(v)) for k, v in kwargs.items())
-    return "|".join([f"{k}={v}" for k, v in items])
-
-
 # ---------------------------
-# Cached loader (stops hammering your API on reruns)
+# Data loading (Alpaca preferred; Yahoo fallback)
 # ---------------------------
 @st.cache_data(ttl=15 * 60, show_spinner=False)
-def _cached_load_historical(symbol: str, api_key: str, sec_key: str) -> pd.DataFrame:
+def _cached_load_alpaca(symbol: str, api_key: str, sec_key: str) -> pd.DataFrame:
     df, _dbg = load_historical(symbol, api_key, sec_key)
     return df
 
 
-def _load_and_prepare(symbol: str, api_key: str, sec_key: str) -> None:
+@st.cache_data(ttl=30 * 60, show_spinner=False)
+def _cached_load_yahoo(symbol: str, period: str = "5y", interval: str = "1d") -> pd.DataFrame:
+    if not YF_AVAILABLE:
+        raise RuntimeError("yfinance not installed. Add `yfinance` to requirements.")
+    t = yf.Ticker(symbol)
+    hist = t.history(period=period, interval=interval, auto_adjust=False)
+    if hist is None or hist.empty:
+        raise RuntimeError("Yahoo returned no data.")
+    hist = hist.rename(columns={c: c.lower() for c in hist.columns})
+    # yfinance index is timezone-aware sometimes; normalize later
+    hist = hist.reset_index().rename(columns={"Date": "timestamp", "Datetime": "timestamp"})
+    if "timestamp" not in hist.columns:
+        # last resort: if the index is dates
+        hist["timestamp"] = pd.to_datetime(hist.index)
+    return hist
+
+
+def _load_and_prepare(symbol: str, api_key: str, sec_key: str, yahoo_fallback: bool, yahoo_period: str) -> None:
     st.session_state["load_error"] = None
     st.session_state["ind_error"] = None
+    st.session_state["data_source"] = None
 
-    try:
-        df = _cached_load_historical(symbol, api_key, sec_key)
-    except Exception as e:
+    df: Optional[pd.DataFrame] = None
+    err_alpaca: Optional[str] = None
+
+    # Try Alpaca only if keys present
+    if has_keys(api_key, sec_key):
+        try:
+            df = _cached_load_alpaca(symbol, api_key, sec_key)
+            st.session_state["data_source"] = "Alpaca"
+        except Exception as e:
+            err_alpaca = f"{type(e).__name__}: {e}"
+            df = None
+
+    # Yahoo fallback if enabled and either no keys or alpaca failed
+    if df is None and yahoo_fallback:
+        try:
+            df = _cached_load_yahoo(symbol, period=yahoo_period, interval="1d")
+            st.session_state["data_source"] = "Yahoo"
+        except Exception as e:
+            st.session_state["load_error"] = f"{type(e).__name__}: {e}"
+            if err_alpaca:
+                st.session_state["load_error"] = f"Alpaca failed: {err_alpaca} | Yahoo failed: {st.session_state['load_error']}"
+            st.session_state["df_raw"] = None
+            st.session_state["df_chart"] = None
+            st.session_state["last_symbol"] = None
+            return
+
+    if df is None or getattr(df, "empty", True):
         st.session_state["df_raw"] = None
         st.session_state["df_chart"] = None
         st.session_state["last_symbol"] = None
-        st.session_state["sanity"] = None
-        st.session_state["load_error"] = f"{type(e).__name__}: {e}"
+        st.session_state["load_error"] = st.session_state.get("load_error") or (f"Alpaca failed: {err_alpaca}" if err_alpaca else "No data.")
         return
+
+    df = _ensure_ohlcv_cols(df)
 
     st.session_state["df_raw"] = df
     st.session_state["last_symbol"] = symbol
     st.session_state["last_loaded_at"] = pd.Timestamp.utcnow()
 
-    # sanity check
+    # sanity check (quiet): only store; don't spam UI
     try:
         st.session_state["sanity"] = sanity_check_bars(df) if df is not None else None
-    except Exception as e:
+    except Exception:
         st.session_state["sanity"] = None
-        st.session_state["load_error"] = f"Sanity check failed: {type(e).__name__}: {e}"
 
-    # normalize + indicators once
+    # normalize + indicators
     try:
         df_chart = _as_utc_dtindex(df)
         add_indicators_inplace(df_chart)
@@ -409,73 +567,52 @@ def _load_and_prepare(symbol: str, api_key: str, sec_key: str) -> None:
         st.session_state["ind_error"] = f"{type(e).__name__}: {e}"
 
 
-def _stop_live_stream() -> None:
-    stream = st.session_state.get("live_stream")
-    try:
-        if stream is not None:
-            stream.stop()
-    except Exception:
-        pass
-    st.session_state["live_stream"] = None
-
-
 # ---------------------------
-# Secrets (optional; only required for live + possibly your loader)
+# Secrets
 # ---------------------------
 api_key = st.secrets.get("ALPACA_KEY", "")
 sec_key = st.secrets.get("ALPACA_SECRET", "")
 
-st.title("📈 Modular Algorithmic Dashboard")
+
+# ---------------------------
+# Header
+# ---------------------------
+st.title("📈 Pro Algo Trader")
+st.caption("Clean UI • Modular indicators • Persistent backtests • Optional live quotes")
 
 
 # ---------------------------
-# Sidebar
+# Sidebar (clean + organized)
 # ---------------------------
 with st.sidebar:
-    st.header("Settings")
+    st.header("Controls")
 
-    # Inputs (no form-submit confusion)
     symbol = st.text_input("Ticker", value=ss_get("symbol", "AAPL")).upper().strip()
     horizon = st.number_input("Max hold (bars)", min_value=1, max_value=200, value=int(ss_get("horizon", 20)))
 
-    with st.expander("Advanced", expanded=False):
-        # Breakout-only ATR plan
+    with st.expander("Strategy", expanded=False):
         atr_entry = st.number_input("ATR entry (breakout)", 0.0, 10.0, float(ss_get("atr_entry", 1.0)), 0.1)
         atr_stop = st.number_input("ATR stop", 0.1, 20.0, float(ss_get("atr_stop", 2.0)), 0.1)
         atr_target = st.number_input("ATR target", 0.1, 50.0, float(ss_get("atr_target", 3.0)), 0.1)
 
-        # Filters
+        st.caption("Filters (soft-scored, not hard blocked):")
         rsi_min = st.number_input("RSI min", 0.0, 100.0, float(ss_get("rsi_min", 30.0)))
         rsi_max = st.number_input("RSI max", 0.0, 100.0, float(ss_get("rsi_max", 70.0)))
         rvol_min = st.number_input("RVOL min", 0.0, 10.0, float(ss_get("rvol_min", 1.2)))
         vol_max = st.number_input("Max annual vol", 0.0, 5.0, float(ss_get("vol_max", 1.0)))
 
-        include_spread_penalty = st.checkbox(
-            "Include spread penalty",
-            value=bool(ss_get("include_spread_penalty", True)),
-        )
-        assumed_spread_bps = st.number_input(
-            "Assumed spread (bps)",
-            0.0,
-            200.0,
-            float(ss_get("assumed_spread_bps", 5.0)),
-        )
+    with st.expander("Execution realism", expanded=False):
+        include_spread_penalty = st.checkbox("Include spread penalty", value=bool(ss_get("include_spread_penalty", True)))
+        assumed_spread_bps = st.number_input("Assumed spread (bps)", 0.0, 200.0, float(ss_get("assumed_spread_bps", 5.0)))
 
-        sr_lookback = st.number_input(
-            "Lookback low/high (bars)",
-            min_value=10,
-            max_value=300,
-            value=int(ss_get("sr_lookback", 50)),
-            step=5,
-        )
+    with st.expander("Charts", expanded=False):
+        sr_lookback = st.number_input("Lookback low/high (bars)", min_value=10, max_value=300, value=int(ss_get("sr_lookback", 50)), step=5)
+        chart_window = st.number_input("Chart window (bars)", min_value=120, max_value=3000, value=int(ss_get("chart_window", 700)), step=50)
 
-        chart_window = st.number_input(
-            "Chart window (bars)",
-            min_value=120,
-            max_value=3000,
-            value=int(ss_get("chart_window", 700)),
-            step=50,
-        )
+    with st.expander("Data source", expanded=False):
+        yahoo_fallback = st.toggle("Use Yahoo fallback (recommended)", value=bool(ss_get("yahoo_fallback", True)))
+        yahoo_period = st.selectbox("Yahoo history", options=["1y", "2y", "5y", "10y", "max"], index=["1y", "2y", "5y", "10y", "max"].index(str(ss_get("yahoo_period", "5y"))))
+        st.caption("If Alpaca load fails (or no keys), app can still run using Yahoo.")
 
     st.divider()
     c1, c2 = st.columns(2)
@@ -484,12 +621,11 @@ with st.sidebar:
 
     st.divider()
     if has_keys(api_key, sec_key):
-        st.caption("✅ Alpaca keys loaded (Live enabled)")
+        st.success("Alpaca keys detected (Live can work).")
     else:
-        st.caption("ℹ️ No Alpaca keys (Charts/Backtest still work; Live disabled)")
+        st.info("No Alpaca keys found in secrets. Live disabled, Yahoo can still load data.")
 
-
-# Persist user inputs
+# Persist inputs
 for k, v in {
     "symbol": symbol,
     "horizon": horizon,
@@ -504,6 +640,8 @@ for k, v in {
     "assumed_spread_bps": assumed_spread_bps,
     "sr_lookback": sr_lookback,
     "chart_window": chart_window,
+    "yahoo_fallback": yahoo_fallback,
+    "yahoo_period": yahoo_period,
 }.items():
     st.session_state[k] = v
 
@@ -517,16 +655,17 @@ needs_load = (
     or (st.session_state.get("last_symbol") != symbol)
 )
 
-# If ticker changes while live stream is running, stop it (prevents streaming wrong symbol)
+# If ticker changes while live stream is running, stop it (prevents wrong symbol)
 if st.session_state.get("live_stream") is not None and st.session_state.get("live_last_symbol") != symbol:
     _stop_live_stream()
 
 if needs_load:
-    with st.spinner(f"Loading {symbol}..."):
-        _load_and_prepare(symbol, api_key, sec_key)
+    with st.spinner(f"Loading {symbol}…"):
+        _load_and_prepare(symbol, api_key, sec_key, yahoo_fallback=bool(yahoo_fallback), yahoo_period=str(yahoo_period))
 
 df_raw = st.session_state.get("df_raw")
 df_chart = st.session_state.get("df_chart")
+data_source = st.session_state.get("data_source") or "—"
 
 if df_raw is None or getattr(df_raw, "empty", True):
     st.error(f"Could not load data for {symbol}.")
@@ -544,10 +683,10 @@ df_plot = _tail_for_plot(df_chart, int(chart_window))
 
 
 # ---------------------------
-# Tabs
+# Tabs (cleaner set)
 # ---------------------------
 tab_signal, tab_charts, tab_backtest, tab_live = st.tabs(
-    ["✅ Signal", "📈 Charts", "🧪 Backtest", "📡 Live"]
+    ["✅ Signal", "📊 Charts", "🧪 Backtest", "📡 Live"]
 )
 
 
@@ -555,37 +694,30 @@ tab_signal, tab_charts, tab_backtest, tab_live = st.tabs(
 # Signal tab
 # ---------------------------
 with tab_signal:
-    if st.session_state.get("ind_error"):
-        st.warning("Some indicators failed to compute. Signals may be limited.")
-        st.caption(st.session_state["ind_error"])
+    top = st.container(border=True)
+    with top:
+        left, right = st.columns([2, 1], vertical_alignment="center")
+        with left:
+            st.subheader(f"{symbol} — Signal")
+            st.caption(f"Data source: **{data_source}** • Last load: {st.session_state.get('last_loaded_at')}")
+        with right:
+            if st.session_state.get("ind_error"):
+                st.warning("Some indicators failed; signal may be degraded.")
 
+    # Jump warning (kept, but minimal)
     jump = detect_big_jump(df_chart, thresh=0.18)
     if jump:
-        st.warning("Large price jump detected (possible corporate action / data issue).")
+        st.warning("Large price jump detected (possible split/corporate action/data issue).")
         st.caption(f"Max |close-to-close| move: {jump['abs_move']:.1%} at {jump['ts']}")
 
-    sanity = st.session_state.get("sanity")
-    if isinstance(sanity, dict):
-        # Keep this conservative: only show keys that clearly indicate problems
-        flagged = []
-        for k, v in sanity.items():
-            if isinstance(v, bool) and v:
-                flagged.append(k)
-            elif isinstance(v, (list, tuple, set)) and len(v) > 0:
-                flagged.append(k)
-            elif isinstance(v, str) and v.strip():
-                flagged.append(k)
-        if flagged:
-            st.info("Data quality checks flagged potential issues.")
-            st.caption(" • ".join(flagged[:12]))
-
-    rec, why = compute_recommendation(
+    score = compute_signal_score(
         df_chart,
         rsi_min=float(rsi_min),
         rsi_max=float(rsi_max),
         rvol_min=float(rvol_min),
         vol_max=float(vol_max),
     )
+
     plan = compute_trade_plan_breakout(
         df_chart,
         atr_entry=float(atr_entry),
@@ -596,37 +728,62 @@ with tab_signal:
     )
 
     lo, hi = compute_lookback_low_high(df_chart, int(sr_lookback))
-
-    st.subheader(f"{symbol} — Recommendation")
-    if rec == "BUY":
-        st.success(f"**BUY** — {why}")
-    elif rec == "SELL":
-        st.error(f"**SELL** — {why}")
-    else:
-        st.info(f"**HOLD** — {why}")
-
     last = df_chart.iloc[-1]
     close = _safe_float(last.get("close", np.nan))
     rsi = _safe_float(last.get("rsi14", np.nan))
     rvol = _safe_float(last.get("rvol", np.nan))
     vol_ann = _safe_float(last.get("vol_ann", np.nan))
+    atr14 = _safe_float(last.get("atr14", np.nan))
 
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Close", f"{close:.2f}" if np.isfinite(close) else "—")
-    m2.metric("Lookback Low", f"{lo:.2f}" if np.isfinite(lo) else "—")
-    m3.metric("Lookback High", f"{hi:.2f}" if np.isfinite(hi) else "—")
-    m4.metric("RSI", f"{rsi:.1f}" if np.isfinite(rsi) else "—")
-    m5.metric("RVOL", f"{rvol:.2f}" if np.isfinite(rvol) else "—")
+    # Hero banner
+    hero = st.container(border=True)
+    with hero:
+        a, b, c = st.columns([1.2, 1, 1], vertical_alignment="center")
+        with a:
+            if score.label == "BUY":
+                st.success(f"**BUY** • Score {score.score}/100")
+            elif score.label == "SELL":
+                st.error(f"**SELL** • Score {score.score}/100")
+            elif score.label == "WAIT":
+                st.warning(f"**WAIT** • Score {score.score}/100")
+            else:
+                st.info(f"**HOLD** • Score {score.score}/100")
+            st.caption(score.summary)
 
-    e1, e2, e3, e4, e5 = st.columns(5)
-    e1.metric("Planned entry", f"{plan['entry']:.2f}" if np.isfinite(plan.get("entry", np.nan)) else "—")
-    e2.metric("Stop", f"{plan['stop']:.2f}" if np.isfinite(plan.get("stop", np.nan)) else "—")
-    e3.metric("Target", f"{plan['target']:.2f}" if np.isfinite(plan.get("target", np.nan)) else "—")
-    rr = plan.get("rr", np.nan)
-    e4.metric("R:R", f"{rr:.2f}" if np.isfinite(rr) else "—")
-    e5.metric("Ann. Vol", f"{vol_ann:.2f}" if np.isfinite(vol_ann) else "—")
+        with b:
+            st.metric("Close", f"{close:.2f}" if np.isfinite(close) else "—")
+            st.metric("ATR(14)", f"{atr14:.3f}" if np.isfinite(atr14) else "—")
+        with c:
+            rr = plan.get("rr", np.nan)
+            st.metric("Planned Entry", f"{plan['entry']:.2f}" if np.isfinite(plan.get("entry", np.nan)) else "—")
+            st.metric("R:R", f"{rr:.2f}" if np.isfinite(rr) else "—")
 
-    st.caption("Plan: Breakout-only (no pullback mode).")
+    # Metrics grid
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1.metric("Lookback Low", f"{lo:.2f}" if np.isfinite(lo) else "—")
+    m2.metric("Lookback High", f"{hi:.2f}" if np.isfinite(hi) else "—")
+    m3.metric("RSI", f"{rsi:.1f}" if np.isfinite(rsi) else "—")
+    m4.metric("RVOL", f"{rvol:.2f}" if np.isfinite(rvol) else "—")
+    m5.metric("Ann. Vol", f"{vol_ann:.2f}" if np.isfinite(vol_ann) else "—")
+    m6.metric("Data", data_source)
+
+    # Plan details
+    st.divider()
+    p = st.container(border=True)
+    with p:
+        st.subheader("Breakout Plan (ATR-based)")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Entry", f"{plan['entry']:.2f}" if np.isfinite(plan.get("entry", np.nan)) else "—")
+        c2.metric("Stop", f"{plan['stop']:.2f}" if np.isfinite(plan.get("stop", np.nan)) else "—")
+        c3.metric("Target", f"{plan['target']:.2f}" if np.isfinite(plan.get("target", np.nan)) else "—")
+        c4.metric("Assumed spread (bps)", f"{assumed_spread_bps:.1f}" if include_spread_penalty else "0.0")
+
+        st.caption(f"Mode: {plan.get('entry_type','—')} • Multiples: entry={atr_entry:.2f}×ATR, stop={atr_stop:.2f}×ATR, target={atr_target:.2f}×ATR")
+
+    # Reasons (clean, not spammy)
+    with st.expander("Why this score?", expanded=False):
+        for r in score.reasons[:10]:
+            st.write(f"• {r}")
 
 
 # ---------------------------
@@ -634,34 +791,29 @@ with tab_signal:
 # ---------------------------
 with tab_charts:
     st.subheader(f"{symbol} — Charts")
-    cols_to_plot = [c for c in ["close", "ma50", "ma200"] if c in df_plot.columns]
-    if not cols_to_plot:
-        cols_to_plot = ["close"] if "close" in df_plot.columns else list(df_plot.columns[:1])
+    st.caption("Candles + moving averages, plus key indicators.")
 
-    st.plotly_chart(
-        plot_lines(df_plot, cols_to_plot, title=f"{symbol} Price + MAs", height=420),
-        use_container_width=True,
-    )
+    st.plotly_chart(plot_price(df_plot, symbol), use_container_width=True)
 
     c1, c2, c3 = st.columns(3, gap="large")
     with c1:
         if "rsi14" in df_plot.columns:
-            st.plotly_chart(
-                plot_indicator(df_plot, "rsi14", title="RSI(14)", height=240, hlines=[30, 70], y0=0, y1=100),
-                use_container_width=True,
-            )
+            st.plotly_chart(plot_indicator(df_plot, "rsi14", "RSI(14)", height=260, hlines=[30, 70], y0=0, y1=100), use_container_width=True)
+        else:
+            st.info("RSI not available.")
     with c2:
         if "rvol" in df_plot.columns:
-            st.plotly_chart(
-                plot_indicator(df_plot, "rvol", title="RVOL", height=240, hlines=[1.0]),
-                use_container_width=True,
-            )
+            st.plotly_chart(plot_indicator(df_plot, "rvol", "RVOL", height=260, hlines=[1.0]), use_container_width=True)
+        else:
+            st.info("RVOL not available.")
     with c3:
         if "vol_ann" in df_plot.columns:
-            st.plotly_chart(
-                plot_indicator(df_plot, "vol_ann", title="Annualized Vol", height=240),
-                use_container_width=True,
-            )
+            st.plotly_chart(plot_indicator(df_plot, "vol_ann", "Annualized Volatility", height=260), use_container_width=True)
+        else:
+            st.info("Volatility not available.")
+
+    with st.expander("Data preview", expanded=False):
+        st.dataframe(df_plot.tail(120), use_container_width=True, height=420)
 
 
 # ---------------------------
@@ -669,6 +821,7 @@ with tab_charts:
 # ---------------------------
 with tab_backtest:
     st.subheader("Backtest (Breakout-only)")
+    st.caption("Runs using your `utils.backtester.backtest_strategy()` and persists results across reruns.")
 
     bt_params = dict(
         symbol=symbol,
@@ -687,10 +840,10 @@ with tab_backtest:
 
     if run_backtest_btn:
         st.session_state["bt_error"] = None
-        with st.spinner("Running backtest..."):
+        with st.spinner("Running backtest…"):
             try:
                 results, trades = backtest_strategy(
-                    df=df_chart,               # use same normalized df as signals
+                    df=df_chart,
                     market_df=None,
                     horizon=int(horizon),
                     mode="breakout",
@@ -731,6 +884,7 @@ with tab_backtest:
 
         t = trades.copy()
 
+        # Win rate
         win_rate = np.nan
         if "pnl_per_share" in t.columns:
             p = pd.to_numeric(t["pnl_per_share"], errors="coerce")
@@ -739,22 +893,26 @@ with tab_backtest:
             p = pd.to_numeric(t["pnl"], errors="coerce")
             win_rate = float((p > 0).sum()) / max(1, len(p))
 
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Trades", f"{len(t)}")
-        c2.metric("Win rate", f"{win_rate:.1%}" if np.isfinite(win_rate) else "—")
+        # Summary cards
+        wrap = st.container(border=True)
+        with wrap:
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Trades", f"{len(t)}")
+            c2.metric("Win rate", f"{win_rate:.1%}" if np.isfinite(win_rate) else "—")
 
-        if isinstance(results, dict):
-            total_ret = _safe_float(results.get("total_return", np.nan))
-            sharpe = _safe_float(results.get("sharpe", np.nan))
-            maxdd = _safe_float(results.get("max_drawdown", np.nan))
-            c3.metric("Total return", f"{total_ret:.1%}" if np.isfinite(total_ret) else "—")
-            c4.metric("Max drawdown", f"{maxdd:.1%}" if np.isfinite(maxdd) else "—")
-            if np.isfinite(sharpe):
-                st.caption(f"Sharpe (if provided by backtester): {sharpe:.2f}")
-        else:
-            c3.metric("Total return", "—")
-            c4.metric("Max drawdown", "—")
+            if isinstance(results, dict):
+                total_ret = _safe_float(results.get("total_return", np.nan))
+                sharpe = _safe_float(results.get("sharpe", np.nan))
+                maxdd = _safe_float(results.get("max_drawdown", np.nan))
+                c3.metric("Total return", f"{total_ret:.1%}" if np.isfinite(total_ret) else "—")
+                c4.metric("Max drawdown", f"{maxdd:.1%}" if np.isfinite(maxdd) else "—")
+                if np.isfinite(sharpe):
+                    st.caption(f"Sharpe (if provided): {sharpe:.2f}")
+            else:
+                c3.metric("Total return", "—")
+                c4.metric("Max drawdown", "—")
 
+        # Equity + DD
         eq, dd = equity_and_drawdown_from_trades(t, start_equity=100000.0)
         if eq is not None and dd is not None:
             st.plotly_chart(
@@ -763,6 +921,7 @@ with tab_backtest:
                     height=320,
                     margin=dict(l=10, r=10, t=45, b=10),
                     hovermode="x unified",
+                    showlegend=False,
                 ),
                 use_container_width=True,
             )
@@ -772,42 +931,39 @@ with tab_backtest:
                     height=260,
                     margin=dict(l=10, r=10, t=45, b=10),
                     hovermode="x unified",
+                    showlegend=False,
                 ),
                 use_container_width=True,
             )
 
         st.divider()
-        st.dataframe(t, use_container_width=True, height=520)
+        st.dataframe(t, use_container_width=True, height=560)
 
 
 # ---------------------------
-# Live tab (Start/Stop + tidy quote table)
+# Live tab
 # ---------------------------
 with tab_live:
     st.subheader("Live Quotes")
+    st.caption("Requires Alpaca keys and a working `utils.live_stream.RealtimeStream`.")
 
     if not LIVE_AVAILABLE:
         st.info("Live module not available (or import failed).")
     elif not has_keys(api_key, sec_key):
-        st.info("Live is disabled because Alpaca keys are missing.")
+        st.info("Live is disabled because Alpaca keys are missing in Streamlit secrets.")
     else:
         stream = st.session_state.get("live_stream")
         live_running = _live_running(stream)
 
-        a, b, c, d = st.columns([1, 1, 1, 2])
+        a, b, c, d = st.columns([1, 1, 1, 2], vertical_alignment="center")
         start_clicked = a.button("▶ Start", use_container_width=True, disabled=live_running)
         stop_clicked = b.button("⏹ Stop", use_container_width=True, disabled=not live_running)
         clear_clicked = c.button("🧹 Clear", use_container_width=True)
-
-        st.session_state["live_autorefresh"] = d.toggle(
-            "Auto refresh",
-            value=bool(st.session_state.get("live_autorefresh", True)),
-        )
+        st.session_state["live_autorefresh"] = d.toggle("Auto refresh", value=bool(st.session_state.get("live_autorefresh", True)))
 
         if clear_clicked:
             st.session_state["live_rows"] = []
 
-        # Start / Stop
         if start_clicked and not live_running:
             try:
                 stream = RealtimeStream(api_key, sec_key, symbol)
@@ -834,7 +990,7 @@ with tab_live:
                 new_msgs = []
             if new_msgs:
                 st.session_state["live_rows"].extend(new_msgs)
-                st.session_state["live_rows"] = st.session_state["live_rows"][-500:]
+                st.session_state["live_rows"] = st.session_state["live_rows"][-600:]
 
         st.caption("Status: ✅ running" if live_running else "Status: ⏸ stopped")
 
@@ -844,12 +1000,10 @@ with tab_live:
         else:
             df_live = _live_msgs_to_df(rows)
 
-            # If schema changes, don't silently hide it
             if df_live.empty:
-                st.info("Received live messages, but couldn't parse them into a table.")
-                st.write(rows[-5:])
+                st.warning("Received live messages, but couldn't parse them into a table.")
+                st.write("Last raw message:", rows[-1])
             else:
-                # Snapshot metrics
                 latest = df_live.tail(1)
                 if not latest.empty and ("bid_price" in latest.columns) and ("ask_price" in latest.columns):
                     lbid = _safe_float(pd.to_numeric(latest["bid_price"], errors="coerce").iloc[0])
@@ -863,18 +1017,13 @@ with tab_live:
                     m2.metric("Ask", f"{lask:.4f}" if np.isfinite(lask) else "—")
                     m3.metric("Spread (bps)", f"{lsp_bps:.1f}" if np.isfinite(lsp_bps) else "—")
 
-                show_cols = [
-                    c for c in
-                    ["timestamp", "symbol", "bid_price", "ask_price", "mid", "spread_bps", "bid_size", "ask_size", "message"]
-                    if c in df_live.columns
-                ]
+                show_cols = [c for c in ["timestamp", "symbol", "bid_price", "ask_price", "mid", "spread_bps", "bid_size", "ask_size", "message"] if c in df_live.columns]
                 sort_col = "timestamp" if "timestamp" in df_live.columns else None
-                view = df_live.sort_values(sort_col).tail(120) if sort_col else df_live.tail(120)
-                st.dataframe(view[show_cols] if show_cols else view, use_container_width=True, height=460)
+                view = df_live.sort_values(sort_col).tail(140) if sort_col else df_live.tail(140)
+                st.dataframe(view[show_cols] if show_cols else view, use_container_width=True, height=520)
 
-        # Smooth refresh (community component if installed)
         if live_running and bool(st.session_state.get("live_autorefresh", True)):
             if st_autorefresh is not None:
-                st_autorefresh(interval=750, key=f"live_refresh_{symbol}")
+                st_autorefresh(interval=800, key=f"live_refresh_{symbol}")
             else:
-                st.caption("Tip: install `streamlit-autorefresh` to enable auto-refresh without manual reruns.")
+                st.caption("Tip: install `streamlit-autorefresh` to auto-refresh without manual reruns.")
