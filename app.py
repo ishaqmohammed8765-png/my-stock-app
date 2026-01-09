@@ -17,6 +17,10 @@ Background defaults (safe):
 - Backtest: entry next-day open, slippage 5 bps, commission $0
 - Rate limit 429 backoff
 - Websocket cleanup via atexit
+
+Auto-refresh:
+- Uses streamlit-autorefresh if installed
+- Falls back to safe throttled sleep+rerrun if not
 """
 
 from __future__ import annotations
@@ -36,6 +40,13 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from scipy import stats
+
+# Optional best UX auto-refresh (install: streamlit-autorefresh)
+try:
+    from streamlit_autorefresh import st_autorefresh  # type: ignore
+    HAS_ST_AUTOR = True
+except Exception:
+    HAS_ST_AUTOR = False
 
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.live import StockDataStream
@@ -190,6 +201,26 @@ def is_rate_limit_error(e: Exception) -> bool:
 
 def backoff_seconds(attempt: int) -> float:
     return float(min(2 ** attempt, 30))
+
+
+def live_autorefresh(interval_ms: int, key: str = "live_refresh") -> None:
+    """
+    Best-effort auto-refresh:
+    - Prefer streamlit-autorefresh if installed (smooth, non-blocking)
+    - Otherwise throttle with time + a short sleep then st.rerun()
+    """
+    if HAS_ST_AUTOR:
+        st_autorefresh(interval=interval_ms, key=key)
+        return
+
+    now = time.monotonic()
+    last = st.session_state.get("_last_live_refresh", 0.0)
+    due = (now - last) >= (interval_ms / 1000.0)
+
+    if due:
+        st.session_state["_last_live_refresh"] = now
+        time.sleep(interval_ms / 1000.0)
+        st.rerun()
 
 
 # =========================
@@ -764,6 +795,7 @@ def init_state() -> None:
         "ws_thread": None,
         "last_error": "",
         "debug": {},
+        "_last_live_refresh": 0.0,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -840,6 +872,21 @@ if load_btn:
     stop_live()
     st.session_state.last_error = ""
     st.session_state.debug = {}
+    st.session_state._last_live_refresh = 0.0
+
+    # Clear live buffers so old ticker data doesn't linger
+    st.session_state.trade_history = []
+    st.session_state.quote_history = []
+    while not st.session_state.trade_q.empty():
+        try:
+            st.session_state.trade_q.get_nowait()
+        except Exception:
+            break
+    while not st.session_state.quote_q.empty():
+        try:
+            st.session_state.quote_q.get_nowait()
+        except Exception:
+            break
 
     with st.spinner(f"Loading {ticker}..."):
         df, dbg = load_historical(ticker, st.session_state.api_key, st.session_state.secret_key)
@@ -903,8 +950,14 @@ if live_btn:
         st.session_state.live_active = True
     st.rerun()
 
+# ---- Live heartbeat + auto-refresh (best approach)
 if st.session_state.live_active:
-    st.autorefresh(interval=AUTO_REFRESH_MS, key="live_refresh")
+    thr = st.session_state.ws_thread
+    if thr is None or (hasattr(thr, "is_alive") and not thr.is_alive()):
+        stop_live()
+        st.warning("Live feed stopped (connection closed).")
+    else:
+        live_autorefresh(AUTO_REFRESH_MS, key="live_refresh")
 
 # ---- Drain live data
 drain(st.session_state.trade_q, st.session_state.trade_history, MAX_TRADES)
