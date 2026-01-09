@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import plotly.graph_objects as go
 
 from utils.data_loader import load_historical, sanity_check_bars
 from utils.indicators import add_indicators_inplace
@@ -30,20 +31,17 @@ st.set_page_config(
 st.markdown(
     """
 <style>
-/* Tighten spacing a bit */
+/* Tighten overall page spacing */
 .block-container { padding-top: 1.2rem; padding-bottom: 1.5rem; }
 [data-testid="stSidebar"] .block-container { padding-top: 1rem; }
 h1 { margin-bottom: 0.5rem; }
 h2, h3 { margin-top: 0.6rem; }
 
-/* Make metrics/cards feel tighter */
-[data-testid="stMetric"] { padding: 0.2rem 0.2rem; }
-
-/* Reduce expander padding slightly */
+/* Reduce expander spacing a little */
 [data-testid="stExpander"] details { padding: 0.25rem 0; }
 
-/* Remove some extra space under chart containers */
-div[data-testid="stVerticalBlock"] > div:has(> div[data-testid="stArrowVegaLiteChart"]) { margin-bottom: 0.25rem; }
+/* Slightly tighten metric padding */
+[data-testid="stMetric"] { padding: 0.2rem 0.2rem; }
 </style>
 """,
     unsafe_allow_html=True,
@@ -61,6 +59,73 @@ def ss_get(name, default):
     return st.session_state.get(name, default)
 
 
+def _nice_index(df: pd.DataFrame) -> pd.Series:
+    """Use df.index for x-axis (works for datetime index or int)."""
+    return df.index
+
+
+def plot_lines(
+    df: pd.DataFrame,
+    cols: list[str],
+    *,
+    title: str,
+    height: int = 360,
+) -> "go.Figure":
+    x = _nice_index(df)
+
+    fig = go.Figure()
+    for c in cols:
+        if c in df.columns:
+            fig.add_trace(go.Scatter(x=x, y=df[c], mode="lines", name=c))
+
+    fig.update_layout(
+        title=title,
+        height=height,
+        margin=dict(l=10, r=10, t=45, b=10),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        hovermode="x unified",
+    )
+    fig.update_xaxes(showgrid=False)
+    fig.update_yaxes(showgrid=True)
+    return fig
+
+
+def plot_indicator_band(
+    df: pd.DataFrame,
+    col: str,
+    *,
+    title: str,
+    height: int = 240,
+    y0: float | None = None,
+    y1: float | None = None,
+    hlines: list[float] | None = None,
+) -> "go.Figure":
+    x = _nice_index(df)
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=x, y=df[col], mode="lines", name=col))
+
+    # Optional horizontal reference lines (e.g., RSI 30/70)
+    if hlines:
+        for v in hlines:
+            fig.add_hline(y=float(v), line_width=1)
+
+    fig.update_layout(
+        title=title,
+        height=height,
+        margin=dict(l=10, r=10, t=45, b=10),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        hovermode="x unified",
+    )
+    fig.update_xaxes(showgrid=False)
+    fig.update_yaxes(showgrid=True)
+
+    if y0 is not None and y1 is not None:
+        fig.update_yaxes(range=[float(y0), float(y1)])
+
+    return fig
+
+
 # ---------------------------
 # Secrets (no manual key entry)
 # ---------------------------
@@ -71,12 +136,11 @@ st.title("📈 Modular Algorithmic Dashboard")
 
 
 # ---------------------------
-# Sidebar (tight + grouped)
+# Sidebar (tight + grouped via form)
 # ---------------------------
 with st.sidebar:
     st.header("Settings")
 
-    # Use a form so the UI doesn't look scattered and actions feel consistent
     with st.form("settings_form", clear_on_submit=False):
         symbol = st.text_input("Stock Symbol", value=ss_get("symbol", "AAPL")).upper().strip()
 
@@ -99,7 +163,9 @@ with st.sidebar:
 
             cooldown_bars = st.number_input("Cooldown bars", 0, 200, int(ss_get("cooldown_bars", 5)))
 
-            include_spread_penalty = st.checkbox("Include spread penalty", value=bool(ss_get("include_spread_penalty", True)))
+            include_spread_penalty = st.checkbox(
+                "Include spread penalty", value=bool(ss_get("include_spread_penalty", True))
+            )
             assumed_spread_bps = st.number_input("Assumed spread (bps)", 0.0, 200.0, float(ss_get("assumed_spread_bps", 5.0)))
 
             start_equity = st.number_input(
@@ -116,7 +182,6 @@ with st.sidebar:
             )
 
         st.divider()
-
         b1, b2 = st.columns(2)
         with b1:
             load_btn = st.form_submit_button("🔄 Load/Refresh", use_container_width=True)
@@ -132,7 +197,7 @@ with st.sidebar:
 
 
 # ---------------------------
-# Block if no keys (since loader uses Alpaca)
+# Block if no keys (since your loader uses Alpaca)
 # ---------------------------
 if not has_keys(api_key, sec_key):
     st.stop()
@@ -201,6 +266,9 @@ if df is None or getattr(df, "empty", True):
 
 # Prep indicators for dashboard charts (use copy)
 df_chart = df.copy()
+if isinstance(df_chart.index, pd.DatetimeIndex):
+    df_chart = df_chart.sort_index()
+
 try:
     add_indicators_inplace(df_chart)
 except Exception as e:
@@ -215,20 +283,19 @@ tab1, tab2, tab3 = st.tabs(["📊 Dashboard", "🧪 Backtest", "📡 Live"])
 
 
 # ---------------------------
-# Tab 1: Dashboard
+# Tab 1: Dashboard (Plotly)
 # ---------------------------
 with tab1:
     left, right = st.columns([2.2, 1.0], gap="large")
 
     with left:
         st.subheader(f"{symbol} — Price & Trend")
-
         cols_to_plot = [c for c in ["close", "ma50", "ma200"] if c in df_chart.columns]
         if not cols_to_plot:
             cols_to_plot = ["close"] if "close" in df_chart.columns else list(df_chart.columns[:1])
 
-        # Smaller, consistent height helps a lot
-        st.line_chart(df_chart[cols_to_plot], height=360)
+        fig_price = plot_lines(df_chart, cols_to_plot, title=f"{symbol} Price + Moving Averages", height=380)
+        st.plotly_chart(fig_price, use_container_width=True)
 
     with right:
         st.subheader("Data integrity")
@@ -251,24 +318,47 @@ with tab1:
     st.divider()
 
     c1, c2, c3 = st.columns(3, gap="large")
+
     with c1:
         st.subheader("RSI(14)")
         if "rsi14" in df_chart.columns:
-            st.line_chart(df_chart[["rsi14"]], height=220)
+            fig_rsi = plot_indicator_band(
+                df_chart,
+                "rsi14",
+                title="RSI(14)",
+                height=240,
+                y0=0,
+                y1=100,
+                hlines=[30, 70],
+            )
+            st.plotly_chart(fig_rsi, use_container_width=True)
         else:
             st.caption("RSI not available.")
 
     with c2:
         st.subheader("RVOL")
         if "rvol" in df_chart.columns:
-            st.line_chart(df_chart[["rvol"]], height=220)
+            fig_rvol = plot_indicator_band(
+                df_chart,
+                "rvol",
+                title="Relative Volume (RVOL)",
+                height=240,
+                hlines=[1.0],
+            )
+            st.plotly_chart(fig_rvol, use_container_width=True)
         else:
             st.caption("RVOL not available.")
 
     with c3:
         st.subheader("Ann. Vol (proxy)")
         if "vol_ann" in df_chart.columns:
-            st.line_chart(df_chart[["vol_ann"]], height=220)
+            fig_vol = plot_indicator_band(
+                df_chart,
+                "vol_ann",
+                title="Annualized Volatility (proxy)",
+                height=240,
+            )
+            st.plotly_chart(fig_vol, use_container_width=True)
         else:
             st.caption("Vol proxy not available.")
 
