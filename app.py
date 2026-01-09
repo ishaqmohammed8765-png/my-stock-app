@@ -1,5 +1,5 @@
 """
-Trading Dashboard Pro — Simple UI (No Advanced)
+Trading Dashboard Pro — Simple UI (No Advanced) + RSI + Market Regime + RVOL
 Educational only. Not financial advice.
 
 Minimal controls:
@@ -18,9 +18,10 @@ Background defaults (safe):
 - Rate limit 429 backoff
 - Websocket cleanup via atexit
 
-Auto-refresh:
-- Uses streamlit-autorefresh if installed
-- Falls back to safe throttled sleep+rerrun if not
+Added strategy logic (no UI complexity):
+- RSI(14) filter/penalty (soft, score-based)
+- Market regime filter using QQQ (or SPY fallback): if index < MA200, downgrade score
+- RVOL (relative volume) check: last completed day volume / 20-day avg volume
 """
 
 from __future__ import annotations
@@ -100,6 +101,10 @@ MAX_RISK_PCT = 0.02   # 2% of equity max risk per trade
 SLIPPAGE_BPS = 5
 COMMISSION = 0.0
 
+# Market regime reference ticker (simple default)
+REGIME_TICKER_PRIMARY = "QQQ"
+REGIME_TICKER_FALLBACK = "SPY"
+
 
 # =========================
 # MODELS
@@ -123,6 +128,10 @@ class TradeMetrics:
     risk_per_share: float
     cap_alloc_qty: int
     cap_risk_qty: int
+
+    # Strategy extras
+    rsi14: float
+    rvol: float
 
 
 @dataclass(frozen=True)
@@ -204,11 +213,7 @@ def backoff_seconds(attempt: int) -> float:
 
 
 def live_autorefresh(interval_ms: int, key: str = "live_refresh") -> None:
-    """
-    Best-effort auto-refresh:
-    - Prefer streamlit-autorefresh if installed (smooth, non-blocking)
-    - Otherwise throttle with time + a short sleep then st.rerun()
-    """
+    """Best-effort auto-refresh."""
     if HAS_ST_AUTOR:
         st_autorefresh(interval=interval_ms, key=key)
         return
@@ -216,11 +221,27 @@ def live_autorefresh(interval_ms: int, key: str = "live_refresh") -> None:
     now = time.monotonic()
     last = st.session_state.get("_last_live_refresh", 0.0)
     due = (now - last) >= (interval_ms / 1000.0)
-
     if due:
         st.session_state["_last_live_refresh"] = now
         time.sleep(interval_ms / 1000.0)
         st.rerun()
+
+
+def last_completed_index(df: pd.DataFrame) -> int:
+    """
+    Alpaca daily bars can include today's partial bar.
+    If last bar date is today (UTC), use previous bar for RSI/RVOL stability.
+    """
+    if df is None or df.empty:
+        return -1
+    try:
+        ts = df["timestamp"].iloc[-1]
+        dt = parse_ts(ts)
+        if dt.date() >= datetime.utcnow().date() and len(df) >= 2:
+            return -2
+    except Exception:
+        pass
+    return -1
 
 
 # =========================
@@ -356,7 +377,7 @@ def _bars_to_df(bars_obj: Any) -> Optional[pd.DataFrame]:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_historical(ticker: str, api_key: str, secret_key: str,
-                    days_back: int = 260) -> Tuple[Optional[pd.DataFrame], Dict[str, Any]]:
+                    days_back: int = 360) -> Tuple[Optional[pd.DataFrame], Dict[str, Any]]:
     dbg: Dict[str, Any] = {"ticker": ticker, "feed": BARS_FEED, "steps": []}
 
     ticker = (ticker or "").upper().strip()
@@ -433,7 +454,7 @@ def load_historical(ticker: str, api_key: str, secret_key: str,
         return None, dbg
 
     df = df.sort_values("timestamp").reset_index(drop=True)
-    if len(df) < 30:
+    if len(df) < 60:
         dbg["error"] = f"Too few rows ({len(df)})"
         return None, dbg
 
@@ -572,6 +593,69 @@ def max_drawdown(cumret: np.ndarray) -> float:
     return m if np.isfinite(m) else 0.0
 
 
+def rsi14_from_close(df: pd.DataFrame) -> float:
+    """Classic RSI(14) using Wilder smoothing approximation (EMA-like)."""
+    if df is None or df.empty or len(df) < 20:
+        return 50.0
+    i = last_completed_index(df)
+    closes = df["close"].astype(float).values
+    if len(closes) < 20:
+        return 50.0
+    # Use data up to completed bar
+    closes = closes[: i + 1] if i != -1 else closes
+    if len(closes) < 20:
+        return 50.0
+
+    delta = np.diff(closes)
+    up = np.where(delta > 0, delta, 0.0)
+    down = np.where(delta < 0, -delta, 0.0)
+
+    # Wilder smoothing using EMA(alpha=1/14)
+    period = 14
+    roll_up = pd.Series(up).ewm(alpha=1/period, adjust=False).mean()
+    roll_down = pd.Series(down).ewm(alpha=1/period, adjust=False).mean()
+
+    rs = roll_up.iloc[-1] / (roll_down.iloc[-1] + 1e-12)
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    if not np.isfinite(rsi):
+        return 50.0
+    return float(clamp(rsi, 0.0, 100.0))
+
+
+def rvol_20(df: pd.DataFrame) -> float:
+    """Relative volume: last completed day volume / 20-day avg volume."""
+    if df is None or df.empty or len(df) < 25:
+        return 1.0
+    i = last_completed_index(df)
+    vol = df["volume"].astype(float)
+    if i == -2:
+        last_vol = float(vol.iloc[-2])
+        avg = float(vol.iloc[-22:-2].mean()) if len(vol) >= 22 else float(vol.mean())
+    else:
+        last_vol = float(vol.iloc[-1])
+        avg = float(vol.iloc[-21:-1].mean()) if len(vol) >= 21 else float(vol.mean())
+    if avg <= 0:
+        return 1.0
+    rvol = last_vol / avg
+    return float(max(0.0, rvol))
+
+
+def market_regime(index_df: Optional[pd.DataFrame]) -> Tuple[bool, float, float]:
+    """
+    Returns (risk_on, index_close, index_ma200).
+    risk_on True if index close >= MA200.
+    """
+    if index_df is None or index_df.empty or len(index_df) < 210:
+        return True, 0.0, 0.0  # treat as neutral/risk-on if unavailable
+    i = last_completed_index(index_df)
+    closes = index_df["close"].astype(float)
+    close = float(closes.iloc[i])
+    ma200 = float(closes.rolling(200).mean().iloc[i])
+    if not np.isfinite(ma200) or ma200 <= 0:
+        return True, close, ma200
+    return (close >= ma200), close, ma200
+
+
 def backtest(df: pd.DataFrame, horizon: int) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
@@ -666,6 +750,10 @@ def compute_trade_metrics(df: pd.DataFrame, price: float, horizon: int, acct: fl
 
     qty = max(0, min(raw_qty, cap_alloc_qty, cap_risk_qty))
 
+    # RSI + RVOL (from last completed day)
+    rsi14 = rsi14_from_close(df)
+    rvol = rvol_20(df)
+
     return TradeMetrics(
         price=price, vol=v, atr=a, ma50=ma50, ma200=ma200,
         buy=buy, sell=sell, stop=stop,
@@ -675,14 +763,35 @@ def compute_trade_metrics(df: pd.DataFrame, price: float, horizon: int, acct: fl
         risk_per_share=float(risk_per_share),
         cap_alloc_qty=int(cap_alloc_qty),
         cap_risk_qty=int(cap_risk_qty),
+        rsi14=float(rsi14),
+        rvol=float(rvol),
     )
 
 
-def score_decision(price: float, ma50: float, ma200: float, rrr: float,
-                   sh: float, mdd: float, wr: float, pf: float) -> Tuple[int, str, str, List[str]]:
+def score_decision(
+    price: float,
+    ma50: float,
+    ma200: float,
+    rrr: float,
+    sh: float,
+    mdd: float,
+    wr: float,
+    pf: float,
+    rsi14: float,
+    rvol: float,
+    risk_on: bool,
+    regime_ticker: str
+) -> Tuple[int, str, str, List[str]]:
+    """
+    Score-based decision with added:
+    - RSI soft penalties
+    - Market regime filter (index below MA200 downgrades)
+    - RVOL confirmation
+    """
     score = 0
     reasons: List[str] = []
 
+    # Trend (15)
     if price > ma200 and price > ma50:
         score += 15; reasons.append("Uptrend: above MA50 & MA200")
     elif price > ma200:
@@ -692,6 +801,7 @@ def score_decision(price: float, ma50: float, ma200: float, rrr: float,
     else:
         reasons.append("Trend: below MA50 & MA200")
 
+    # RRR (25)
     if rrr >= 3.0:
         score += 25; reasons.append("Risk/Reward: excellent")
     elif rrr >= 2.0:
@@ -701,6 +811,7 @@ def score_decision(price: float, ma50: float, ma200: float, rrr: float,
     else:
         reasons.append("Risk/Reward: poor")
 
+    # Sharpe (25)
     if sh >= 1.5:
         score += 25; reasons.append("Backtest Sharpe: excellent")
     elif sh >= 1.0:
@@ -710,6 +821,7 @@ def score_decision(price: float, ma50: float, ma200: float, rrr: float,
     else:
         reasons.append("Backtest Sharpe: poor")
 
+    # Drawdown (15)
     if abs(mdd) <= 0.10:
         score += 15; reasons.append("Drawdown: low")
     elif abs(mdd) <= 0.20:
@@ -719,6 +831,7 @@ def score_decision(price: float, ma50: float, ma200: float, rrr: float,
     else:
         reasons.append("Drawdown: very high")
 
+    # Win rate (10)
     if wr >= 60:
         score += 10; reasons.append("Win rate: high")
     elif wr >= 50:
@@ -728,6 +841,7 @@ def score_decision(price: float, ma50: float, ma200: float, rrr: float,
     else:
         reasons.append("Win rate: low")
 
+    # Profit factor (10)
     if pf >= 2.0:
         score += 10; reasons.append("Profit factor: strong")
     elif pf >= 1.5:
@@ -736,6 +850,39 @@ def score_decision(price: float, ma50: float, ma200: float, rrr: float,
         score += 3; reasons.append("Profit factor: marginal")
     else:
         reasons.append("Profit factor: weak")
+
+    # --- NEW: Market regime (soft but meaningful penalty)
+    if risk_on:
+        reasons.append(f"Market regime: {regime_ticker} risk-on (>= MA200)")
+        score += 5
+    else:
+        reasons.append(f"Market regime: {regime_ticker} risk-off (< MA200) — downgraded")
+        score -= 15
+
+    # --- NEW: RSI penalty/bonus
+    # Keep it soft: RSI extremes reduce score rather than hard-block.
+    if rsi14 >= 80:
+        score -= 15; reasons.append(f"RSI {rsi14:.0f}: very overbought (penalty)")
+    elif rsi14 >= 70:
+        score -= 8; reasons.append(f"RSI {rsi14:.0f}: overbought (penalty)")
+    elif rsi14 <= 20:
+        score += 6; reasons.append(f"RSI {rsi14:.0f}: very oversold (small boost)")
+    elif rsi14 <= 30:
+        score += 3; reasons.append(f"RSI {rsi14:.0f}: oversold (small boost)")
+    else:
+        reasons.append(f"RSI {rsi14:.0f}: neutral")
+
+    # --- NEW: RVOL confirmation
+    # Prefer RVOL >= 1.5; penalize if < 1.0, slight penalty for 1.0–1.5.
+    if rvol >= 1.5:
+        score += 6; reasons.append(f"RVOL {rvol:.2f}: strong volume confirmation")
+    elif rvol >= 1.0:
+        score -= 2; reasons.append(f"RVOL {rvol:.2f}: average volume")
+    else:
+        score -= 6; reasons.append(f"RVOL {rvol:.2f}: weak volume (penalty)")
+
+    # clamp score
+    score = int(max(0, min(100, score)))
 
     if score >= SCORE_STRONG_BUY:
         return score, "STRONG BUY", "🟢", reasons
@@ -784,6 +931,8 @@ def init_state() -> None:
         "secret_key": "",
         "ticker": "NVDA",
         "historical": None,
+        "market_df": None,
+        "market_ticker": REGIME_TICKER_PRIMARY,
         "latest_quote": None,
         "latest_price": None,
         "trade_q": queue.Queue(maxsize=QUEUE_MAX),
@@ -820,7 +969,7 @@ def stop_live() -> None:
 atexit.register(lambda: stop_live())
 
 st.title("📈 Trading Dashboard")
-st.caption("Simple controls. Safe defaults. Educational only — not financial advice.")
+st.caption("Simple controls. Safe defaults. RSI + Market regime + RVOL added. Educational only — not financial advice.")
 
 # ---- Secrets
 try:
@@ -888,14 +1037,25 @@ if load_btn:
         except Exception:
             break
 
-    with st.spinner(f"Loading {ticker}..."):
+    with st.spinner(f"Loading {ticker} + market regime data..."):
         df, dbg = load_historical(ticker, st.session_state.api_key, st.session_state.secret_key)
         q, qdbg = load_latest_quote(ticker, st.session_state.api_key, st.session_state.secret_key)
-        st.session_state.debug = {"historical": dbg, "quote": qdbg}
+
+        # Market regime data (try QQQ then SPY)
+        mkt_ticker = REGIME_TICKER_PRIMARY
+        mdf, mdbg = load_historical(mkt_ticker, st.session_state.api_key, st.session_state.secret_key)
+        if mdf is None:
+            mkt_ticker = REGIME_TICKER_FALLBACK
+            mdf, mdbg = load_historical(mkt_ticker, st.session_state.api_key, st.session_state.secret_key)
+
+        st.session_state.debug = {"historical": dbg, "quote": qdbg, "market": {"ticker": mkt_ticker, **mdbg}}
 
         st.session_state.ticker = ticker
         st.session_state.latest_quote = q
         st.session_state.latest_price = mid_from_quote(q)
+
+        st.session_state.market_df = mdf
+        st.session_state.market_ticker = mkt_ticker
 
         if df is None:
             st.session_state.historical = None
@@ -950,7 +1110,7 @@ if live_btn:
         st.session_state.live_active = True
     st.rerun()
 
-# ---- Live heartbeat + auto-refresh (best approach)
+# ---- Live heartbeat + auto-refresh
 if st.session_state.live_active:
     thr = st.session_state.ws_thread
     if thr is None or (hasattr(thr, "is_alive") and not thr.is_alive()):
@@ -971,14 +1131,29 @@ if st.session_state.quote_history:
 
 current_price = float(st.session_state.latest_price or df["close"].iloc[-1])
 
-# ---- Compute
+# ---- Compute base stats
 bt = backtest(df, horizon)
 btr = bt_stats(bt)
 
 tm = compute_trade_metrics(df=df, price=current_price, horizon=horizon, acct=float(account_size))
+
+# ---- Market regime
+risk_on, idx_close, idx_ma200 = market_regime(st.session_state.market_df)
+regime_ticker = st.session_state.market_ticker or REGIME_TICKER_PRIMARY
+
 score, decision, emoji, reasons = score_decision(
-    current_price, tm.ma50, tm.ma200, tm.rrr,
-    btr.sharpe_ratio, btr.max_drawdown, btr.win_rate, btr.profit_factor
+    price=current_price,
+    ma50=tm.ma50,
+    ma200=tm.ma200,
+    rrr=tm.rrr,
+    sh=btr.sharpe_ratio,
+    mdd=btr.max_drawdown,
+    wr=btr.win_rate,
+    pf=btr.profit_factor,
+    rsi14=tm.rsi14,
+    rvol=tm.rvol,
+    risk_on=risk_on,
+    regime_ticker=regime_ticker
 )
 
 # ---- Dashboard layout
@@ -987,7 +1162,10 @@ left, right = row.columns([1.4, 1.0], vertical_alignment="top")
 
 with left:
     st.subheader(f"{emoji} {st.session_state.ticker} — {decision}")
-    st.caption(f"Price: ${current_price:,.2f} • Horizon: {horizon}d • Live: {'ON' if st.session_state.live_active else 'OFF'}")
+    st.caption(
+        f"Price: ${current_price:,.2f} • Horizon: {horizon}d • Live: {'ON' if st.session_state.live_active else 'OFF'} • "
+        f"Regime: {regime_ticker} {'RISK-ON' if risk_on else 'RISK-OFF'}"
+    )
 
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("Buy", f"${tm.buy:,.2f}", f"{(tm.buy/current_price - 1)*100:.1f}%")
@@ -996,8 +1174,8 @@ with left:
     k4.metric("Position", f"{tm.qty} shares")
 
     s1, s2, s3, s4 = st.columns(4)
-    s1.metric("Vol (ann.)", f"{tm.vol:.2f}")
-    s2.metric("ATR", f"{tm.atr:.2f}")
+    s1.metric("RSI(14)", f"{tm.rsi14:.1f}")
+    s2.metric("RVOL(20)", f"{tm.rvol:.2f}")
     s3.metric("RRR", f"{tm.rrr:.2f}")
     s4.metric("Kelly (half)", f"{tm.kelly:.3f}")
 
@@ -1030,6 +1208,16 @@ with tab1:
 
     fig.update_layout(height=520, hovermode="x unified", title=f"{st.session_state.ticker} Price")
     st.plotly_chart(fig, use_container_width=True)
+
+    # Small regime mini-panel (optional, simple)
+    mdf = st.session_state.market_df
+    if mdf is not None and not mdf.empty:
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=mdf["timestamp"], y=mdf["close"], name=f"{regime_ticker} Close"))
+        if len(mdf) >= 200:
+            fig2.add_trace(go.Scatter(x=mdf["timestamp"], y=mdf["close"].rolling(200).mean(), name=f"{regime_ticker} MA200"))
+        fig2.update_layout(height=260, hovermode="x unified", title=f"Market Regime: {regime_ticker}")
+        st.plotly_chart(fig2, use_container_width=True)
 
 with tab2:
     c1, c2, c3, c4 = st.columns(4)
