@@ -1,121 +1,150 @@
-# utils/live_stream.py
-from __future__ import annotations
+with tab_live:
+    st.subheader("Live Quotes")
 
-import asyncio
-import threading
-import queue
-from typing import Any, Optional, List
+    if not LIVE_AVAILABLE:
+        st.info("Live module not available (or import failed).")
+    elif not has_keys(api_key, sec_key):
+        st.info("Live is disabled because Alpaca keys are missing.")
+    else:
+        # ---- derive running state safely
+        stream = st.session_state.get("live_stream", None)
+        live_running = bool(stream is not None and getattr(stream, "is_running", lambda: False)())
 
-from alpaca.data.live import StockDataStream
+        # Controls
+        c1, c2, c3, c4 = st.columns([1, 1, 1, 2])
 
+        start_clicked = c1.button("▶ Start", use_container_width=True, disabled=live_running)
+        stop_clicked = c2.button("⏹ Stop", use_container_width=True, disabled=not live_running)
+        clear_clicked = c3.button("🧹 Clear", use_container_width=True)
 
-class RealtimeStream:
-    """
-    Manages an Alpaca StockDataStream in a background thread.
+        st.session_state["live_autorefresh"] = c4.toggle(
+            "Auto refresh",
+            value=bool(st.session_state.get("live_autorefresh", True)),
+        )
 
-    Notes:
-    - Streamlit reruns the script often. Keep this object in st.session_state.
-    - stop() attempts a best-effort shutdown (alpaca-py can vary by version).
-    """
+        if clear_clicked:
+            st.session_state["live_rows"] = []
 
-    def __init__(self, api_key: str, secret_key: str, symbol: str):
-        self.api_key = api_key
-        self.secret_key = secret_key
-        self.symbol = symbol.upper().strip()
-
-        self.msg_queue: "queue.Queue[Any]" = queue.Queue()
-        self.stream: Optional[StockDataStream] = None
-        self.thread: Optional[threading.Thread] = None
-
-        self._stop_event = threading.Event()
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
-
-    async def _data_handler(self, data: Any):
-        """Callback that puts new data into the queue."""
-        self.msg_queue.put(data)
-
-    def _run_stream(self):
-        """Runs an asyncio loop inside a background thread and starts the stream."""
-        self._stop_event.clear()
-
-        loop = asyncio.new_event_loop()
-        self._loop = loop
-        asyncio.set_event_loop(loop)
-
-        self.stream = StockDataStream(self.api_key, self.secret_key)
-
-        # subscribe to quotes (bid/ask updates)
-        self.stream.subscribe_quotes(self._data_handler, self.symbol)
-
-        try:
-            # Alpaca-py commonly provides a synchronous .run() that blocks
-            if hasattr(self.stream, "run") and callable(getattr(self.stream, "run")):
-                self.stream.run()
-            else:
-                # fallback to internal coroutine if present (older patterns)
-                coro = getattr(self.stream, "_run_forever", None)
-                if coro is None:
-                    raise RuntimeError("StockDataStream has no run() or _run_forever().")
-                loop.run_until_complete(coro())
-        except Exception:
-            # Keep it quiet; Streamlit will show errors elsewhere if needed
-            pass
-        finally:
+        # Start stream
+        if start_clicked and not live_running:
             try:
-                if self.stream and hasattr(self.stream, "unsubscribe_quotes"):
-                    try:
-                        self.stream.unsubscribe_quotes(self.symbol)
-                    except Exception:
-                        pass
-            finally:
-                try:
-                    loop.stop()
-                except Exception:
-                    pass
-                try:
-                    loop.close()
-                except Exception:
-                    pass
-                self._loop = None
-                self.stream = None
+                stream = RealtimeStream(api_key, sec_key, symbol)
+                stream.start()
+                st.session_state["live_stream"] = stream
+                live_running = True
+            except Exception as e:
+                st.session_state["live_stream"] = None
+                st.error("Failed to start live stream.")
+                st.caption(f"{type(e).__name__}: {e}")
+                live_running = False
 
-    def start(self):
-        """Launch the stream in a daemon thread."""
-        if self.thread is None or not self.thread.is_alive():
-            self.thread = threading.Thread(target=self._run_stream, daemon=True)
-            self.thread.start()
-
-    def stop(self):
-        """Best-effort stop."""
-        self._stop_event.set()
-
-        # Try calling stop/close if alpaca-py exposes it
-        if self.stream is not None:
-            for method_name in ("stop", "close", "disconnect"):
-                m = getattr(self.stream, method_name, None)
-                if callable(m):
-                    try:
-                        m()
-                        break
-                    except Exception:
-                        pass
-
-        # Try stopping the event loop
-        if self._loop is not None:
+        # Stop stream (best effort)
+        if stop_clicked and live_running:
             try:
-                self._loop.call_soon_threadsafe(self._loop.stop)
+                if stream is not None:
+                    stream.stop()
             except Exception:
                 pass
+            # keep object but mark it as stopped by dropping reference
+            st.session_state["live_stream"] = None
+            live_running = False
 
-    def is_running(self) -> bool:
-        return self.thread is not None and self.thread.is_alive()
-
-    def get_latest(self, max_items: int = 200) -> List[Any]:
-        """Drain up to max_items messages from the queue."""
-        msgs = []
-        for _ in range(max_items):
+        # Pull latest messages into buffer
+        stream = st.session_state.get("live_stream", None)
+        if stream is not None:
             try:
-                msgs.append(self.msg_queue.get_nowait())
-            except queue.Empty:
-                break
-        return msgs
+                new_msgs = stream.get_latest(max_items=250)
+            except Exception:
+                new_msgs = []
+            if new_msgs:
+                st.session_state["live_rows"].extend(new_msgs)
+                # cap memory
+                st.session_state["live_rows"] = st.session_state["live_rows"][-500:]
+
+        # Status
+        if live_running:
+            st.caption("Status: ✅ running (quotes)")
+        else:
+            st.caption("Status: ⏸ stopped")
+
+        rows = st.session_state.get("live_rows", [])
+        if not rows:
+            st.info("No quote updates received yet.")
+        else:
+            # Convert alpaca quote objects/dicts into a clean dataframe
+            def to_dict(x):
+                # alpaca objects often have __dict__ or model_dump
+                if isinstance(x, dict):
+                    return x
+                for attr in ("model_dump", "dict"):
+                    m = getattr(x, attr, None)
+                    if callable(m):
+                        try:
+                            return m()
+                        except Exception:
+                            pass
+                d = {}
+                # common quote fields in alpaca
+                for k in ("symbol", "timestamp", "bid_price", "ask_price", "bid_size", "ask_size"):
+                    if hasattr(x, k):
+                        d[k] = getattr(x, k)
+                # fallback: last resort string
+                if not d:
+                    d["message"] = str(x)
+                return d
+
+            df_live = pd.DataFrame([to_dict(x) for x in rows])
+
+            # Normalize column names (alpaca sometimes uses bid_price/ask_price or bp/ap etc.)
+            rename_map = {
+                "bp": "bid_price",
+                "ap": "ask_price",
+                "bs": "bid_size",
+                "as": "ask_size",
+                "t": "timestamp",
+                "S": "symbol",
+            }
+            for k, v in rename_map.items():
+                if k in df_live.columns and v not in df_live.columns:
+                    df_live[v] = df_live[k]
+
+            # Compute mid + spread (bps) if possible
+            if "bid_price" in df_live.columns and "ask_price" in df_live.columns:
+                bid = pd.to_numeric(df_live["bid_price"], errors="coerce")
+                ask = pd.to_numeric(df_live["ask_price"], errors="coerce")
+                mid = (bid + ask) / 2.0
+                spread = (ask - bid)
+                df_live["mid"] = mid
+                df_live["spread"] = spread
+                df_live["spread_bps"] = np.where(
+                    mid > 0, (spread / mid) * 10000.0, np.nan
+                )
+
+            # Timestamp parse
+            if "timestamp" in df_live.columns:
+                df_live["timestamp"] = pd.to_datetime(df_live["timestamp"], errors="coerce", utc=True)
+
+            # Show latest snapshot metrics if possible
+            latest = df_live.tail(1)
+            if not latest.empty and "bid_price" in latest.columns and "ask_price" in latest.columns:
+                lbid = float(pd.to_numeric(latest["bid_price"], errors="coerce").iloc[0])
+                lask = float(pd.to_numeric(latest["ask_price"], errors="coerce").iloc[0])
+                lmid = (lbid + lask) / 2.0 if np.isfinite([lbid, lask]).all() else np.nan
+                lsp = (lask - lbid) if np.isfinite([lbid, lask]).all() else np.nan
+                lsp_bps = (lsp / lmid) * 10000.0 if np.isfinite([lsp, lmid]).all() and lmid > 0 else np.nan
+
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Bid", f"{lbid:.4f}" if np.isfinite(lbid) else "—")
+                m2.metric("Ask", f"{lask:.4f}" if np.isfinite(lask) else "—")
+                m3.metric("Spread (bps)", f"{lsp_bps:.1f}" if np.isfinite(lsp_bps) else "—")
+
+            # Display a tidy table
+            show_cols = [c for c in ["timestamp", "symbol", "bid_price", "ask_price", "mid", "spread_bps", "bid_size", "ask_size"] if c in df_live.columns]
+            if show_cols:
+                st.dataframe(df_live[show_cols].sort_values(show_cols[0]).tail(120), use_container_width=True, height=460)
+            else:
+                st.dataframe(df_live.tail(120), use_container_width=True, height=460)
+
+        # Auto refresh while running (no rerun-loop)
+        if live_running and st.session_state.get("live_autorefresh", True):
+            st.autorefresh(interval=750, key=f"live_refresh_{symbol}")
