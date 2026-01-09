@@ -2,29 +2,24 @@
 Trading Dashboard (Simple) + RSI + Market Regime + RVOL
 Educational only. Not financial advice.
 
-Added "best" improvements (low-UI, high value):
-A) Data Integrity Engine (practical + lightweight)
-   1) Data sanity checks (OHLC validity, monotonic timestamps, missing/duplicate days)
-   2) Split-like jump detection + "Possible Corporate Action" warning banner
-   3) Optional multi-source daily-close validator via yfinance (if installed)
-      - Flags if |close discrepancy| > threshold (default 0.75%)
+Major upgrades implemented:
+1) Fix "RRR constant" problem:
+   - Stop/Target based on ATR distances (variable per ticker/time).
+2) Make entry match labels:
+   - Backtest enters using a LIMIT at "Buy" (pullback) OR breakout mode.
+3) Levels computed from entry (not prior close), so backtest is coherent.
+4) Backtest uses realistic sizing:
+   - allocation cap + risk cap + (optional) rolling half-kelly based on PRIOR trades only (no lookahead).
+5) Out-of-sample split + benchmark vs Buy&Hold.
+6) Trade costs:
+   - dynamic slippage model + optional spread penalty + per-trade commission.
 
-B) Execution realism improvements
-   4) Dynamic slippage model in backtest based on liquidity (ADV $) and volatility proxy
-      - still includes base bps; increases slippage for illiquid names / large position vs ADV
-   5) Spread-aware live warning when live quotes exist (wide spread = execution risk)
-
-C) Concentration / correlated risk (optional, minimal UI)
-   6) Optional portfolio tickers box (expander): computes average correlation to current ticker
-      - If highly correlated, it soft-reduces position sizing (kelly multiplier) + shows warning
-
-Important: Still keeps your UI minimal (only one optional expander).
+UI remains minimal; one "Advanced" expander for strategy params.
 """
 
 from __future__ import annotations
 
 import atexit
-import asyncio
 import logging
 import queue
 import threading
@@ -75,51 +70,43 @@ log = logging.getLogger("dash_simple")
 TRADING_DAYS = 252
 RISK_FREE = 0.045
 
-VOL_FLOOR, VOL_CAP, VOL_DEFAULT = 0.10, 1.50, 0.30
-KELLY_MIN, KELLY_MAX = 0.01, 0.15
-STOP_MULT = 0.50
-MC_SIMS = 1000
+VOL_FLOOR, VOL_CAP, VOL_DEFAULT = 0.10, 1.80, 0.30
 
+# sizing caps
+KELLY_MIN, KELLY_MAX = 0.01, 0.15
+MAX_ALLOC_PCT = 0.10   # 10% of equity max position
+MAX_RISK_PCT = 0.02    # 2% of equity max risk per trade
+
+# execution costs
+BASE_SLIPPAGE_BPS = 5.0
+COMMISSION_PER_TRADE = 0.00  # dollars per round trip (entry+exit) in backtest
+WIDE_SPREAD_BPS_WARN = 25
+
+# strategy/backtest
+MIN_HIST_DAYS = 240
+MAX_BT_ITERS = 800          # allow more history for OOS split
+BT_OOS_FRAC = 0.30          # last 30% = out-of-sample
+BT_MIN_TRADES_FOR_KELLY = 40
+
+# regime
+REGIME_TICKER_PRIMARY = "QQQ"
+REGIME_TICKER_FALLBACK = "SPY"
+
+# data validator
+YF_CLOSE_DIFF_PCT = 0.0075  # 0.75%
+
+# live
 QUEUE_MAX = 1500
 MAX_TRADES = 200
 MAX_QUOTES = 200
 MAX_RECONNECTS = 8
-
-MIN_HIST_DAYS = 240  # need room for MA200 + regime
-MAX_BT_ITERS = 250
-
 AUTO_REFRESH_MS = 1500
 
+# score thresholds
 SCORE_STRONG_BUY = 80
 SCORE_BUY = 65
 SCORE_CONDITIONAL = 50
 SCORE_HOLD = 35
-
-# Background defaults (no UI controls)
-MC_METHOD = "student_t"
-BARS_FEED = "IEX"
-WS_FEED = "iex"
-
-MAX_ALLOC_PCT = 0.10  # 10% of equity max position
-MAX_RISK_PCT = 0.02   # 2% of equity max risk per trade
-BASE_SLIPPAGE_BPS = 5
-COMMISSION = 0.0
-
-# Market regime reference ticker (simple default)
-REGIME_TICKER_PRIMARY = "QQQ"
-REGIME_TICKER_FALLBACK = "SPY"
-
-# Backtest strategy threshold (aligns with your score meanings)
-BT_MIN_SCORE = SCORE_CONDITIONAL  # trade only when >= 50
-
-# Data validator thresholds
-YF_CLOSE_DIFF_PCT = 0.0075  # 0.75%
-WIDE_SPREAD_BPS_WARN = 25   # warn if spread > 25 bps
-
-# Concentration risk
-CORR_LOOKBACK_DAYS = 120
-CORR_WARN = 0.70            # avg corr above this => warning
-KELLY_CORR_PENALTY_MAX = 0.45  # up to 45% size reduction if very correlated
 
 
 # =========================
@@ -132,6 +119,7 @@ class TradeMetrics:
     atr: float
     ma50: float
     ma200: float
+
     buy: float
     sell: float
     stop: float
@@ -142,7 +130,6 @@ class TradeMetrics:
     rrr: float
     kelly: float
     qty: int
-    expected_move: float
     risk_per_share: float
     cap_alloc_qty: int
     cap_risk_qty: int
@@ -150,7 +137,6 @@ class TradeMetrics:
     rsi14: float
     rvol: float
 
-    # Data / execution diagnostics
     adv_dollar: float
     est_slippage_bps: float
 
@@ -234,7 +220,6 @@ def backoff_seconds(attempt: int) -> float:
 
 
 def live_autorefresh(interval_ms: int, key: str = "live_refresh") -> None:
-    """Best-effort auto-refresh without sleep-based rerun loops."""
     if HAS_ST_AUTOR:
         st_autorefresh(interval=interval_ms, key=key)
     else:
@@ -242,10 +227,6 @@ def live_autorefresh(interval_ms: int, key: str = "live_refresh") -> None:
 
 
 def last_completed_index(df: pd.DataFrame) -> int:
-    """
-    Alpaca daily bars can include today's partial bar.
-    If last bar date is today (UTC), use previous bar for RSI/RVOL stability.
-    """
     if df is None or df.empty:
         return -1
     try:
@@ -259,7 +240,6 @@ def last_completed_index(df: pd.DataFrame) -> int:
 
 
 def align_to_timestamp(df: pd.DataFrame, ts: Any) -> int:
-    """Return the last index in df with timestamp <= ts. If none, return -1."""
     if df is None or df.empty:
         return -1
     t = parse_ts(ts)
@@ -272,15 +252,13 @@ def align_to_timestamp(df: pd.DataFrame, ts: Any) -> int:
 
 
 # =========================
-# DATA INTEGRITY ENGINE
+# DATA INTEGRITY
 # =========================
 def sanity_check_bars(df: pd.DataFrame) -> List[str]:
-    """Lightweight OHLCV sanity checks; returns list of warning strings."""
     warns: List[str] = []
     if df is None or df.empty:
         return ["No historical data loaded."]
 
-    # Timestamps monotonic?
     try:
         ts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
         if ts.isna().any():
@@ -292,7 +270,6 @@ def sanity_check_bars(df: pd.DataFrame) -> List[str]:
     except Exception:
         warns.append("Could not validate timestamp integrity.")
 
-    # OHLC validity
     o = pd.to_numeric(df["open"], errors="coerce")
     h = pd.to_numeric(df["high"], errors="coerce")
     l = pd.to_numeric(df["low"], errors="coerce")
@@ -304,59 +281,38 @@ def sanity_check_bars(df: pd.DataFrame) -> List[str]:
     if (v < 0).any():
         warns.append("Negative volume detected (data error).")
 
-    # High/Low consistency
     bad_h = (h < np.maximum(o, c)).sum()
     bad_l = (l > np.minimum(o, c)).sum()
     if bad_h > 0 or bad_l > 0:
         warns.append("OHLC inconsistency detected (high/low not enclosing open/close).")
 
-    # Missing trading days heuristic (doesn't know exchange holidays; uses median gap)
-    try:
-        ts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce").dropna()
-        if len(ts) > 10:
-            gaps = ts.diff().dt.days.dropna()
-            if gaps.median() > 2:
-                warns.append("Large gaps between bars detected (missing days / sparse feed).")
-    except Exception:
-        pass
-
     return warns
 
 
-def detect_split_like_events(df: pd.DataFrame, threshold_low: float = 0.45, threshold_high: float = 0.55) -> List[str]:
-    """
-    Detect split-like jumps where close ratio is near 0.5, 2.0, 3.0, 1/3, 1/4.
-    This is heuristic; returns human-readable warnings.
-    """
+def detect_split_like_events(df: pd.DataFrame) -> List[str]:
     warns: List[str] = []
     if df is None or df.empty or len(df) < 5:
         return warns
-
     c = pd.to_numeric(df["close"], errors="coerce").dropna()
     if len(c) < 5:
         return warns
-
     r = (c / c.shift(1)).replace([np.inf, -np.inf], np.nan).dropna()
     if r.empty:
         return warns
-
-    # check for ratios near common split factors
     targets = [0.5, 2.0, 3.0, 0.3333, 4.0, 0.25]
     for t in targets:
-        near = (r - t).abs() <= 0.03  # within ~3%
+        near = (r - t).abs() <= 0.03
         if near.any():
-            idxs = list(r.index[near][-3:])  # last few
+            idxs = list(r.index[near][-3:])
             for ix in idxs:
                 dt = parse_ts(df.loc[ix, "timestamp"]).date()
-                warns.append(f"Possible corporate action near {dt}: close ratio ≈ {r.loc[ix]:.2f} (split/dividend adjustment mismatch).")
+                warns.append(f"Possible corporate action near {dt}: close ratio ≈ {r.loc[ix]:.2f} (split/dividend mismatch).")
             break
-
     return warns
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def yf_daily_close(ticker: str, period_days: int = 400) -> Optional[pd.Series]:
-    """Fetch daily closes from yfinance (if available). Cached."""
     if not HAS_YF:
         return None
     t = (ticker or "").upper().strip()
@@ -374,10 +330,6 @@ def yf_daily_close(ticker: str, period_days: int = 400) -> Optional[pd.Series]:
 
 
 def validate_price_vs_yf(ticker: str, our_df: pd.DataFrame) -> Tuple[Optional[float], Optional[float], Optional[str]]:
-    """
-    Compare last completed daily close vs yfinance last daily close.
-    Returns: (our_close, yf_close, warning_str)
-    """
     if not HAS_YF or our_df is None or our_df.empty:
         return None, None, None
 
@@ -393,23 +345,17 @@ def validate_price_vs_yf(ticker: str, our_df: pd.DataFrame) -> Tuple[Optional[fl
     if yf_close_series is None or yf_close_series.empty:
         return our_close, None, None
 
-    # Align by date (UTC date)
     our_date = pd.Timestamp(our_ts).date()
     yf_same = yf_close_series[yf_close_series.index.date == our_date]
-    if yf_same.empty:
-        # fallback to last available yf close
-        yf_close = float(yf_close_series.iloc[-1])
-    else:
-        yf_close = float(yf_same.iloc[-1])
+    yf_close = float(yf_same.iloc[-1]) if not yf_same.empty else float(yf_close_series.iloc[-1])
 
     if our_close <= 0 or yf_close <= 0:
         return our_close, yf_close, None
 
     diff_pct = abs(our_close - yf_close) / ((our_close + yf_close) / 2)
     if diff_pct > YF_CLOSE_DIFF_PCT:
-        warn = f"Data Warning: Daily close differs vs Yahoo by {diff_pct*100:.2f}% (our {our_close:.2f} vs YF {yf_close:.2f}). Check adjustments/feed."
+        warn = f"Data Warning: close differs vs Yahoo by {diff_pct*100:.2f}% (our {our_close:.2f} vs YF {yf_close:.2f})."
         return our_close, yf_close, warn
-
     return our_close, yf_close, None
 
 
@@ -418,7 +364,7 @@ def validate_price_vs_yf(ticker: str, our_df: pd.DataFrame) -> Tuple[Optional[fl
 # =========================
 class RealtimeStream:
     def __init__(self, api_key: str, secret_key: str, ticker: str,
-                 trade_q: queue.Queue, quote_q: queue.Queue, feed: str = WS_FEED):
+                 trade_q: queue.Queue, quote_q: queue.Queue, feed: str = "iex"):
         self.api_key = api_key
         self.secret_key = secret_key
         self.ticker = ticker.upper().strip()
@@ -537,8 +483,8 @@ def _bars_to_df(bars_obj: Any) -> Optional[pd.DataFrame]:
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def load_historical(ticker: str, api_key: str, secret_key: str,
-                    days_back: int = 720) -> Tuple[Optional[pd.DataFrame], Dict[str, Any]]:
-    dbg: Dict[str, Any] = {"ticker": ticker, "feed": BARS_FEED, "steps": []}
+                    days_back: int = 1200) -> Tuple[Optional[pd.DataFrame], Dict[str, Any]]:
+    dbg: Dict[str, Any] = {"ticker": ticker, "steps": []}
 
     ticker = (ticker or "").upper().strip()
     if not validate_keys(api_key, secret_key) or not ticker:
@@ -555,7 +501,7 @@ def load_historical(ticker: str, api_key: str, secret_key: str,
 
     feed_val = None
     if HAS_DATAFEED:
-        feed_val = DataFeed.SIP if BARS_FEED.upper() == "SIP" else DataFeed.IEX
+        feed_val = DataFeed.SIP if "IEX" == "SIP" else DataFeed.IEX
 
     try:
         if feed_val is not None:
@@ -576,7 +522,7 @@ def load_historical(ticker: str, api_key: str, secret_key: str,
         except Exception as e:
             if is_rate_limit_error(e):
                 wait = backoff_seconds(attempt)
-                dbg["steps"].append(f"429 rate limit -> sleep {wait:.0f}s")
+                dbg["steps"].append(f"429 -> sleep {wait:.0f}s")
                 time.sleep(wait)
                 continue
             dbg["error"] = f"Exception: {e}"
@@ -603,9 +549,6 @@ def load_historical(ticker: str, api_key: str, secret_key: str,
     if "symbol" in df.columns:
         df["symbol"] = df["symbol"].astype(str).str.upper()
         df = df[df["symbol"] == ticker].copy()
-
-    if "timestamp" not in df.columns and "time" in df.columns:
-        df = df.rename(columns={"time": "timestamp"})
 
     required = {"timestamp", "open", "high", "low", "close", "volume"}
     if not required.issubset(df.columns):
@@ -671,74 +614,25 @@ def annual_vol(df: pd.DataFrame, span: int = 20) -> float:
     return clamp(float(v), VOL_FLOOR, VOL_CAP)
 
 
-def atr(df: pd.DataFrame, period: int = 14) -> float:
-    if df is None or df.empty or len(df) < period + 1:
+def atr_value(df: pd.DataFrame, period: int = 14) -> float:
+    if df is None or df.empty or len(df) < period + 2:
         return 0.0
     x = df.copy()
-    x["h_l"] = x["high"] - x["low"]
-    x["h_pc"] = (x["high"] - x["close"].shift(1)).abs()
-    x["l_pc"] = (x["low"] - x["close"].shift(1)).abs()
-    x["tr"] = x[["h_l", "h_pc", "l_pc"]].max(axis=1)
-    v = x["tr"].rolling(period).mean().iloc[-1]
+    h = pd.to_numeric(x["high"], errors="coerce")
+    l = pd.to_numeric(x["low"], errors="coerce")
+    c = pd.to_numeric(x["close"], errors="coerce")
+    tr1 = (h - l).abs()
+    tr2 = (h - c.shift(1)).abs()
+    tr3 = (l - c.shift(1)).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    v = tr.rolling(period).mean().iloc[-1]
     return float(v) if np.isfinite(v) else 0.0
 
 
-def expected_move(price: float, vol: float, days: int) -> float:
-    if price <= 0 or vol <= 0 or days <= 0:
-        return 0.0
-    return float(price * vol * np.sqrt(days / TRADING_DAYS))
-
-
-def prob_hit_mc(S: float, K: float, vol: float, days: int, sims: int, method: str) -> float:
-    """Probability a path ever touches K within 'days' steps."""
-    if S <= 0 or K <= 0 or vol <= 0 or days <= 0 or sims <= 0:
-        return 0.0
-
-    dt = 1 / TRADING_DAYS
-    try:
-        if method == "student_t":
-            dof = 5
-            shocks = stats.t.rvs(df=dof, size=(sims, days)) / np.sqrt(dof / (dof - 2))
-        else:
-            shocks = np.random.standard_normal((sims, days))
-
-        drift = -0.5 * (vol ** 2) * dt
-        diffusion = vol * np.sqrt(dt) * shocks
-        paths = S * np.exp(np.cumsum(drift + diffusion, axis=1))
-
-        hit = np.any(paths >= K, axis=1) if K >= S else np.any(paths <= K, axis=1)
-        return float(hit.mean())
-    except Exception:
-        return 0.0
-
-
-def sharpe(returns: np.ndarray) -> float:
-    if returns is None or len(returns) == 0:
-        return 0.0
-    sd = returns.std()
-    if sd == 0:
-        return 0.0
-    excess = returns - (RISK_FREE / TRADING_DAYS)
-    s = (excess.mean() / sd) * np.sqrt(TRADING_DAYS)
-    return float(s) if np.isfinite(s) else 0.0
-
-
-def max_drawdown(cumret: np.ndarray) -> float:
-    if cumret is None or len(cumret) == 0:
-        return 0.0
-    peak = np.maximum.accumulate(cumret)
-    dd = (cumret - peak) / (peak + 1e-12)
-    m = float(dd.min())
-    return m if np.isfinite(m) else 0.0
-
-
 def rsi14_from_close(df: pd.DataFrame) -> float:
-    """RSI(14) using Wilder-like smoothing."""
     if df is None or df.empty or len(df) < 20:
         return 50.0
     closes = pd.to_numeric(df["close"], errors="coerce").dropna().values
-    if len(closes) < 20:
-        return 50.0
     if last_completed_index(df) == -2 and len(closes) >= 2:
         closes = closes[:-1]
     if len(closes) < 20:
@@ -754,13 +648,10 @@ def rsi14_from_close(df: pd.DataFrame) -> float:
 
     rs = roll_up.iloc[-1] / (roll_down.iloc[-1] + 1e-12)
     rsi = 100.0 - (100.0 / (1.0 + rs))
-    if not np.isfinite(rsi):
-        return 50.0
-    return float(clamp(rsi, 0.0, 100.0))
+    return float(clamp(rsi, 0.0, 100.0)) if np.isfinite(rsi) else 50.0
 
 
 def rvol_20(df: pd.DataFrame) -> float:
-    """Relative volume: last completed day volume / 20-day avg volume."""
     if df is None or df.empty or len(df) < 25:
         return 1.0
     vol = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0)
@@ -776,7 +667,6 @@ def rvol_20(df: pd.DataFrame) -> float:
 
 
 def market_regime_at(index_df: Optional[pd.DataFrame], ts: Any) -> Tuple[bool, float, float]:
-    """(risk_on, close, ma200) as of timestamp ts."""
     if index_df is None or index_df.empty or len(index_df) < 210:
         return True, 0.0, 0.0
     idx = align_to_timestamp(index_df, ts)
@@ -788,6 +678,26 @@ def market_regime_at(index_df: Optional[pd.DataFrame], ts: Any) -> Tuple[bool, f
     if not np.isfinite(ma200) or ma200 <= 0:
         return True, close, ma200
     return (close >= ma200), close, ma200
+
+
+def sharpe(returns: np.ndarray) -> float:
+    if returns is None or len(returns) == 0:
+        return 0.0
+    sd = returns.std()
+    if sd == 0:
+        return 0.0
+    excess = returns - (RISK_FREE / TRADING_DAYS)
+    s = (excess.mean() / sd) * np.sqrt(TRADING_DAYS)
+    return float(s) if np.isfinite(s) else 0.0
+
+
+def max_drawdown(cum_equity: np.ndarray) -> float:
+    if cum_equity is None or len(cum_equity) == 0:
+        return 0.0
+    peak = np.maximum.accumulate(cum_equity)
+    dd = (cum_equity - peak) / (peak + 1e-12)
+    m = float(dd.min())
+    return m if np.isfinite(m) else 0.0
 
 
 def bt_stats(bt: pd.DataFrame) -> BacktestResults:
@@ -806,151 +716,393 @@ def bt_stats(bt: pd.DataFrame) -> BacktestResults:
     avg_win = float(bt.loc[bt["PnL"] > 0, "PnL"].mean()) if wins else 0.0
     avg_loss = float(bt.loc[bt["PnL"] < 0, "PnL"].mean()) if losses else 0.0
 
-    mdd = max_drawdown(bt["CumReturn"].values)
     sh = sharpe(bt["Return"].values)
     total_pnl = float(bt["PnL"].sum())
+
+    # equity curve mdd
+    eq = bt["Equity"].values if "Equity" in bt.columns else (1 + bt["Return"]).cumprod()
+    mdd = max_drawdown(eq)
 
     return BacktestResults(win_rate, pf, mdd, sh, total, wins, losses, avg_win, avg_loss, total_pnl)
 
 
-def kelly_from_bt(bt: pd.DataFrame, min_trades: int = 30) -> float:
-    """Half-Kelly from strategy trade distribution; clamped."""
-    if bt is None or bt.empty or len(bt) < min_trades:
-        return KELLY_MIN
-    wins = bt[bt["PnL"] > 0]
-    losses = bt[bt["PnL"] < 0]
-    if len(wins) < max(8, min_trades // 4) or len(losses) < max(8, min_trades // 4):
-        return KELLY_MIN
-    wr = len(wins) / len(bt)
-    aw = float(wins["Return"].mean())
-    al = float(abs(losses["Return"].mean()))
-    if al <= 0 or aw <= 0:
-        return KELLY_MIN
-    R = aw / al
-    f = (wr - ((1 - wr) / R)) * 0.5
-    return clamp(float(f), KELLY_MIN, KELLY_MAX)
-
-
 def adv_dollar_volume(df: pd.DataFrame, lookback: int = 20) -> float:
-    """Approximate average daily dollar volume over lookback (close * volume)."""
     if df is None or df.empty or len(df) < lookback + 2:
         return 0.0
     x = df.copy()
-    i = last_completed_index(x)
-    if i == -2:
+    if last_completed_index(x) == -2:
         x = x.iloc[:-1]
     x = x.tail(lookback)
     c = pd.to_numeric(x["close"], errors="coerce")
     v = pd.to_numeric(x["volume"], errors="coerce")
     dv = (c * v).replace([np.inf, -np.inf], np.nan).dropna()
-    if dv.empty:
-        return 0.0
-    return float(dv.mean())
+    return float(dv.mean()) if not dv.empty else 0.0
 
 
 def estimate_slippage_bps(base_bps: float, order_value: float, adv_dollar: float, vol: float) -> float:
-    """
-    Simple impact model:
-    - base + impact * (order_value / adv$) + volatility component
-    """
     if order_value <= 0:
         return float(base_bps)
     adv = max(adv_dollar, 1.0)
-    participation = order_value / adv  # fraction of daily dollar volume
-    # tuned to be conservative but not insane
-    impact = 8_000.0 * participation   # e.g., 0.1% participation => 8 bps
-    vol_component = 15.0 * max(0.0, min(vol, 1.0))  # up to ~15 bps for high vol
+    participation = order_value / adv
+    impact = 8_000.0 * participation
+    vol_component = 15.0 * max(0.0, min(vol, 1.0))
     est = base_bps + impact + vol_component
-    return float(clamp(est, base_bps, 150.0))
+    return float(clamp(est, base_bps, 200.0))
+
+
+def prob_hit_mc(S: float, K: float, vol: float, days: int, sims: int = 800) -> float:
+    if S <= 0 or K <= 0 or vol <= 0 or days <= 0 or sims <= 0:
+        return 0.0
+    dt = 1 / TRADING_DAYS
+    try:
+        dof = 5
+        shocks = stats.t.rvs(df=dof, size=(sims, days)) / np.sqrt(dof / (dof - 2))
+        drift = -0.5 * (vol ** 2) * dt
+        diffusion = vol * np.sqrt(dt) * shocks
+        paths = S * np.exp(np.cumsum(drift + diffusion, axis=1))
+        hit = np.any(paths >= K, axis=1) if K >= S else np.any(paths <= K, axis=1)
+        return float(hit.mean())
+    except Exception:
+        return 0.0
 
 
 # =========================
-# OPTIONAL CONCENTRATION / CORRELATION
+# STRATEGY LEVELS (ATR BASED)
 # =========================
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_multi_historical(tickers: Tuple[str, ...], api_key: str, secret_key: str) -> Dict[str, pd.DataFrame]:
-    """Load historical data for multiple tickers; cached; best-effort."""
-    out: Dict[str, pd.DataFrame] = {}
-    for t in tickers:
-        df, _ = load_historical(t, api_key, secret_key)
-        if df is not None and not df.empty:
-            out[t] = df
-    return out
-
-
-def parse_portfolio_tickers(text: str) -> List[str]:
-    """Parse comma/space/newline separated tickers; uppercase; unique."""
-    if not text:
-        return []
-    raw = (
-        text.replace("\n", ",")
-            .replace(" ", ",")
-            .replace(";", ",")
-            .split(",")
-    )
-    toks = []
-    for r in raw:
-        t = r.strip().upper()
-        if t and t.isalnum():
-            toks.append(t)
-    # unique preserve order
-    seen = set()
-    uniq = []
-    for t in toks:
-        if t not in seen:
-            uniq.append(t)
-            seen.add(t)
-    return uniq[:25]
-
-
-def avg_corr_to_portfolio(cur: str, port: List[str], data: Dict[str, pd.DataFrame]) -> Optional[float]:
-    """Compute avg correlation of cur returns vs portfolio tickers over lookback window."""
-    if cur not in data or not port:
-        return None
-    cur_df = data[cur]
-    cur_r = pd.to_numeric(cur_df["close"], errors="coerce").pct_change().dropna().tail(CORR_LOOKBACK_DAYS)
-    if cur_r.empty:
-        return None
-    cors = []
-    for t in port:
-        if t == cur:
-            continue
-        if t not in data:
-            continue
-        r = pd.to_numeric(data[t]["close"], errors="coerce").pct_change().dropna().tail(CORR_LOOKBACK_DAYS)
-        if r.empty:
-            continue
-        # align
-        a = pd.concat([cur_r, r], axis=1).dropna()
-        if len(a) < 40:
-            continue
-        c = float(a.iloc[:, 0].corr(a.iloc[:, 1]))
-        if np.isfinite(c):
-            cors.append(c)
-    if not cors:
-        return None
-    return float(np.mean(cors))
-
-
-def corr_kelly_multiplier(avg_corr: Optional[float]) -> float:
+def compute_levels(
+    df: pd.DataFrame,
+    price: float,
+    mode: str,
+    atr_mult_entry: float,
+    atr_mult_stop: float,
+    atr_mult_target: float,
+) -> Tuple[float, float, float, float]:
     """
-    Soft position size penalty based on correlation.
-    If avg_corr <= 0.3 => no penalty.
-    If avg_corr >= 0.9 => max penalty.
+    Returns (buy, stop, sell, risk_per_share)
+
+    Pullback mode:
+      buy = price - atr_mult_entry*ATR
+      stop = buy - atr_mult_stop*ATR
+      sell = buy + atr_mult_target*ATR
+
+    Breakout mode:
+      buy = price + atr_mult_entry*ATR
+      stop = buy - atr_mult_stop*ATR
+      sell = buy + atr_mult_target*ATR
     """
-    if avg_corr is None or not np.isfinite(avg_corr):
-        return 1.0
-    c = clamp(avg_corr, -1.0, 1.0)
-    if c <= 0.30:
-        return 1.0
-    # scale [0.3..0.9] -> [0..1]
-    x = (c - 0.30) / (0.90 - 0.30)
-    penalty = KELLY_CORR_PENALTY_MAX * clamp(x, 0.0, 1.0)
-    return float(1.0 - penalty)
+    a = atr_value(df, 14)
+    a = max(a, 0.01)
+
+    if mode == "BREAKOUT":
+        buy = price + atr_mult_entry * a
+    else:
+        buy = price - atr_mult_entry * a
+
+    stop = buy - atr_mult_stop * a
+    sell = buy + atr_mult_target * a
+    risk_per_share = max(buy - stop, 0.01)
+    return float(buy), float(stop), float(sell), float(risk_per_share)
+
+
+def ma(df: pd.DataFrame, n: int) -> float:
+    if df is None or df.empty or len(df) < n:
+        return float(pd.to_numeric(df["close"], errors="coerce").iloc[-1])
+    return float(pd.to_numeric(df["close"], errors="coerce").rolling(n).mean().iloc[-1])
 
 
 # =========================
-# SCORING
+# SIZING (USED BOTH LIVE METRICS + BACKTEST)
+# =========================
+def size_position(
+    acct: float,
+    entry: float,
+    stop: float,
+    kelly_f: float,
+) -> Tuple[int, int, int, float]:
+    """
+    Returns (qty, cap_alloc_qty, cap_risk_qty, risk_per_share).
+    Uses same caps as dashboard.
+    """
+    risk_per_share = max(entry - stop, 0.01)
+
+    cap_alloc_qty = int((acct * MAX_ALLOC_PCT) / max(entry, 0.01))
+    cap_risk_qty = int((acct * MAX_RISK_PCT) / risk_per_share) if risk_per_share > 0 else 0
+
+    # Kelly here is used as a fraction of equity you'd be willing to "risk-scale" with.
+    # Convert to shares via risk-based sizing (still capped by alloc and risk).
+    raw_qty = int((acct * kelly_f) / risk_per_share) if risk_per_share > 0 else 0
+    qty = max(0, min(raw_qty, cap_alloc_qty, cap_risk_qty))
+    return qty, cap_alloc_qty, cap_risk_qty, float(risk_per_share)
+
+
+def rolling_half_kelly_from_trades(trades: List[Dict[str, Any]]) -> float:
+    """
+    Half-Kelly computed from prior trade returns only.
+    Kept conservative and clamped.
+    """
+    if len(trades) < BT_MIN_TRADES_FOR_KELLY:
+        return KELLY_MIN
+
+    rets = np.array([t["Return"] for t in trades if np.isfinite(t.get("Return", np.nan))], dtype=float)
+    if len(rets) < BT_MIN_TRADES_FOR_KELLY:
+        return KELLY_MIN
+
+    wins = rets[rets > 0]
+    losses = rets[rets < 0]
+    if len(wins) < 10 or len(losses) < 10:
+        return KELLY_MIN
+
+    wr = len(wins) / len(rets)
+    aw = float(np.mean(wins))
+    al = float(abs(np.mean(losses)))
+    if al <= 0 or aw <= 0:
+        return KELLY_MIN
+
+    R = aw / al
+    f = (wr - ((1 - wr) / R)) * 0.5  # half-kelly
+    return clamp(float(f), KELLY_MIN, KELLY_MAX)
+
+
+# =========================
+# BACKTEST (LIMIT ENTRY, ATR LEVELS, REAL SIZING, OOS)
+# =========================
+def gap_aware_fill(open_px: float, level_px: float, is_stop: bool) -> float:
+    # Conservative: stops slip against you, targets slip against you on gaps
+    if is_stop:
+        return float(open_px) if open_px <= level_px else float(level_px)
+    return float(open_px) if open_px >= level_px else float(level_px)
+
+
+def backtest_strategy(
+    df: pd.DataFrame,
+    market_df: Optional[pd.DataFrame],
+    horizon: int,
+    mode: str,
+    atr_entry: float,
+    atr_stop: float,
+    atr_target: float,
+    require_risk_on: bool,
+    rsi_max: float,
+    rsi_min: float,
+    rvol_min: float,
+    vol_max: float,
+    cooldown_bars: int,
+    include_spread_penalty: bool,
+    assumed_spread_bps: float,
+    start_equity: float,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Returns (trades_df, daily_equity_df)
+    - enters with a limit at buy
+    - uses ATR-based stop/target from entry
+    - uses equity-based sizing with caps
+    - dynamic slippage based on ADV$ and vol
+    - optional cooldown after STOP
+    - OOS split handled outside
+    """
+
+    if df is None or df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    if len(df) < MIN_HIST_DAYS + horizon + 30:
+        return pd.DataFrame(), pd.DataFrame()
+
+    df_bt = df.iloc[:-1].copy() if last_completed_index(df) == -2 else df.copy()
+    df_bt = df_bt.reset_index(drop=True)
+
+    # prepare indicators
+    close = pd.to_numeric(df_bt["close"], errors="coerce")
+    df_bt["ma50"] = close.rolling(50).mean()
+    df_bt["ma200"] = close.rolling(200).mean()
+    df_bt["rsi14"] = np.nan
+    df_bt["rvol"] = np.nan
+    df_bt["vol_ann"] = np.nan
+    df_bt["atr14"] = np.nan
+
+    # compute rolling stuff efficiently
+    # RSI & ATR from helper functions (slower) – keep simple but bounded.
+    for i in range(220, len(df_bt)):
+        hist = df_bt.iloc[:i+1]
+        df_bt.loc[i, "rsi14"] = rsi14_from_close(hist)
+        df_bt.loc[i, "rvol"] = rvol_20(hist)
+        df_bt.loc[i, "vol_ann"] = annual_vol(hist)
+        df_bt.loc[i, "atr14"] = atr_value(hist, 14)
+
+    trades: List[Dict[str, Any]] = []
+    equity = float(start_equity)
+    equity_curve: List[Dict[str, Any]] = []
+
+    last_stop_i = -10_000
+
+    # Iterate across potential entry days
+    # We use i as "signal day" (levels based on price at i), and attempt fill from i+1 forward.
+    for i in range(220, min(len(df_bt) - horizon - 2, MAX_BT_ITERS + 220)):
+        ts_i = df_bt["timestamp"].iloc[i]
+        px = float(pd.to_numeric(df_bt["close"], errors="coerce").iloc[i])
+        if px <= 0:
+            continue
+
+        # cooldown after stopouts
+        if (i - last_stop_i) < cooldown_bars:
+            continue
+
+        v = float(df_bt["vol_ann"].iloc[i]) if np.isfinite(df_bt["vol_ann"].iloc[i]) else VOL_DEFAULT
+        if v > vol_max:
+            continue
+
+        ma50_i = float(df_bt["ma50"].iloc[i]) if np.isfinite(df_bt["ma50"].iloc[i]) else px
+        ma200_i = float(df_bt["ma200"].iloc[i]) if np.isfinite(df_bt["ma200"].iloc[i]) else ma50_i
+        rsi_i = float(df_bt["rsi14"].iloc[i]) if np.isfinite(df_bt["rsi14"].iloc[i]) else 50.0
+        rvol_i = float(df_bt["rvol"].iloc[i]) if np.isfinite(df_bt["rvol"].iloc[i]) else 1.0
+
+        # regime
+        risk_on, _, _ = market_regime_at(market_df, ts_i)
+        if require_risk_on and not risk_on:
+            continue
+
+        # basic trend filter (kept light)
+        if px < ma200_i:
+            continue
+
+        # RSI & RVOL gates (simple)
+        if not (rsi_min <= rsi_i <= rsi_max):
+            continue
+        if rvol_i < rvol_min:
+            continue
+
+        # compute ATR-based levels from signal-day context
+        hist = df_bt.iloc[:i+1]
+        buy, stop, sell, risk_per_share = compute_levels(
+            hist, px, mode=mode,
+            atr_mult_entry=atr_entry,
+            atr_mult_stop=atr_stop,
+            atr_mult_target=atr_target,
+        )
+
+        # if buy is silly
+        if stop <= 0 or buy <= 0 or sell <= 0 or sell <= buy:
+            continue
+
+        # estimate slippage and spread
+        adv = adv_dollar_volume(hist, 20)
+        # rolling half-kelly from prior trades only
+        kelly_f = rolling_half_kelly_from_trades(trades)
+        qty, cap_alloc_qty, cap_risk_qty, risk_ps = size_position(equity, buy, stop, kelly_f)
+        if qty <= 0:
+            continue
+
+        order_value = qty * buy
+        slip_bps = estimate_slippage_bps(BASE_SLIPPAGE_BPS, order_value, adv, v)
+        if include_spread_penalty:
+            slip_bps += max(0.0, assumed_spread_bps / 2.0)  # half-spread penalty per side
+        slip = slip_bps / 10000.0
+
+        # attempt fill starting next day: limit order at buy
+        entry_eff = None
+        entry_day = None
+
+        for j in range(i + 1, min(i + 1 + 5, len(df_bt) - horizon - 1)):  # give it up to 5 days to fill
+            o = float(pd.to_numeric(df_bt["open"], errors="coerce").iloc[j])
+            h = float(pd.to_numeric(df_bt["high"], errors="coerce").iloc[j])
+            l = float(pd.to_numeric(df_bt["low"], errors="coerce").iloc[j])
+            if o <= 0 or h <= 0 or l <= 0:
+                continue
+
+            if mode == "BREAKOUT":
+                # breakout: require price trade up through buy
+                if h >= buy:
+                    fill = gap_aware_fill(o, buy, is_stop=False)
+                    entry_eff = fill * (1 + slip)
+                    entry_day = j
+                    break
+            else:
+                # pullback: require price trade down to buy
+                if l <= buy:
+                    fill = gap_aware_fill(o, buy, is_stop=False)
+                    entry_eff = fill * (1 + slip)
+                    entry_day = j
+                    break
+
+        if entry_eff is None or entry_day is None:
+            continue
+
+        # Recompute levels from ENTRY price (coherent)
+        # (We keep stop/target distances based on ATR from signal-day; could also use ATR at entry day.)
+        entry = float(entry_eff)
+        stop_eff = float(stop)
+        sell_eff = float(sell)
+
+        # walk forward for exits
+        exit_eff = None
+        reason = "TIME"
+        exit_day = entry_day + horizon
+
+        for j in range(entry_day, min(entry_day + horizon, len(df_bt))):
+            o = float(pd.to_numeric(df_bt["open"], errors="coerce").iloc[j])
+            h = float(pd.to_numeric(df_bt["high"], errors="coerce").iloc[j])
+            l = float(pd.to_numeric(df_bt["low"], errors="coerce").iloc[j])
+            c = float(pd.to_numeric(df_bt["close"], errors="coerce").iloc[j])
+            if o <= 0 or h <= 0 or l <= 0 or c <= 0:
+                continue
+
+            # Stop first (conservative)
+            if l <= stop_eff:
+                fill = gap_aware_fill(o, stop_eff, is_stop=True)
+                exit_eff = fill * (1 - slip)
+                reason = "STOP"
+                exit_day = j
+                last_stop_i = i
+                break
+
+            if h >= sell_eff:
+                fill = gap_aware_fill(o, sell_eff, is_stop=False)
+                exit_eff = fill * (1 - slip)
+                reason = "TP"
+                exit_day = j
+                break
+
+        if exit_eff is None:
+            c = float(pd.to_numeric(df_bt["close"], errors="coerce").iloc[min(entry_day + horizon - 1, len(df_bt)-1)]))
+            exit_eff = c * (1 - slip)
+            reason = "TIME"
+            exit_day = min(entry_day + horizon - 1, len(df_bt)-1)
+
+        pnl = (exit_eff - entry_eff) * qty - COMMISSION_PER_TRADE
+        ret = pnl / max(equity, 1e-9)
+
+        equity = max(1.0, equity + pnl)
+
+        trades.append({
+            "SignalTS": parse_ts(ts_i),
+            "EntryTS": parse_ts(df_bt["timestamp"].iloc[entry_day]),
+            "ExitTS": parse_ts(df_bt["timestamp"].iloc[exit_day]),
+            "Mode": mode,
+            "Entry": entry_eff,
+            "Stop": stop_eff,
+            "Target": sell_eff,
+            "Exit": exit_eff,
+            "Reason": reason,
+            "Qty": qty,
+            "SlipBps": slip_bps,
+            "PnL": pnl,
+            "Return": ret,
+            "Equity": equity,
+            "RSI": rsi_i,
+            "RVOL": rvol_i,
+        })
+
+        equity_curve.append({
+            "timestamp": parse_ts(df_bt["timestamp"].iloc[exit_day]),
+            "Equity": equity
+        })
+
+    trades_df = pd.DataFrame(trades)
+    eq_df = pd.DataFrame(equity_curve).sort_values("timestamp") if equity_curve else pd.DataFrame()
+
+    return trades_df, eq_df
+
+
+# =========================
+# SCORING (now uses REAL RRR)
 # =========================
 def score_decision(
     price: float,
@@ -1095,237 +1247,6 @@ def score_gauge(score: int, label: str) -> go.Figure:
 
 
 # =========================
-# STRATEGY BACKTEST (aligned)
-# =========================
-def _gap_aware_fill(open_px: float, level_px: float, is_stop: bool) -> float:
-    if is_stop:
-        return float(open_px) if open_px <= level_px else float(level_px)
-    return float(open_px) if open_px >= level_px else float(level_px)
-
-
-def entry_score_proxy(px: float, ma50: float, ma200: float, rrr: float, rsi14: float, rvol: float, risk_on: bool) -> int:
-    """
-    Non-circular score proxy for entry gating (does not use backtest stats).
-    Mirrors your scoring weights for trend/rrr/regime/rsi/rvol.
-    """
-    s = 0
-    if px > ma200 and px > ma50:
-        s += 15
-    elif px > ma200:
-        s += 10
-    elif px > ma50:
-        s += 5
-
-    if rrr >= 3.0:
-        s += 25
-    elif rrr >= 2.0:
-        s += 20
-    elif rrr >= 1.5:
-        s += 12
-
-    s += 5 if risk_on else -15
-
-    if rsi14 >= 80:
-        s -= 15
-    elif rsi14 >= 70:
-        s -= 8
-    elif rsi14 <= 20:
-        s += 6
-    elif rsi14 <= 30:
-        s += 3
-
-    if rvol >= 1.5:
-        s += 6
-    elif rvol >= 1.0:
-        s -= 2
-    else:
-        s -= 6
-
-    return int(max(0, min(100, s)))
-
-
-def backtest_strategy(
-    df: pd.DataFrame,
-    market_df: Optional[pd.DataFrame],
-    horizon: int,
-    min_score: int = BT_MIN_SCORE,
-) -> pd.DataFrame:
-    """
-    Enters next-day open when entry_score_proxy >= min_score.
-    Exits via stop or TP with OHLC + gap-aware fills, else horizon close.
-    Uses dynamic slippage estimate based on simulated position size vs ADV$ and volatility.
-    """
-    if df is None or df.empty:
-        return pd.DataFrame()
-    if len(df) < max(MIN_HIST_DAYS, 220) + horizon + 5:
-        return pd.DataFrame()
-
-    # Use only fully completed bars if today's bar is partial
-    df_bt = df.iloc[:-1].copy() if last_completed_index(df) == -2 else df.copy()
-
-    iters = min(len(df_bt) - horizon - 3, MAX_BT_ITERS)
-    start = max(210, len(df_bt) - horizon - iters - 2)
-
-    trades: List[Dict[str, Any]] = []
-
-    for i in range(iters):
-        idx = start + i
-        hist = df_bt.iloc[: idx + 1].copy()
-        if idx + 1 >= len(df_bt):
-            break
-
-        px = float(pd.to_numeric(hist["close"], errors="coerce").iloc[-1])
-        if px <= 0:
-            continue
-
-        v = annual_vol(hist)
-        move = expected_move(px, v, horizon)
-        buy = px - move
-        sell = px + move
-        stop = buy - (move * STOP_MULT)
-        risk_per_share = max(buy - stop, 0.01)
-        rrr = (sell - buy) / risk_per_share
-
-        rsi14 = rsi14_from_close(hist)
-        rvol = rvol_20(hist)
-        ma50 = float(pd.to_numeric(hist["close"], errors="coerce").rolling(50).mean().iloc[-1]) if len(hist) >= 50 else px
-        ma200 = float(pd.to_numeric(hist["close"], errors="coerce").rolling(200).mean().iloc[-1]) if len(hist) >= 200 else ma50
-        risk_on, _, _ = market_regime_at(market_df, hist["timestamp"].iloc[-1])
-
-        s = entry_score_proxy(px, ma50, ma200, rrr, rsi14, rvol, risk_on)
-        if s < min_score:
-            continue
-
-        entry_open = float(pd.to_numeric(df_bt["open"], errors="coerce").iloc[idx + 1])
-        if entry_open <= 0:
-            continue
-
-        # Simulate a representative order size for slippage:
-        # assume "unit" account value of $10k to estimate slippage impact fairly across time
-        acct_sim = 10_000.0
-        adv = adv_dollar_volume(hist, lookback=20)
-        # assume we'd allocate up to MAX_ALLOC_PCT; order value ~ alloc
-        order_value = acct_sim * MAX_ALLOC_PCT
-        slip_bps = estimate_slippage_bps(BASE_SLIPPAGE_BPS, order_value, adv, v)
-        slip = slip_bps / 10000.0
-
-        entry_eff = entry_open * (1 + slip)
-
-        exit_eff = None
-        exit_reason = "TIME"
-        window = df_bt.iloc[idx + 1: idx + 1 + horizon]
-
-        for _, bar in window.iterrows():
-            o = float(pd.to_numeric(bar["open"], errors="coerce"))
-            h = float(pd.to_numeric(bar["high"], errors="coerce"))
-            l = float(pd.to_numeric(bar["low"], errors="coerce"))
-            c = float(pd.to_numeric(bar["close"], errors="coerce"))
-            if o <= 0 or h <= 0 or l <= 0 or c <= 0:
-                continue
-
-            # Stop first (conservative)
-            if l <= stop:
-                fill = _gap_aware_fill(o, stop, is_stop=True)
-                exit_eff = fill * (1 - slip)
-                exit_reason = "STOP"
-                break
-
-            if h >= sell:
-                fill = _gap_aware_fill(o, sell, is_stop=False)
-                exit_eff = fill * (1 - slip)
-                exit_reason = "TP"
-                break
-
-        if exit_eff is None:
-            last_close = float(pd.to_numeric(window["close"], errors="coerce").iloc[-1])
-            exit_eff = last_close * (1 - slip)
-
-        pnl = (exit_eff - entry_eff) - COMMISSION
-        ret = pnl / entry_eff if entry_eff > 0 else 0.0
-
-        trades.append({
-            "EntryTS": parse_ts(df_bt["timestamp"].iloc[idx + 1]),
-            "ExitTS": parse_ts(window["timestamp"].iloc[-1]),
-            "Entry": entry_eff,
-            "Exit": exit_eff,
-            "Reason": exit_reason,
-            "PnL": pnl,
-            "Return": ret,
-            "SlipBps": slip_bps,
-        })
-
-    if not trades:
-        return pd.DataFrame()
-
-    bt = pd.DataFrame(trades)
-    bt["CumPnL"] = bt["PnL"].cumsum()
-    bt["CumReturn"] = (1 + bt["Return"]).cumprod() - 1
-    return bt
-
-
-def compute_trade_metrics(
-    df: pd.DataFrame,
-    price: float,
-    horizon: int,
-    acct: float,
-    kelly_f: float,
-    corr_mult: float,
-) -> TradeMetrics:
-    v = annual_vol(df)
-    a = atr(df)
-
-    ma50 = float(pd.to_numeric(df["close"], errors="coerce").rolling(50).mean().iloc[-1]) if len(df) >= 50 else price
-    ma200 = float(pd.to_numeric(df["close"], errors="coerce").rolling(200).mean().iloc[-1]) if len(df) >= 200 else ma50
-
-    move = expected_move(price, v, horizon)
-    buy = price - move
-    sell = price + move
-    stop = buy - (move * STOP_MULT)
-
-    prob_touch_buy = prob_hit_mc(price, buy, v, horizon, MC_SIMS, MC_METHOD)
-    prob_touch_sell = prob_hit_mc(price, sell, v, horizon, MC_SIMS, MC_METHOD)
-
-    risk_per_share = max(buy - stop, 0.01)
-    rrr = (sell - buy) / risk_per_share if risk_per_share > 0 else 0.0
-
-    # Concentration penalty applied as a multiplier to Kelly fraction
-    k_eff = float(clamp(kelly_f * corr_mult, KELLY_MIN, KELLY_MAX))
-
-    # caps
-    cap_alloc_qty = int((acct * MAX_ALLOC_PCT) / max(price, 0.01))
-    cap_risk_qty = int((acct * MAX_RISK_PCT) / risk_per_share) if risk_per_share > 0 else 0
-
-    # dynamic slippage estimate (uses expected order value = min(alloc cap, kelly cap))
-    adv = adv_dollar_volume(df, lookback=20)
-    order_value = min(acct * MAX_ALLOC_PCT, acct * k_eff)
-    est_slip_bps = estimate_slippage_bps(BASE_SLIPPAGE_BPS, order_value, adv, v)
-
-    raw_qty = int((acct * k_eff) / risk_per_share) if risk_per_share > 0 else 0
-    qty = max(0, min(raw_qty, cap_alloc_qty, cap_risk_qty))
-
-    rsi14 = rsi14_from_close(df)
-    rvol = rvol_20(df)
-
-    return TradeMetrics(
-        price=price, vol=v, atr=a, ma50=ma50, ma200=ma200,
-        buy=buy, sell=sell, stop=stop,
-        prob_touch_buy=float(prob_touch_buy),
-        prob_touch_sell=float(prob_touch_sell),
-        rrr=float(rrr),
-        kelly=float(k_eff),
-        qty=int(qty),
-        expected_move=float(move),
-        risk_per_share=float(risk_per_share),
-        cap_alloc_qty=int(cap_alloc_qty),
-        cap_risk_qty=int(cap_risk_qty),
-        rsi14=float(rsi14),
-        rvol=float(rvol),
-        adv_dollar=float(adv),
-        est_slippage_bps=float(est_slip_bps),
-    )
-
-
-# =========================
 # STREAMLIT APP
 # =========================
 st.set_page_config(page_title="Trading Dashboard (Simple)", page_icon="📈", layout="wide")
@@ -1350,9 +1271,21 @@ def init_state() -> None:
         "ws_thread": None,
         "last_error": "",
         "debug": {},
-        "portfolio_text": "",
-        "portfolio_tickers": [],
-        "avg_corr": None,
+
+        # strategy params
+        "mode": "PULLBACK",
+        "atr_entry": 0.6,
+        "atr_stop": 1.6,
+        "atr_target": 2.8,
+        "require_risk_on": True,
+        "rsi_min": 25.0,
+        "rsi_max": 75.0,
+        "rvol_min": 0.9,
+        "vol_max": 1.35,
+        "cooldown_bars": 5,
+        "spread_penalty": False,
+        "assumed_spread_bps": 10.0,
+        "start_equity_bt": 10_000.0,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -1377,7 +1310,7 @@ def stop_live() -> None:
 atexit.register(lambda: stop_live())
 
 st.title("📈 Trading Dashboard")
-st.caption("Simple controls. Safe defaults. Added integrity checks + dynamic slippage + optional correlation sizing. Educational only.")
+st.caption("Minimal UI. Coherent backtest. ATR-based levels. Out-of-sample evaluation. Educational only.")
 
 # ---- Secrets
 try:
@@ -1424,20 +1357,38 @@ with top:
         st.write("")
         load_btn = st.button("Load / Refresh", type="primary", use_container_width=True)
 
-# ---- Optional portfolio expander (correlation sizing)
-with st.expander("Optional: Portfolio tickers (for correlation sizing)", expanded=False):
-    st.caption("Paste tickers separated by commas/spaces/newlines (e.g., NVDA AMD TSM). Equal-weight assumed. Leave empty to ignore.")
-    st.session_state.portfolio_text = st.text_area("Portfolio tickers", value=st.session_state.portfolio_text, height=70)
-    st.caption("If current ticker is highly correlated to your portfolio, position sizing is reduced automatically.")
+# ---- Advanced expander (still minimal)
+with st.expander("Advanced (strategy + realism)", expanded=False):
+    colA, colB, colC = st.columns(3)
+    with colA:
+        st.session_state.mode = st.selectbox("Mode", ["PULLBACK", "BREAKOUT"], index=0 if st.session_state.mode == "PULLBACK" else 1)
+        st.session_state.require_risk_on = st.checkbox("Require risk-on regime", value=st.session_state.require_risk_on)
+        st.session_state.spread_penalty = st.checkbox("Include spread penalty", value=st.session_state.spread_penalty)
+    with colB:
+        st.session_state.atr_entry = st.slider("ATR entry mult", 0.1, 2.0, float(st.session_state.atr_entry), 0.1)
+        st.session_state.atr_stop = st.slider("ATR stop mult", 0.5, 3.0, float(st.session_state.atr_stop), 0.1)
+        st.session_state.atr_target = st.slider("ATR target mult", 0.5, 5.0, float(st.session_state.atr_target), 0.1)
+    with colC:
+        st.session_state.rsi_min = st.slider("RSI min", 0.0, 60.0, float(st.session_state.rsi_min), 1.0)
+        st.session_state.rsi_max = st.slider("RSI max", 40.0, 100.0, float(st.session_state.rsi_max), 1.0)
+        st.session_state.rvol_min = st.slider("RVOL min", 0.2, 2.0, float(st.session_state.rvol_min), 0.1)
+
+    colD, colE, colF = st.columns(3)
+    with colD:
+        st.session_state.vol_max = st.slider("Max annual vol filter", 0.3, 2.0, float(st.session_state.vol_max), 0.05)
+        st.session_state.cooldown_bars = st.slider("Cooldown bars after STOP", 0, 20, int(st.session_state.cooldown_bars), 1)
+    with colE:
+        st.session_state.assumed_spread_bps = st.slider("Assumed spread (bps)", 0.0, 60.0, float(st.session_state.assumed_spread_bps), 1.0)
+    with colF:
+        st.session_state.start_equity_bt = st.number_input("Backtest starting equity ($)", min_value=1000, max_value=1_000_000, value=int(st.session_state.start_equity_bt), step=1000)
 
 # ---- Load data
 if load_btn:
     stop_live()
     st.session_state.last_error = ""
     st.session_state.debug = {}
-    st.session_state.avg_corr = None
 
-    # Clear live buffers so old ticker data doesn't linger
+    # Clear live buffers
     st.session_state.trade_history = []
     st.session_state.quote_history = []
     while not st.session_state.trade_q.empty():
@@ -1463,7 +1414,6 @@ if load_btn:
             mdf, mdbg = load_historical(mkt_ticker, st.session_state.api_key, st.session_state.secret_key)
 
         st.session_state.debug = {"historical": dbg, "quote": qdbg, "market": {"ticker": mkt_ticker, **mdbg}}
-
         st.session_state.ticker = ticker
         st.session_state.latest_quote = q
         st.session_state.latest_price = mid_from_quote(q)
@@ -1479,12 +1429,9 @@ if load_btn:
             if st.session_state.latest_price is None:
                 st.session_state.latest_price = float(pd.to_numeric(df["close"], errors="coerce").iloc[-1])
 
-        # Portfolio parse (stored)
-        st.session_state.portfolio_tickers = parse_portfolio_tickers(st.session_state.portfolio_text)
-
     st.rerun()
 
-# ---- Error banner (friendly)
+# ---- Error banner
 if st.session_state.last_error:
     msg = st.session_state.last_error
     if "429" in msg or "rate" in msg.lower():
@@ -1504,7 +1451,6 @@ if sanity_warns:
 if split_warns:
     st.warning("Corporate Action Check: " + " | ".join(split_warns[:2]) + (" ..." if len(split_warns) > 2 else ""))
 
-# ---- Optional Yahoo validation
 our_close, yf_close, yf_warn = validate_price_vs_yf(st.session_state.ticker, df)
 if yf_warn:
     st.warning(yf_warn)
@@ -1513,14 +1459,14 @@ elif HAS_YF:
 else:
     st.caption("Price validator: install `yfinance` to enable multi-source daily-close validation.")
 
-# ---- Live toggle (simple)
+# ---- Live toggle
 live_box = st.container(border=True)
 with live_box:
     l1, l2, l3 = st.columns([1.0, 1.0, 3.0])
     with l1:
         live_btn = st.button("Stop Live" if st.session_state.live_active else "Start Live", use_container_width=True)
     with l2:
-        st.caption(f"Feed: {WS_FEED.upper()}")
+        st.caption("Feed: IEX")
     with l3:
         st.caption("Live is optional — analysis works without it.")
 
@@ -1535,7 +1481,7 @@ if live_btn:
             st.session_state.ticker,
             st.session_state.trade_q,
             st.session_state.quote_q,
-            feed=WS_FEED,
+            feed="iex",
         )
         t = threading.Thread(target=handler.run, daemon=True)
         t.start()
@@ -1544,7 +1490,6 @@ if live_btn:
         st.session_state.live_active = True
     st.rerun()
 
-# ---- Live heartbeat + auto-refresh
 if st.session_state.live_active:
     thr = st.session_state.ws_thread
     if thr is None or (hasattr(thr, "is_alive") and not thr.is_alive()):
@@ -1553,7 +1498,6 @@ if st.session_state.live_active:
     else:
         live_autorefresh(AUTO_REFRESH_MS, key="live_refresh")
 
-# ---- Drain live data
 drain(st.session_state.trade_q, st.session_state.trade_history, MAX_TRADES)
 drain(st.session_state.quote_q, st.session_state.quote_history, MAX_QUOTES)
 
@@ -1565,7 +1509,7 @@ if st.session_state.quote_history:
 
 current_price = float(st.session_state.latest_price or float(pd.to_numeric(df["close"], errors="coerce").iloc[-1]))
 
-# ---- Spread warning (execution)
+# ---- Spread warning
 spread_bps = None
 if st.session_state.latest_quote:
     q = st.session_state.latest_quote
@@ -1576,59 +1520,115 @@ if st.session_state.latest_quote:
         if mid > 0:
             spread_bps = 10000.0 * spread / mid
             if spread_bps > WIDE_SPREAD_BPS_WARN:
-                st.warning(f"Execution Warning: Spread is wide ({spread_bps:.1f} bps). Signals may be unreliable / slippage higher.")
+                st.warning(f"Execution Warning: Spread is wide ({spread_bps:.1f} bps). Slippage risk is higher.")
 
-# ---- Backtest aligned to strategy + dynamic slippage
-bt = backtest_strategy(
-    df=df,
+# ---- Backtest with OOS split
+df_bt = df.iloc[:-1].copy() if last_completed_index(df) == -2 else df.copy()
+df_bt = df_bt.reset_index(drop=True)
+
+split_idx = int(len(df_bt) * (1.0 - BT_OOS_FRAC))
+split_idx = max(split_idx, 260)
+
+df_is = df_bt.iloc[:split_idx].copy()
+df_oos = df_bt.iloc[split_idx:].copy()
+
+bt_is, eq_is = backtest_strategy(
+    df=df_is,
     market_df=st.session_state.market_df,
     horizon=horizon,
-    min_score=BT_MIN_SCORE,
+    mode=st.session_state.mode,
+    atr_entry=float(st.session_state.atr_entry),
+    atr_stop=float(st.session_state.atr_stop),
+    atr_target=float(st.session_state.atr_target),
+    require_risk_on=bool(st.session_state.require_risk_on),
+    rsi_max=float(st.session_state.rsi_max),
+    rsi_min=float(st.session_state.rsi_min),
+    rvol_min=float(st.session_state.rvol_min),
+    vol_max=float(st.session_state.vol_max),
+    cooldown_bars=int(st.session_state.cooldown_bars),
+    include_spread_penalty=bool(st.session_state.spread_penalty),
+    assumed_spread_bps=float(st.session_state.assumed_spread_bps),
+    start_equity=float(st.session_state.start_equity_bt),
 )
-btr = bt_stats(bt)
 
-# ---- Kelly from backtest trades
-kelly_f = kelly_from_bt(bt)
-
-# ---- Correlation sizing (optional)
-corr_mult = 1.0
-avg_corr = None
-port = st.session_state.portfolio_tickers or []
-if port:
-    tickers = tuple([st.session_state.ticker] + [t for t in port if t != st.session_state.ticker])
-    data = load_multi_historical(tickers, st.session_state.api_key, st.session_state.secret_key)
-    avg_corr = avg_corr_to_portfolio(st.session_state.ticker, port, data)
-    corr_mult = corr_kelly_multiplier(avg_corr)
-
-# ---- Compute trade metrics (uses kelly * corr penalty)
-tm = compute_trade_metrics(
-    df=df,
-    price=current_price,
+bt_oos, eq_oos = backtest_strategy(
+    df=df_oos,
+    market_df=st.session_state.market_df,
     horizon=horizon,
-    acct=float(account_size),
-    kelly_f=kelly_f,
-    corr_mult=corr_mult,
+    mode=st.session_state.mode,
+    atr_entry=float(st.session_state.atr_entry),
+    atr_stop=float(st.session_state.atr_stop),
+    atr_target=float(st.session_state.atr_target),
+    require_risk_on=bool(st.session_state.require_risk_on),
+    rsi_max=float(st.session_state.rsi_max),
+    rsi_min=float(st.session_state.rsi_min),
+    rvol_min=float(st.session_state.rvol_min),
+    vol_max=float(st.session_state.vol_max),
+    cooldown_bars=int(st.session_state.cooldown_bars),
+    include_spread_penalty=bool(st.session_state.spread_penalty),
+    assumed_spread_bps=float(st.session_state.assumed_spread_bps),
+    start_equity=float(st.session_state.start_equity_bt),
 )
 
-# ---- Market regime (as of latest completed day)
-i_comp = last_completed_index(df)
-ts_latest = df["timestamp"].iloc[i_comp] if i_comp in (-1, -2) else df["timestamp"].iloc[-1]
-regime_ticker = st.session_state.market_ticker or REGIME_TICKER_PRIMARY
-risk_on, idx_close, idx_ma200 = market_regime_at(st.session_state.market_df, ts_latest)
+btr_is = bt_stats(bt_is)
+btr_oos = bt_stats(bt_oos)
+
+# ---- Buy & Hold benchmark (OOS window)
+bench = pd.DataFrame()
+try:
+    if not df_oos.empty:
+        c = pd.to_numeric(df_oos["close"], errors="coerce").dropna()
+        if len(c) >= 2:
+            ret = c.pct_change().fillna(0.0)
+            eq = float(st.session_state.start_equity_bt) * (1 + ret).cumprod()
+            bench = pd.DataFrame({"timestamp": df_oos.loc[c.index, "timestamp"].values, "Equity": eq.values})
+except Exception:
+    bench = pd.DataFrame()
+
+# ---- Compute LIVE trade metrics with same ATR logic
+hist_full = df_bt.copy()
+v_live = annual_vol(hist_full)
+a_live = atr_value(hist_full, 14)
+ma50_live = ma(hist_full, 50)
+ma200_live = ma(hist_full, 200)
+rsi_live = rsi14_from_close(hist_full)
+rvol_live = rvol_20(hist_full)
+risk_on_live, _, _ = market_regime_at(st.session_state.market_df, hist_full["timestamp"].iloc[-1])
+
+buy, stop, sell, risk_ps = compute_levels(
+    hist_full, current_price,
+    mode=st.session_state.mode,
+    atr_mult_entry=float(st.session_state.atr_entry),
+    atr_mult_stop=float(st.session_state.atr_stop),
+    atr_mult_target=float(st.session_state.atr_target),
+)
+rrr = (sell - buy) / max(buy - stop, 0.01)
+
+# kelly estimate from in-sample trades distribution (for display only)
+kelly_disp = rolling_half_kelly_from_trades(bt_is.to_dict("records")) if not bt_is.empty else KELLY_MIN
+
+qty, cap_alloc_qty, cap_risk_qty, risk_per_share = size_position(float(account_size), buy, stop, float(kelly_disp))
+
+adv = adv_dollar_volume(hist_full, 20)
+order_value = qty * buy
+est_slip_bps = estimate_slippage_bps(BASE_SLIPPAGE_BPS, order_value, adv, v_live)
+
+prob_touch_buy = prob_hit_mc(current_price, buy, v_live, horizon, sims=700)
+prob_touch_sell = prob_hit_mc(current_price, sell, v_live, horizon, sims=700)
 
 score, decision, emoji, reasons = score_decision(
     price=current_price,
-    ma50=tm.ma50,
-    ma200=tm.ma200,
-    rrr=tm.rrr,
-    sh=btr.sharpe_ratio,
-    mdd=btr.max_drawdown,
-    wr=btr.win_rate,
-    pf=btr.profit_factor,
-    rsi14=tm.rsi14,
-    rvol=tm.rvol,
-    risk_on=risk_on,
-    regime_ticker=regime_ticker
+    ma50=ma50_live,
+    ma200=ma200_live,
+    rrr=rrr,
+    sh=btr_oos.sharpe_ratio if btr_oos.total_trades > 0 else btr_is.sharpe_ratio,
+    mdd=btr_oos.max_drawdown if btr_oos.total_trades > 0 else btr_is.max_drawdown,
+    wr=btr_oos.win_rate if btr_oos.total_trades > 0 else btr_is.win_rate,
+    pf=btr_oos.profit_factor if btr_oos.total_trades > 0 else btr_is.profit_factor,
+    rsi14=rsi_live,
+    rvol=rvol_live,
+    risk_on=risk_on_live,
+    regime_ticker=st.session_state.market_ticker or REGIME_TICKER_PRIMARY
 )
 
 # ---- Dashboard layout
@@ -1638,40 +1638,35 @@ left, right = row.columns([1.4, 1.0], vertical_alignment="top")
 with left:
     st.subheader(f"{emoji} {st.session_state.ticker} — {decision}")
     st.caption(
-        f"Price: ${current_price:,.2f} • Horizon: {horizon}d • Live: {'ON' if st.session_state.live_active else 'OFF'} • "
-        f"Regime: {regime_ticker} {'RISK-ON' if risk_on else 'RISK-OFF'}"
+        f"Price: ${current_price:,.2f} • Horizon: {horizon}d • Mode: {st.session_state.mode} • "
+        f"Regime: {st.session_state.market_ticker} {'RISK-ON' if risk_on_live else 'RISK-OFF'} • "
+        f"OOS window: {int(BT_OOS_FRAC*100)}%"
     )
 
-    # Correlation note
-    if avg_corr is not None:
-        st.caption(f"Concentration check: avg corr vs your portfolio ≈ {avg_corr:.2f} → sizing multiplier {corr_mult:.2f}")
-        if avg_corr >= CORR_WARN:
-            st.warning("Concentration Risk: Current ticker is highly correlated to your portfolio; position sizing reduced.")
-
     k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Buy (±1σ move)", f"${tm.buy:,.2f}", f"{(tm.buy/current_price - 1)*100:.1f}%")
-    k2.metric("Sell (±1σ move)", f"${tm.sell:,.2f}", f"{(tm.sell/current_price - 1)*100:.1f}%")
-    k3.metric("Stop", f"${tm.stop:,.2f}", f"{(tm.stop/current_price - 1)*100:.1f}%")
-    k4.metric("Position", f"{tm.qty} shares")
+    k1.metric("Buy (limit)", f"${buy:,.2f}", f"{(buy/current_price - 1)*100:.1f}%")
+    k2.metric("Target", f"${sell:,.2f}", f"{(sell/current_price - 1)*100:.1f}%")
+    k3.metric("Stop", f"${stop:,.2f}", f"{(stop/current_price - 1)*100:.1f}%")
+    k4.metric("Position", f"{qty} shares")
 
     s1, s2, s3, s4 = st.columns(4)
-    s1.metric("RSI(14)", f"{tm.rsi14:.1f}")
-    s2.metric("RVOL(20)", f"{tm.rvol:.2f}")
-    s3.metric("RRR", f"{tm.rrr:.2f}")
-    s4.metric("Kelly (half, adj)", f"{tm.kelly:.3f}")
+    s1.metric("RSI(14)", f"{rsi_live:.1f}")
+    s2.metric("RVOL(20)", f"{rvol_live:.2f}")
+    s3.metric("RRR", f"{rrr:.2f}")
+    s4.metric("Kelly (rolling, IS)", f"{kelly_disp:.3f}")
 
     p1, p2, p3 = st.columns(3)
-    p1.metric("Prob touch Buy", f"{tm.prob_touch_buy*100:.1f}%")
-    p2.metric("Prob touch Sell", f"{tm.prob_touch_sell*100:.1f}%")
-    p3.metric("Est. Slippage", f"{tm.est_slippage_bps:.1f} bps")
+    p1.metric("Prob touch Buy (MC)", f"{prob_touch_buy*100:.1f}%")
+    p2.metric("Prob touch Target (MC)", f"{prob_touch_sell*100:.1f}%")
+    p3.metric("Est. Slippage", f"{est_slip_bps:.1f} bps")
 
     with st.expander("Why this decision"):
         for r in reasons:
             st.write(f"- {r}")
         st.caption(
-            f"Caps: max alloc {int(MAX_ALLOC_PCT*100)}% (cap {tm.cap_alloc_qty} sh), "
-            f"max risk {int(MAX_RISK_PCT*100)}% (cap {tm.cap_risk_qty} sh). "
-            f"Backtest: strategy-aligned, gap-aware, dynamic slippage (ADV$ + vol)."
+            f"Caps: max alloc {int(MAX_ALLOC_PCT*100)}% (cap {cap_alloc_qty} sh), "
+            f"max risk {int(MAX_RISK_PCT*100)}% (cap {cap_risk_qty} sh). "
+            f"Backtest: LIMIT entry at Buy, ATR stop/target, dynamic slippage, out-of-sample."
         )
 
 with right:
@@ -1682,53 +1677,50 @@ tab1, tab2, tab3 = st.tabs(["Chart", "Backtest", "Live"])
 
 with tab1:
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=df["timestamp"], y=df["close"], name="Close"))
-    if len(df) >= 50:
-        fig.add_trace(go.Scatter(x=df["timestamp"], y=pd.to_numeric(df["close"], errors="coerce").rolling(50).mean(), name="MA50"))
-    if len(df) >= 200:
-        fig.add_trace(go.Scatter(x=df["timestamp"], y=pd.to_numeric(df["close"], errors="coerce").rolling(200).mean(), name="MA200"))
-
-    fig.add_hline(y=tm.buy, line_dash="dot", annotation_text="Buy")
-    fig.add_hline(y=tm.sell, line_dash="dot", annotation_text="Sell")
-    fig.add_hline(y=tm.stop, line_dash="dot", annotation_text="Stop")
-
+    fig.add_trace(go.Scatter(x=df_bt["timestamp"], y=df_bt["close"], name="Close"))
+    fig.add_trace(go.Scatter(x=df_bt["timestamp"], y=df_bt["ma50"], name="MA50"))
+    fig.add_trace(go.Scatter(x=df_bt["timestamp"], y=df_bt["ma200"], name="MA200"))
+    fig.add_hline(y=buy, line_dash="dot", annotation_text="Buy (limit)")
+    fig.add_hline(y=sell, line_dash="dot", annotation_text="Target")
+    fig.add_hline(y=stop, line_dash="dot", annotation_text="Stop")
     fig.update_layout(height=520, hovermode="x unified", title=f"{st.session_state.ticker} Price")
     st.plotly_chart(fig, use_container_width=True)
 
-    # Regime mini-panel
-    mdf = st.session_state.market_df
-    if mdf is not None and not mdf.empty:
-        fig2 = go.Figure()
-        fig2.add_trace(go.Scatter(x=mdf["timestamp"], y=mdf["close"], name=f"{regime_ticker} Close"))
-        if len(mdf) >= 200:
-            fig2.add_trace(go.Scatter(x=mdf["timestamp"], y=pd.to_numeric(mdf["close"], errors="coerce").rolling(200).mean(), name=f"{regime_ticker} MA200"))
-        fig2.update_layout(height=260, hovermode="x unified", title=f"Market Regime: {regime_ticker}")
-        st.plotly_chart(fig2, use_container_width=True)
-
 with tab2:
+    st.markdown("### In-sample vs Out-of-sample")
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Trades", btr.total_trades)
-    c2.metric("Win Rate", f"{btr.win_rate:.1f}%")
-    c3.metric("Profit Factor", f"{btr.profit_factor:.2f}")
-    c4.metric("Sharpe", f"{btr.sharpe_ratio:.2f}")
+    c1.metric("IS Trades", btr_is.total_trades)
+    c2.metric("IS Win Rate", f"{btr_is.win_rate:.1f}%")
+    c3.metric("IS Profit Factor", f"{btr_is.profit_factor:.2f}")
+    c4.metric("IS Sharpe", f"{btr_is.sharpe_ratio:.2f}")
 
-    c5, c6, c7, c8 = st.columns(4)
-    c5.metric("Max Drawdown", f"{btr.max_drawdown*100:.1f}%")
-    c6.metric("Total PnL", f"${btr.total_pnl:,.2f}")
-    c7.metric("Avg Win", f"{btr.avg_win:,.2f}")
-    c8.metric("Avg Loss", f"{btr.avg_loss:,.2f}")
+    d1, d2, d3, d4 = st.columns(4)
+    d1.metric("OOS Trades", btr_oos.total_trades)
+    d2.metric("OOS Win Rate", f"{btr_oos.win_rate:.1f}%")
+    d3.metric("OOS Profit Factor", f"{btr_oos.profit_factor:.2f}")
+    d4.metric("OOS Sharpe", f"{btr_oos.sharpe_ratio:.2f}")
 
-    if not bt.empty:
-        fig_bt = go.Figure()
-        fig_bt.add_trace(go.Scatter(y=bt["CumPnL"], name="Cumulative PnL"))
-        fig_bt.update_layout(height=360, title="Equity Curve (Strategy Backtest)")
-        st.plotly_chart(fig_bt, use_container_width=True)
+    e1, e2, e3, e4 = st.columns(4)
+    e1.metric("OOS Max DD", f"{btr_oos.max_drawdown*100:.1f}%")
+    e2.metric("OOS Total PnL", f"${btr_oos.total_pnl:,.2f}")
+    e3.metric("OOS Avg Win", f"{btr_oos.avg_win:,.2f}")
+    e4.metric("OOS Avg Loss", f"{btr_oos.avg_loss:,.2f}")
 
-        with st.expander("Recent trades"):
-            show = bt.tail(15).copy()
+    # Equity curves
+    fig_eq = go.Figure()
+    if not eq_oos.empty:
+        fig_eq.add_trace(go.Scatter(x=eq_oos["timestamp"], y=eq_oos["Equity"], name="Strategy (OOS)"))
+    if not bench.empty:
+        fig_eq.add_trace(go.Scatter(x=bench["timestamp"], y=bench["Equity"], name="Buy & Hold (OOS)"))
+    fig_eq.update_layout(height=360, title="Out-of-sample Equity Curve")
+    st.plotly_chart(fig_eq, use_container_width=True)
+
+    if not bt_oos.empty:
+        with st.expander("Recent OOS trades"):
+            show = bt_oos.tail(15).copy()
             show["EntryTS"] = show["EntryTS"].astype(str)
             show["ExitTS"] = show["ExitTS"].astype(str)
-            st.dataframe(show[["EntryTS", "ExitTS", "Reason", "Entry", "Exit", "PnL", "Return", "SlipBps"]], use_container_width=True)
+            st.dataframe(show[["EntryTS", "ExitTS", "Reason", "Entry", "Exit", "Qty", "PnL", "Return", "SlipBps"]], use_container_width=True)
 
 with tab3:
     if not st.session_state.live_active:
