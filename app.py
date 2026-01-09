@@ -31,16 +31,11 @@ st.set_page_config(
 st.markdown(
     """
 <style>
-/* Tighten overall page spacing */
-.block-container { padding-top: 1.2rem; padding-bottom: 1.5rem; }
-[data-testid="stSidebar"] .block-container { padding-top: 1rem; }
-h1 { margin-bottom: 0.5rem; }
-h2, h3 { margin-top: 0.6rem; }
-
-/* Reduce expander spacing a little */
-[data-testid="stExpander"] details { padding: 0.25rem 0; }
-
-/* Slightly tighten metric padding */
+.block-container { padding-top: 1.1rem; padding-bottom: 1.3rem; }
+[data-testid="stSidebar"] .block-container { padding-top: 0.8rem; }
+h1 { margin-bottom: 0.25rem; }
+h2, h3 { margin-top: 0.55rem; }
+[data-testid="stExpander"] details { padding: 0.15rem 0; }
 [data-testid="stMetric"] { padding: 0.2rem 0.2rem; }
 </style>
 """,
@@ -59,25 +54,16 @@ def ss_get(name, default):
     return st.session_state.get(name, default)
 
 
-def _nice_index(df: pd.DataFrame) -> pd.Series:
-    """Use df.index for x-axis (works for datetime index or int)."""
+def _nice_index(df: pd.DataFrame):
     return df.index
 
 
-def plot_lines(
-    df: pd.DataFrame,
-    cols: list[str],
-    *,
-    title: str,
-    height: int = 360,
-) -> "go.Figure":
+def plot_lines(df: pd.DataFrame, cols: list[str], *, title: str, height: int = 360) -> go.Figure:
     x = _nice_index(df)
-
     fig = go.Figure()
     for c in cols:
         if c in df.columns:
             fig.add_trace(go.Scatter(x=x, y=df[c], mode="lines", name=c))
-
     fig.update_layout(
         title=title,
         height=height,
@@ -90,26 +76,13 @@ def plot_lines(
     return fig
 
 
-def plot_indicator_band(
-    df: pd.DataFrame,
-    col: str,
-    *,
-    title: str,
-    height: int = 240,
-    y0: float | None = None,
-    y1: float | None = None,
-    hlines: list[float] | None = None,
-) -> "go.Figure":
+def plot_indicator(df: pd.DataFrame, col: str, *, title: str, height: int = 230, hlines=None, y0=None, y1=None):
     x = _nice_index(df)
-
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=x, y=df[col], mode="lines", name=col))
-
-    # Optional horizontal reference lines (e.g., RSI 30/70)
     if hlines:
         for v in hlines:
             fig.add_hline(y=float(v), line_width=1)
-
     fig.update_layout(
         title=title,
         height=height,
@@ -119,11 +92,137 @@ def plot_indicator_band(
     )
     fig.update_xaxes(showgrid=False)
     fig.update_yaxes(showgrid=True)
-
-    if y0 is not None and y1 is not None:
+    if (y0 is not None) and (y1 is not None):
         fig.update_yaxes(range=[float(y0), float(y1)])
-
     return fig
+
+
+def compute_sr_levels(df_ind: pd.DataFrame, lookback: int) -> tuple[float, float]:
+    """Simple Support/Resistance from recent lows/highs."""
+    lb = int(max(10, lookback))
+    tail = df_ind.tail(lb)
+    support = float(np.nanmin(tail["low"].values))
+    resistance = float(np.nanmax(tail["high"].values))
+    return support, resistance
+
+
+def compute_trade_plan_from_backtest_rules(
+    df_ind: pd.DataFrame,
+    *,
+    mode: str,
+    atr_entry: float,
+    atr_stop: float,
+    atr_target: float,
+    assumed_spread_bps: float,
+    include_spread_penalty: bool,
+) -> dict:
+    """
+    Mirrors your backtester entry math as closely as possible for *next-bar* planning.
+
+    Backtester entries:
+      pullback: limit_px = close - atr_entry*atr; filled if next low <= limit_px, entry=limit_px
+      breakout: stop_buy  = close + atr_entry*atr; filled if next high >= stop_buy, entry=stop_buy (or open if gap)
+
+    In a dashboard, we can't know next bar. So we present the *trigger/price* it would attempt:
+      pullback: planned entry = close - atr_entry*atr
+      breakout: planned entry = close + atr_entry*atr
+    Then stop/target derived the same.
+    """
+    last = df_ind.iloc[-1]
+    close = float(last["close"])
+    atr = float(last["atr14"])
+
+    if not np.isfinite(close) or not np.isfinite(atr) or atr <= 0:
+        return {"entry": np.nan, "stop": np.nan, "target": np.nan, "rr": np.nan}
+
+    mode_l = str(mode).lower().strip()
+    if mode_l == "pullback":
+        entry = close - float(atr_entry) * atr
+        entry_type = "limit (pullback trigger)"
+    elif mode_l == "breakout":
+        entry = close + float(atr_entry) * atr
+        entry_type = "stop (breakout trigger)"
+    else:
+        entry = np.nan
+        entry_type = "—"
+
+    # Spread penalty: backtester applies +bps on entry and -bps on exit.
+    # For planning, we can show the "effective" worse entry if enabled.
+    if include_spread_penalty and assumed_spread_bps > 0 and np.isfinite(entry):
+        entry_eff = entry * (1.0 + assumed_spread_bps / 10000.0)
+    else:
+        entry_eff = entry
+
+    stop = entry_eff - float(atr_stop) * atr
+    target = entry_eff + float(atr_target) * atr
+
+    risk = entry_eff - stop
+    reward = target - entry_eff
+    rr = (reward / risk) if risk > 0 else np.nan
+
+    return {"entry": entry_eff, "stop": stop, "target": target, "rr": rr, "entry_type": entry_type}
+
+
+def compute_recommendation_from_backtest_filters(
+    df_ind: pd.DataFrame,
+    *,
+    rsi_min: float,
+    rsi_max: float,
+    rvol_min: float,
+    vol_max: float,
+) -> tuple[str, str]:
+    """
+    Uses the SAME filters your backtester uses (RSI/RVOL/vol_ann) to decide if a trade is even allowed.
+    Then adds a small trend hint (MA50/MA200) to label BUY/SELL/HOLD.
+    """
+    last = df_ind.iloc[-1]
+
+    need = ["close", "ma50", "ma200", "rsi14", "rvol", "vol_ann", "atr14"]
+    missing = [c for c in need if c not in df_ind.columns]
+    if missing:
+        return "—", f"Missing columns: {missing}"
+
+    close = float(last["close"])
+    ma50 = float(last["ma50"]) if pd.notna(last["ma50"]) else np.nan
+    ma200 = float(last["ma200"]) if pd.notna(last["ma200"]) else np.nan
+    rsi = float(last["rsi14"])
+    rvol = float(last["rvol"])
+    vol_ann = float(last["vol_ann"])
+    atr = float(last["atr14"])
+
+    if not np.isfinite([close, rsi, rvol, vol_ann, atr]).all():
+        return "HOLD", "Indicators not ready (need more history)."
+
+    # Backtester filters
+    filters_ok = True
+    reasons = []
+
+    if rsi < float(rsi_min) or rsi > float(rsi_max):
+        filters_ok = False
+        reasons.append(f"RSI {rsi:.1f} outside [{rsi_min:.0f}, {rsi_max:.0f}]")
+
+    if rvol < float(rvol_min):
+        filters_ok = False
+        reasons.append(f"RVOL {rvol:.2f} < {rvol_min:.2f}")
+
+    if vol_ann > float(vol_max):
+        filters_ok = False
+        reasons.append(f"Vol {vol_ann:.2f} > {vol_max:.2f}")
+
+    # Trend context for label
+    uptrend = np.isfinite(ma50) and np.isfinite(ma200) and (close > ma50 > ma200)
+    downtrend = np.isfinite(ma50) and np.isfinite(ma200) and (close < ma50 < ma200)
+
+    if not filters_ok:
+        # Even if trend is up, backtester would not enter
+        return "HOLD", " / ".join(reasons)
+
+    # Filters pass: label as BUY in uptrend, SELL in downtrend, otherwise HOLD/WAIT
+    if uptrend:
+        return "BUY", "Filters pass (RSI/RVOL/Vol) + uptrend."
+    if downtrend:
+        return "SELL", "Filters pass but trend is down (be cautious / short logic not implemented)."
+    return "HOLD", "Filters pass, but trend not clear (wait for alignment)."
 
 
 # ---------------------------
@@ -136,7 +235,7 @@ st.title("📈 Modular Algorithmic Dashboard")
 
 
 # ---------------------------
-# Sidebar (tight + grouped via form)
+# Sidebar (form)
 # ---------------------------
 with st.sidebar:
     st.header("Settings")
@@ -166,7 +265,9 @@ with st.sidebar:
             include_spread_penalty = st.checkbox(
                 "Include spread penalty", value=bool(ss_get("include_spread_penalty", True))
             )
-            assumed_spread_bps = st.number_input("Assumed spread (bps)", 0.0, 200.0, float(ss_get("assumed_spread_bps", 5.0)))
+            assumed_spread_bps = st.number_input(
+                "Assumed spread (bps)", 0.0, 200.0, float(ss_get("assumed_spread_bps", 5.0))
+            )
 
             start_equity = st.number_input(
                 "Starting equity ($)",
@@ -179,6 +280,14 @@ with st.sidebar:
             require_risk_on = st.checkbox(
                 "Require risk-on regime (needs market_df)",
                 value=bool(ss_get("require_risk_on", False)),
+            )
+
+            sr_lookback = st.number_input(
+                "Support/Resistance lookback (bars)",
+                min_value=10,
+                max_value=300,
+                value=int(ss_get("sr_lookback", 50)),
+                step=5,
             )
 
         st.divider()
@@ -213,22 +322,26 @@ if "df_raw" not in st.session_state:
     st.session_state.last_symbol = None
 
 
-# Persist sidebar values (so they survive reruns)
-st.session_state["symbol"] = symbol
-st.session_state["mode"] = mode
-st.session_state["horizon"] = horizon
-st.session_state["atr_entry"] = atr_entry
-st.session_state["atr_stop"] = atr_stop
-st.session_state["atr_target"] = atr_target
-st.session_state["rsi_min"] = rsi_min
-st.session_state["rsi_max"] = rsi_max
-st.session_state["rvol_min"] = rvol_min
-st.session_state["vol_max"] = vol_max
-st.session_state["cooldown_bars"] = cooldown_bars
-st.session_state["include_spread_penalty"] = include_spread_penalty
-st.session_state["assumed_spread_bps"] = assumed_spread_bps
-st.session_state["start_equity"] = start_equity
-st.session_state["require_risk_on"] = require_risk_on
+# Persist sidebar values
+for k, v in {
+    "symbol": symbol,
+    "mode": mode,
+    "horizon": horizon,
+    "atr_entry": atr_entry,
+    "atr_stop": atr_stop,
+    "atr_target": atr_target,
+    "rsi_min": rsi_min,
+    "rsi_max": rsi_max,
+    "rvol_min": rvol_min,
+    "vol_max": vol_max,
+    "cooldown_bars": cooldown_bars,
+    "include_spread_penalty": include_spread_penalty,
+    "assumed_spread_bps": assumed_spread_bps,
+    "start_equity": start_equity,
+    "require_risk_on": require_risk_on,
+    "sr_lookback": sr_lookback,
+}.items():
+    st.session_state[k] = v
 
 
 # ---------------------------
@@ -264,9 +377,15 @@ if df is None or getattr(df, "empty", True):
     st.stop()
 
 
-# Prep indicators for dashboard charts (use copy)
+# ---------------------------
+# Indicators
+# ---------------------------
 df_chart = df.copy()
-if isinstance(df_chart.index, pd.DatetimeIndex):
+if "timestamp" in df_chart.columns:
+    df_chart["timestamp"] = pd.to_datetime(df_chart["timestamp"], utc=True, errors="coerce")
+    df_chart = df_chart.dropna(subset=["timestamp"]).sort_values("timestamp")
+    df_chart = df_chart.set_index("timestamp")
+elif isinstance(df_chart.index, pd.DatetimeIndex):
     df_chart = df_chart.sort_index()
 
 try:
@@ -283,84 +402,99 @@ tab1, tab2, tab3 = st.tabs(["📊 Dashboard", "🧪 Backtest", "📡 Live"])
 
 
 # ---------------------------
-# Tab 1: Dashboard (Plotly)
+# Tab 1: Dashboard (Recommendation + Levels)
 # ---------------------------
 with tab1:
-    left, right = st.columns([2.2, 1.0], gap="large")
+    rec, why = compute_recommendation_from_backtest_filters(
+        df_chart,
+        rsi_min=rsi_min,
+        rsi_max=rsi_max,
+        rvol_min=rvol_min,
+        vol_max=vol_max,
+    )
 
-    with left:
-        st.subheader(f"{symbol} — Price & Trend")
-        cols_to_plot = [c for c in ["close", "ma50", "ma200"] if c in df_chart.columns]
-        if not cols_to_plot:
-            cols_to_plot = ["close"] if "close" in df_chart.columns else list(df_chart.columns[:1])
+    plan = compute_trade_plan_from_backtest_rules(
+        df_chart,
+        mode=mode,
+        atr_entry=atr_entry,
+        atr_stop=atr_stop,
+        atr_target=atr_target,
+        assumed_spread_bps=assumed_spread_bps,
+        include_spread_penalty=include_spread_penalty,
+    )
 
-        fig_price = plot_lines(df_chart, cols_to_plot, title=f"{symbol} Price + Moving Averages", height=380)
-        st.plotly_chart(fig_price, use_container_width=True)
+    support, resistance = (np.nan, np.nan)
+    if {"low", "high"}.issubset(df_chart.columns):
+        support, resistance = compute_sr_levels(df_chart, int(sr_lookback))
 
-    with right:
-        st.subheader("Data integrity")
+    top_l, top_r = st.columns([2.0, 1.0], gap="large")
+
+    with top_l:
+        st.subheader(f"{symbol} — Signal & Levels")
+
+        if rec == "BUY":
+            st.success(f"**BUY** — {why}")
+        elif rec == "SELL":
+            st.error(f"**SELL** — {why}")
+        else:
+            st.info(f"**HOLD** — {why}")
+
+        last = df_chart.iloc[-1]
+        close = float(last["close"]) if "close" in df_chart.columns else np.nan
+        rsi = float(last["rsi14"]) if "rsi14" in df_chart.columns else np.nan
+        rvol = float(last["rvol"]) if "rvol" in df_chart.columns else np.nan
+        vol_ann = float(last["vol_ann"]) if "vol_ann" in df_chart.columns else np.nan
+
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Close", f"{close:.2f}" if np.isfinite(close) else "—")
+        m2.metric("Support", f"{support:.2f}" if np.isfinite(support) else "—")
+        m3.metric("Resistance", f"{resistance:.2f}" if np.isfinite(resistance) else "—")
+        m4.metric("RSI", f"{rsi:.1f}" if np.isfinite(rsi) else "—")
+        m5.metric("RVOL", f"{rvol:.2f}" if np.isfinite(rvol) else "—")
+
+        e1, e2, e3, e4 = st.columns(4)
+        e1.metric("Planned entry", f"{plan['entry']:.2f}" if np.isfinite(plan.get("entry", np.nan)) else "—")
+        e2.metric("Stop", f"{plan['stop']:.2f}" if np.isfinite(plan.get("stop", np.nan)) else "—")
+        e3.metric("Target", f"{plan['target']:.2f}" if np.isfinite(plan.get("target", np.nan)) else "—")
+        rr = plan.get("rr", np.nan)
+        e4.metric("R:R", f"{rr:.2f}" if np.isfinite(rr) else "—")
+
+        st.caption(f"Entry type: {plan.get('entry_type', '—')} (mirrors backtester trigger math)")
+
+    with top_r:
+        st.subheader("Data checks")
 
         if isinstance(sanity, dict):
             if sanity.get("ok", True):
                 st.success("Sanity checks: OK")
             else:
                 st.warning("Sanity checks: warnings")
-
-            with st.expander("Details", expanded=False):
+            with st.expander("Sanity details", expanded=False):
                 st.json(sanity)
         else:
             st.info("No sanity report available.")
 
-        st.subheader("Debug")
         with st.expander("Loader debug", expanded=False):
             st.json(debug_info or {})
 
     st.divider()
 
-    c1, c2, c3 = st.columns(3, gap="large")
+    left, right = st.columns([2.2, 1.0], gap="large")
 
-    with c1:
-        st.subheader("RSI(14)")
+    with left:
+        cols_to_plot = [c for c in ["close", "ma50", "ma200"] if c in df_chart.columns]
+        if not cols_to_plot:
+            cols_to_plot = ["close"] if "close" in df_chart.columns else list(df_chart.columns[:1])
+        st.plotly_chart(plot_lines(df_chart, cols_to_plot, title=f"{symbol} Price + MAs", height=360), use_container_width=True)
+
+    with right:
         if "rsi14" in df_chart.columns:
-            fig_rsi = plot_indicator_band(
-                df_chart,
-                "rsi14",
-                title="RSI(14)",
-                height=240,
-                y0=0,
-                y1=100,
-                hlines=[30, 70],
-            )
-            st.plotly_chart(fig_rsi, use_container_width=True)
-        else:
-            st.caption("RSI not available.")
-
-    with c2:
-        st.subheader("RVOL")
+            st.plotly_chart(plot_indicator(df_chart, "rsi14", title="RSI(14)", height=220, hlines=[30, 70], y0=0, y1=100), use_container_width=True)
         if "rvol" in df_chart.columns:
-            fig_rvol = plot_indicator_band(
-                df_chart,
-                "rvol",
-                title="Relative Volume (RVOL)",
-                height=240,
-                hlines=[1.0],
-            )
-            st.plotly_chart(fig_rvol, use_container_width=True)
-        else:
-            st.caption("RVOL not available.")
+            st.plotly_chart(plot_indicator(df_chart, "rvol", title="RVOL", height=220, hlines=[1.0]), use_container_width=True)
 
-    with c3:
-        st.subheader("Ann. Vol (proxy)")
-        if "vol_ann" in df_chart.columns:
-            fig_vol = plot_indicator_band(
-                df_chart,
-                "vol_ann",
-                title="Annualized Volatility (proxy)",
-                height=240,
-            )
-            st.plotly_chart(fig_vol, use_container_width=True)
-        else:
-            st.caption("Vol proxy not available.")
+    if "vol_ann" in df_chart.columns:
+        st.plotly_chart(plot_indicator(df_chart, "vol_ann", title="Annualized Vol (proxy)", height=220), use_container_width=True)
 
 
 # ---------------------------
@@ -370,7 +504,6 @@ with tab2:
     st.subheader("Backtest")
     st.caption("Tip: if you get 0 trades, loosen filters (RVOL min down, vol max up, RSI range wider).")
 
-    # Collect params safely
     _atr_entry = float(ss_get("atr_entry", 1.0))
     _atr_stop = float(ss_get("atr_stop", 2.0))
     _atr_target = float(ss_get("atr_target", 3.0))
@@ -422,7 +555,6 @@ with tab2:
         else:
             t = trades.copy()
 
-            # Basic metrics (per-share)
             if "pnl_per_share" in t.columns:
                 wins = (t["pnl_per_share"] > 0).sum()
                 win_rate = wins / max(1, len(t))
