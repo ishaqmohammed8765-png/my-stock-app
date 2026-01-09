@@ -3,7 +3,13 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from .config import CFG
+
+
+# ---- Defaults (kept here to avoid config import / circular deps) ----
+TRADING_DAYS_DEFAULT = 252
+VOL_FLOOR_DEFAULT = 0.01
+VOL_CAP_DEFAULT = 5.0
+VOL_DEFAULT_DEFAULT = 1.0
 
 
 def _fs(s: pd.Series) -> pd.Series:
@@ -32,11 +38,7 @@ def atr_wilder(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 
     prev = c.shift(1)
 
     tr = pd.concat(
-        [
-            (h - l).abs(),
-            (h - prev).abs(),
-            (l - prev).abs(),
-        ],
+        [(h - l).abs(), (h - prev).abs(), (l - prev).abs()],
         axis=1,
     ).max(axis=1)
 
@@ -51,10 +53,17 @@ def rvol_ratio(volume: pd.Series, lookback: int = 20) -> pd.Series:
     return out.fillna(1.0).clip(lower=0.0)
 
 
-def add_indicators_inplace(df: pd.DataFrame) -> None:
+def add_indicators_inplace(
+    df: pd.DataFrame,
+    *,
+    trading_days: int = TRADING_DAYS_DEFAULT,
+    vol_floor: float = VOL_FLOOR_DEFAULT,
+    vol_cap: float = VOL_CAP_DEFAULT,
+    vol_default: float = VOL_DEFAULT_DEFAULT,
+) -> None:
     """
     Adds indicator columns in-place.
-    Expected base columns: open, high, low, close, volume
+    Expected base columns: high, low, close, volume
     Adds:
       - ma50, ma200
       - rsi14
@@ -77,8 +86,8 @@ def add_indicators_inplace(df: pd.DataFrame) -> None:
 
     # Annualized vol proxy from log returns
     r = np.log(c / c.shift(1)).replace([np.inf, -np.inf], np.nan)
-    v = r.ewm(span=20, adjust=False, min_periods=20).std() * np.sqrt(CFG.TRADING_DAYS)
-    df["vol_ann"] = v.clip(lower=CFG.VOL_FLOOR, upper=CFG.VOL_CAP).fillna(CFG.VOL_DEFAULT)
+    v = r.ewm(span=20, adjust=False, min_periods=20).std() * np.sqrt(float(trading_days))
+    df["vol_ann"] = v.clip(lower=float(vol_floor), upper=float(vol_cap)).fillna(float(vol_default))
 
     df["atr14"] = atr_wilder(df["high"], df["low"], c, 14)
 
@@ -104,7 +113,6 @@ def market_regime_at(
         raise KeyError(f"market_regime_at expected market_df['{price_col}']")
 
     if idx < 0 or idx >= len(market_df):
-        # If out of range, safest is to not block trades
         return True
 
     close = _fs(market_df[price_col])
