@@ -259,7 +259,7 @@ with st.sidebar:
         st.divider()
         b1, b2 = st.columns(2)
         with b1:
-            load_btn = st.form_submit_button("🔄 Load/Refresh", use composed=True) if False else st.form_submit_button("🔄 Load/Refresh", use_container_width=True)
+          load_btn = st.form_submit_button("🔄 Load/Refresh", use_container_width=True)
         with b2:
             run_backtest = st.form_submit_button("🚀 Run Backtest", use_container_width=True)
 
