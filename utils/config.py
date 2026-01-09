@@ -1,18 +1,19 @@
-# utils/config.py
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional
+import math
+import re
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Config:
     # Market Constants
     TRADING_DAYS: int = 252
-    RISK_FREE: float = 0.045
+    RISK_FREE: float = 0.045  # annualized (overrideable if you want)
 
-    # Volatility Clamps
+    # Volatility Clamps (annualized)
     VOL_FLOOR: float = 0.10
     VOL_CAP: float = 1.80
     VOL_DEFAULT: float = 0.30
@@ -44,29 +45,91 @@ class Config:
 CFG = Config()
 
 
-def validate_keys(k: str, s: str) -> bool:
-    """Checks if Alpaca keys meet the minimum length requirements."""
-    return bool(k and s and len(k) >= 10 and len(s) >= 10)
+# Alpaca key IDs are typically 20 chars, often start with PK... (paper) or AK... (live).
+# Secrets are typically much longer.
+_KEY_ID_RE = re.compile(r"^[A-Z0-9]{16,32}$")
 
 
-def parse_ts(ts: Any) -> datetime:
-    """Standardizes various timestamp formats into UTC datetime."""
+def validate_keys(api_key: str | None, secret_key: str | None) -> bool:
+    """
+    Best-effort validation for Alpaca credentials.
+    - Avoids false positives from short strings.
+    - Still doesn't *prove* the keys are valid (only an API call can).
+    """
+    if not api_key or not secret_key:
+        return False
+
+    k = api_key.strip()
+    s = secret_key.strip()
+
+    # Quick length sanity checks
+    if len(k) < 16 or len(s) < 32:
+        return False
+
+    # Basic pattern check for key id (Alpaca often uses uppercase alnum key IDs)
+    if not _KEY_ID_RE.match(k):
+        return False
+
+    return True
+
+
+def parse_ts(ts: Any, *, default: Optional[datetime] = None, strict: bool = False) -> datetime:
+    """
+    Standardizes various timestamp formats into a timezone-aware UTC datetime.
+
+    Supported:
+    - None -> default (or now UTC)
+    - datetime (naive assumed UTC)
+    - pandas Timestamp (via to_pydatetime)
+    - ISO 8601 strings (handles trailing 'Z')
+    """
+    if default is None:
+        default = datetime.now(timezone.utc)
+
     try:
         if ts is None:
-            return datetime.now(timezone.utc)
-        if isinstance(ts, datetime):
-            return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+            return default
+
+        # pandas Timestamp / similar
         if hasattr(ts, "to_pydatetime"):
-            dt = ts.to_pydatetime()
-            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+            ts = ts.to_pydatetime()
+
+        if isinstance(ts, datetime):
+            dt = ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+
         if isinstance(ts, str):
-            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+            s = ts.strip()
+            # "Z" -> UTC offset for fromisoformat
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            dt = datetime.fromisoformat(s)
+            dt = dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+
+    except Exception as e:
+        if strict:
+            raise ValueError(f"Could not parse timestamp: {ts!r}") from e
+
+    return default
+
+
+def clamp(x: float, lo: float, hi: float, *, default: Optional[float] = None) -> float:
+    """
+    Ensures a value stays within [lo, hi].
+
+    - Handles NaN/inf safely (returns `default` if provided, else clamps to lo).
+    - Guarantees float output.
+    """
+    try:
+        xf = float(x)
     except Exception:
-        pass
-    return datetime.now(timezone.utc)
+        return float(lo if default is None else default)
 
+    if not math.isfinite(xf):
+        return float(lo if default is None else default)
 
-def clamp(x: float, lo: float, hi: float) -> float:
-    """Ensures a value stays within a specific min/max range."""
-    return float(max(lo, min(hi, x)))
+    if lo > hi:
+        lo, hi = hi, lo  # defensive: swap if misconfigured
+
+    return float(max(lo, min(hi, xf)))
