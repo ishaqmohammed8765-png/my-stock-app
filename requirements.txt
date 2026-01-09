@@ -1,6 +1,8 @@
 streamlit
-alpaca-py
 pandas
 numpy
 plotly
 scipy
+alpaca-py
+streamlit-autorefresh
+
