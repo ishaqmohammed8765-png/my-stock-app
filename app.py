@@ -7,10 +7,9 @@ from utils.data_loader import load_historical, sanity_check_bars
 from utils.indicators import add_indicators_inplace
 from utils.backtester import backtest_strategy
 
-# Optional: only import live stream if the file exists and is ready
 LIVE_AVAILABLE = True
 try:
-    from utils.live_stream import RealtimeStream  # noqa: F401
+    from utils.live_stream import RealtimeStream
 except Exception:
     LIVE_AVAILABLE = False
 
@@ -25,9 +24,6 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ---------------------------
-# Light UI polish (CSS)
-# ---------------------------
 st.markdown(
     """
 <style>
@@ -98,7 +94,6 @@ def plot_indicator(df: pd.DataFrame, col: str, *, title: str, height: int = 230,
 
 
 def compute_sr_levels(df_ind: pd.DataFrame, lookback: int) -> tuple[float, float]:
-    """Simple Support/Resistance from recent lows/highs."""
     lb = int(max(10, lookback))
     tail = df_ind.tail(lb)
     support = float(np.nanmin(tail["low"].values))
@@ -116,24 +111,12 @@ def compute_trade_plan_from_backtest_rules(
     assumed_spread_bps: float,
     include_spread_penalty: bool,
 ) -> dict:
-    """
-    Mirrors your backtester entry math as closely as possible for *next-bar* planning.
-
-    Backtester entries:
-      pullback: limit_px = close - atr_entry*atr; filled if next low <= limit_px, entry=limit_px
-      breakout: stop_buy  = close + atr_entry*atr; filled if next high >= stop_buy, entry=stop_buy (or open if gap)
-
-    In a dashboard, we can't know next bar. So we present the *trigger/price* it would attempt:
-      pullback: planned entry = close - atr_entry*atr
-      breakout: planned entry = close + atr_entry*atr
-    Then stop/target derived the same.
-    """
     last = df_ind.iloc[-1]
     close = float(last["close"])
     atr = float(last["atr14"])
 
     if not np.isfinite(close) or not np.isfinite(atr) or atr <= 0:
-        return {"entry": np.nan, "stop": np.nan, "target": np.nan, "rr": np.nan}
+        return {"entry": np.nan, "stop": np.nan, "target": np.nan, "rr": np.nan, "entry_type": "—"}
 
     mode_l = str(mode).lower().strip()
     if mode_l == "pullback":
@@ -143,24 +126,18 @@ def compute_trade_plan_from_backtest_rules(
         entry = close + float(atr_entry) * atr
         entry_type = "stop (breakout trigger)"
     else:
-        entry = np.nan
-        entry_type = "—"
+        return {"entry": np.nan, "stop": np.nan, "target": np.nan, "rr": np.nan, "entry_type": "—"}
 
-    # Spread penalty: backtester applies +bps on entry and -bps on exit.
-    # For planning, we can show the "effective" worse entry if enabled.
     if include_spread_penalty and assumed_spread_bps > 0 and np.isfinite(entry):
-        entry_eff = entry * (1.0 + assumed_spread_bps / 10000.0)
-    else:
-        entry_eff = entry
+        entry = entry * (1.0 + assumed_spread_bps / 10000.0)
 
-    stop = entry_eff - float(atr_stop) * atr
-    target = entry_eff + float(atr_target) * atr
-
-    risk = entry_eff - stop
-    reward = target - entry_eff
+    stop = entry - float(atr_stop) * atr
+    target = entry + float(atr_target) * atr
+    risk = entry - stop
+    reward = target - entry
     rr = (reward / risk) if risk > 0 else np.nan
 
-    return {"entry": entry_eff, "stop": stop, "target": target, "rr": rr, "entry_type": entry_type}
+    return {"entry": entry, "stop": stop, "target": target, "rr": rr, "entry_type": entry_type}
 
 
 def compute_recommendation_from_backtest_filters(
@@ -171,12 +148,7 @@ def compute_recommendation_from_backtest_filters(
     rvol_min: float,
     vol_max: float,
 ) -> tuple[str, str]:
-    """
-    Uses the SAME filters your backtester uses (RSI/RVOL/vol_ann) to decide if a trade is even allowed.
-    Then adds a small trend hint (MA50/MA200) to label BUY/SELL/HOLD.
-    """
     last = df_ind.iloc[-1]
-
     need = ["close", "ma50", "ma200", "rsi14", "rvol", "vol_ann", "atr14"]
     missing = [c for c in need if c not in df_ind.columns]
     if missing:
@@ -193,40 +165,47 @@ def compute_recommendation_from_backtest_filters(
     if not np.isfinite([close, rsi, rvol, vol_ann, atr]).all():
         return "HOLD", "Indicators not ready (need more history)."
 
-    # Backtester filters
-    filters_ok = True
     reasons = []
-
     if rsi < float(rsi_min) or rsi > float(rsi_max):
-        filters_ok = False
         reasons.append(f"RSI {rsi:.1f} outside [{rsi_min:.0f}, {rsi_max:.0f}]")
-
     if rvol < float(rvol_min):
-        filters_ok = False
         reasons.append(f"RVOL {rvol:.2f} < {rvol_min:.2f}")
-
     if vol_ann > float(vol_max):
-        filters_ok = False
         reasons.append(f"Vol {vol_ann:.2f} > {vol_max:.2f}")
 
-    # Trend context for label
     uptrend = np.isfinite(ma50) and np.isfinite(ma200) and (close > ma50 > ma200)
     downtrend = np.isfinite(ma50) and np.isfinite(ma200) and (close < ma50 < ma200)
 
-    if not filters_ok:
-        # Even if trend is up, backtester would not enter
+    if reasons:
         return "HOLD", " / ".join(reasons)
 
-    # Filters pass: label as BUY in uptrend, SELL in downtrend, otherwise HOLD/WAIT
     if uptrend:
         return "BUY", "Filters pass (RSI/RVOL/Vol) + uptrend."
     if downtrend:
-        return "SELL", "Filters pass but trend is down (be cautious / short logic not implemented)."
-    return "HOLD", "Filters pass, but trend not clear (wait for alignment)."
+        return "SELL", "Filters pass but trend is down (short logic not implemented)."
+    return "HOLD", "Filters pass, but trend not clear."
+
+
+def quote_to_row(q) -> dict:
+    """
+    Make a best-effort row from an Alpaca quote object.
+    Different alpaca-py versions may expose different attributes.
+    """
+    keys = ["symbol", "timestamp", "bid_price", "ask_price", "bid_size", "ask_size"]
+    out = {}
+    for k in keys:
+        if hasattr(q, k):
+            out[k] = getattr(q, k)
+    # fallback: if it's dict-like
+    if not out and isinstance(q, dict):
+        for k in keys:
+            if k in q:
+                out[k] = q[k]
+    return out or {"raw": str(q)}
 
 
 # ---------------------------
-# Secrets (no manual key entry)
+# Secrets
 # ---------------------------
 api_key = st.secrets.get("ALPACA_KEY", "")
 sec_key = st.secrets.get("ALPACA_SECRET", "")
@@ -235,7 +214,7 @@ st.title("📈 Modular Algorithmic Dashboard")
 
 
 # ---------------------------
-# Sidebar (form)
+# Sidebar
 # ---------------------------
 with st.sidebar:
     st.header("Settings")
@@ -262,12 +241,8 @@ with st.sidebar:
 
             cooldown_bars = st.number_input("Cooldown bars", 0, 200, int(ss_get("cooldown_bars", 5)))
 
-            include_spread_penalty = st.checkbox(
-                "Include spread penalty", value=bool(ss_get("include_spread_penalty", True))
-            )
-            assumed_spread_bps = st.number_input(
-                "Assumed spread (bps)", 0.0, 200.0, float(ss_get("assumed_spread_bps", 5.0))
-            )
+            include_spread_penalty = st.checkbox("Include spread penalty", value=bool(ss_get("include_spread_penalty", True)))
+            assumed_spread_bps = st.number_input("Assumed spread (bps)", 0.0, 200.0, float(ss_get("assumed_spread_bps", 5.0)))
 
             start_equity = st.number_input(
                 "Starting equity ($)",
@@ -277,23 +252,14 @@ with st.sidebar:
                 step=1_000.0,
             )
 
-            require_risk_on = st.checkbox(
-                "Require risk-on regime (needs market_df)",
-                value=bool(ss_get("require_risk_on", False)),
-            )
+            require_risk_on = st.checkbox("Require risk-on regime (needs market_df)", value=bool(ss_get("require_risk_on", False)))
 
-            sr_lookback = st.number_input(
-                "Support/Resistance lookback (bars)",
-                min_value=10,
-                max_value=300,
-                value=int(ss_get("sr_lookback", 50)),
-                step=5,
-            )
+            sr_lookback = st.number_input("Support/Resistance lookback (bars)", min_value=10, max_value=300, value=int(ss_get("sr_lookback", 50)), step=5)
 
         st.divider()
         b1, b2 = st.columns(2)
         with b1:
-            load_btn = st.form_submit_button("🔄 Load/Refresh", use_container_width=True)
+            load_btn = st.form_submit_button("🔄 Load/Refresh", use composed=True) if False else st.form_submit_button("🔄 Load/Refresh", use_container_width=True)
         with b2:
             run_backtest = st.form_submit_button("🚀 Run Backtest", use_container_width=True)
 
@@ -305,21 +271,23 @@ with st.sidebar:
         st.caption("Add ALPACA_KEY and ALPACA_SECRET in Streamlit Secrets.")
 
 
-# ---------------------------
-# Block if no keys (since your loader uses Alpaca)
-# ---------------------------
 if not has_keys(api_key, sec_key):
     st.stop()
 
 
 # ---------------------------
-# Session state init
+# Session init
 # ---------------------------
 if "df_raw" not in st.session_state:
     st.session_state.df_raw = None
     st.session_state.debug_info = None
     st.session_state.sanity = None
     st.session_state.last_symbol = None
+
+if "live_stream" not in st.session_state:
+    st.session_state.live_stream = None
+if "live_rows" not in st.session_state:
+    st.session_state.live_rows = []  # list[dict]
 
 
 # Persist sidebar values
@@ -383,8 +351,7 @@ if df is None or getattr(df, "empty", True):
 df_chart = df.copy()
 if "timestamp" in df_chart.columns:
     df_chart["timestamp"] = pd.to_datetime(df_chart["timestamp"], utc=True, errors="coerce")
-    df_chart = df_chart.dropna(subset=["timestamp"]).sort_values("timestamp")
-    df_chart = df_chart.set_index("timestamp")
+    df_chart = df_chart.dropna(subset=["timestamp"]).sort_values("timestamp").set_index("timestamp")
 elif isinstance(df_chart.index, pd.DatetimeIndex):
     df_chart = df_chart.sort_index()
 
@@ -402,15 +369,11 @@ tab1, tab2, tab3 = st.tabs(["📊 Dashboard", "🧪 Backtest", "📡 Live"])
 
 
 # ---------------------------
-# Tab 1: Dashboard (Recommendation + Levels)
+# Tab 1: Dashboard
 # ---------------------------
 with tab1:
     rec, why = compute_recommendation_from_backtest_filters(
-        df_chart,
-        rsi_min=rsi_min,
-        rsi_max=rsi_max,
-        rvol_min=rvol_min,
-        vol_max=vol_max,
+        df_chart, rsi_min=rsi_min, rsi_max=rsi_max, rvol_min=rvol_min, vol_max=vol_max
     )
 
     plan = compute_trade_plan_from_backtest_rules(
@@ -431,7 +394,6 @@ with tab1:
 
     with top_l:
         st.subheader(f"{symbol} — Signal & Levels")
-
         if rec == "BUY":
             st.success(f"**BUY** — {why}")
         elif rec == "SELL":
@@ -458,12 +420,10 @@ with tab1:
         e3.metric("Target", f"{plan['target']:.2f}" if np.isfinite(plan.get("target", np.nan)) else "—")
         rr = plan.get("rr", np.nan)
         e4.metric("R:R", f"{rr:.2f}" if np.isfinite(rr) else "—")
-
-        st.caption(f"Entry type: {plan.get('entry_type', '—')} (mirrors backtester trigger math)")
+        st.caption(f"Entry type: {plan.get('entry_type', '—')} (matches backtester trigger math)")
 
     with top_r:
         st.subheader("Data checks")
-
         if isinstance(sanity, dict):
             if sanity.get("ok", True):
                 st.success("Sanity checks: OK")
@@ -471,34 +431,26 @@ with tab1:
                 st.warning("Sanity checks: warnings")
             with st.expander("Sanity details", expanded=False):
                 st.json(sanity)
-        else:
-            st.info("No sanity report available.")
-
         with st.expander("Loader debug", expanded=False):
             st.json(debug_info or {})
 
     st.divider()
 
     left, right = st.columns([2.2, 1.0], gap="large")
-
     with left:
-        cols_to_plot = [c for c in ["close", "ma50", "ma200"] if c in df_chart.columns]
-        if not cols_to_plot:
-            cols_to_plot = ["close"] if "close" in df_chart.columns else list(df_chart.columns[:1])
+        cols_to_plot = [c for c in ["close", "ma50", "ma200"] if c in df_chart.columns] or ["close"]
         st.plotly_chart(plot_lines(df_chart, cols_to_plot, title=f"{symbol} Price + MAs", height=360), use_container_width=True)
-
     with right:
         if "rsi14" in df_chart.columns:
             st.plotly_chart(plot_indicator(df_chart, "rsi14", title="RSI(14)", height=220, hlines=[30, 70], y0=0, y1=100), use_container_width=True)
         if "rvol" in df_chart.columns:
             st.plotly_chart(plot_indicator(df_chart, "rvol", title="RVOL", height=220, hlines=[1.0]), use_container_width=True)
-
     if "vol_ann" in df_chart.columns:
         st.plotly_chart(plot_indicator(df_chart, "vol_ann", title="Annualized Vol (proxy)", height=220), use_container_width=True)
 
 
 # ---------------------------
-# Tab 2: Backtest
+# Tab 2: Backtest (unchanged)
 # ---------------------------
 with tab2:
     st.subheader("Backtest")
@@ -527,7 +479,7 @@ with tab2:
             try:
                 results, trades = backtest_strategy(
                     df=df,
-                    market_df=None,               # TODO: wire this if you want regime logic
+                    market_df=None,
                     horizon=_horizon,
                     mode=_mode,
                     atr_entry=_atr_entry,
@@ -554,7 +506,6 @@ with tab2:
             st.info("No trades generated with current params.")
         else:
             t = trades.copy()
-
             if "pnl_per_share" in t.columns:
                 wins = (t["pnl_per_share"] > 0).sum()
                 win_rate = wins / max(1, len(t))
@@ -591,20 +542,89 @@ with tab2:
 
 
 # ---------------------------
-# Tab 3: Live
+# Tab 3: Live (wired)
 # ---------------------------
 with tab3:
+    st.subheader("Live Quotes")
+
     if not LIVE_AVAILABLE:
         st.info("Live module not available (or import failed).")
-        st.caption("If you want live streaming, paste your utils/live_stream.py and I’ll wire it back in safely.")
+        st.stop()
+
+    c1, c2, c3 = st.columns([1.2, 1.2, 2.6])
+    with c1:
+        start_live = st.button("▶️ Start Live", use_container_width=True)
+    with c2:
+        stop_live = st.button("⏹ Stop Live", use_container_width=True)
+    with c3:
+        st.caption("Uses Alpaca StockDataStream quotes. Keep this tab open to see updates.")
+
+    # Ensure stream matches current symbol
+    stream: RealtimeStream | None = st.session_state.live_stream
+
+    if start_live:
+        # if symbol changed, stop old and create new
+        if stream is not None and getattr(stream, "symbol", None) != symbol:
+            try:
+                stream.stop()
+            except Exception:
+                pass
+            st.session_state.live_stream = None
+            st.session_state.live_rows = []
+
+        if st.session_state.live_stream is None:
+            st.session_state.live_stream = RealtimeStream(api_key, sec_key, symbol)
+        st.session_state.live_stream.start()
+
+    if stop_live and st.session_state.live_stream is not None:
+        try:
+            st.session_state.live_stream.stop()
+        except Exception:
+            pass
+
+    # Auto-refresh while running
+    stream = st.session_state.live_stream
+    running = bool(stream is not None and stream.is_running())
+
+    if running:
+        st.success(f"Streaming **{symbol}** quotes…")
+        st.autorefresh(interval=1500, key="live_refresh")  # 1.5s
     else:
-        st.subheader("Live (placeholder)")
+        st.info("Not streaming. Click **Start Live**.")
 
-        col1, col2 = st.columns(2)
-        with col1:
-            st.button("▶️ Start Live", use_container_width=True, disabled=True)
-        with col2:
-            st.button("⏹ Stop Live", use_container_width=True, disabled=True)
+    # Drain messages and append to table
+    if stream is not None:
+        msgs = stream.get_latest(max_items=500)
+        if msgs:
+            new_rows = [quote_to_row(m) for m in msgs]
+            st.session_state.live_rows.extend(new_rows)
+            st.session_state.live_rows = st.session_state.live_rows[-500:]  # cap memory
 
-        st.info("Live streaming is detected, but not wired into UI yet.")
-        st.caption("Once you paste utils/live_stream.py, I’ll connect Start/Stop + live chart + last tick table.")
+    rows = st.session_state.live_rows
+    if rows:
+        df_live = pd.DataFrame(rows)
+
+        # Parse/normalize timestamp if possible
+        if "timestamp" in df_live.columns:
+            try:
+                df_live["timestamp"] = pd.to_datetime(df_live["timestamp"], utc=True, errors="coerce")
+            except Exception:
+                pass
+
+        last_row = df_live.tail(1).iloc[0].to_dict()
+        bid = last_row.get("bid_price", np.nan)
+        ask = last_row.get("ask_price", np.nan)
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Last bid", f"{bid:.4f}" if isinstance(bid, (int, float, np.floating)) and np.isfinite(bid) else "—")
+        m2.metric("Last ask", f"{ask:.4f}" if isinstance(ask, (int, float, np.floating)) and np.isfinite(ask) else "—")
+        if isinstance(bid, (int, float, np.floating)) and np.isfinite(bid) and isinstance(ask, (int, float, np.floating)) and np.isfinite(ask):
+            spr = (ask - bid)
+            m3.metric("Spread", f"{spr:.4f}")
+        else:
+            m3.metric("Spread", "—")
+
+        st.subheader("Recent quotes")
+        st.dataframe(df_live.tail(50), use_container_width=True, height=420)
+    else:
+        st.caption("No quotes received yet.")
