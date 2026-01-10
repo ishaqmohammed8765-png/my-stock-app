@@ -47,7 +47,7 @@ st.set_page_config(
 )
 
 # =============================================================================
-# Minimal UI polish (clean, no debug, no “API detected”, no data-source chatter)
+# Minimal UI polish
 # =============================================================================
 st.markdown(
     """
@@ -69,7 +69,6 @@ div[data-testid="stVerticalBlockBorderWrapper"]{ border-radius: 16px; }
 .stDownloadButton button { border-radius: 14px; }
 
 code { font-size: 0.92rem; }
-
 footer { visibility: hidden; }
 </style>
 """,
@@ -163,7 +162,6 @@ def _coerce_ohlcv_numeric(df: pd.DataFrame) -> pd.DataFrame:
     for c in ["open", "high", "low", "close", "volume"]:
         if c in out.columns:
             out[c] = pd.to_numeric(out[c], errors="coerce")
-
     price_cols = [c for c in ["open", "high", "low", "close"] if c in out.columns]
     if price_cols:
         out = out.dropna(subset=price_cols)
@@ -176,7 +174,6 @@ def _coerce_ohlcv_numeric(df: pd.DataFrame) -> pd.DataFrame:
 def plot_price(df: pd.DataFrame, symbol: str) -> go.Figure:
     x = df.index
     fig = go.Figure()
-
     if all(c in df.columns for c in ["open", "high", "low", "close"]):
         fig.add_trace(
             go.Candlestick(
@@ -223,7 +220,6 @@ def plot_indicator(
     if hlines:
         for v in hlines:
             fig.add_hline(y=float(v), line_width=1)
-
     fig.update_layout(
         title=title,
         height=height,
@@ -252,7 +248,6 @@ def compute_lookback_low_high(df_ind: pd.DataFrame, lookback: int) -> Tuple[floa
 
 
 def detect_big_jump(df: pd.DataFrame, thresh: float = 0.18) -> Optional[Dict[str, Any]]:
-    """Lightweight corporate-action/data issue hint (kept minimal)."""
     if df is None or getattr(df, "empty", True) or "close" not in df.columns:
         return None
     c = pd.to_numeric(df["close"], errors="coerce")
@@ -402,7 +397,6 @@ def _stop_live_stream() -> None:
 
 
 def _msg_to_dict(x: Any) -> dict:
-    """Normalize live messages to plain dicts (lighter + safer than storing raw objects)."""
     if isinstance(x, dict):
         return x
     for attr in ("model_dump", "dict"):
@@ -455,7 +449,6 @@ def _live_dicts_to_df(rows: List[dict]) -> pd.DataFrame:
 
 # =============================================================================
 # Cached loaders
-#   Upgrade: do NOT include keys in cache arguments (prevents cache churn).
 # =============================================================================
 @st.cache_data(ttl=15 * 60, show_spinner=False)
 def _cached_load_alpaca(symbol: str, force_refresh: int) -> pd.DataFrame:
@@ -485,8 +478,6 @@ def _cached_load_yahoo(symbol: str, period: str = "5y", interval: str = "1d") ->
 def _load_and_prepare(
     symbol: str,
     *,
-    yahoo_fallback: bool,
-    yahoo_period: str,
     force_refresh: int,
 ) -> None:
     st.session_state["load_error"] = None
@@ -495,6 +486,7 @@ def _load_and_prepare(
     df: Optional[pd.DataFrame] = None
     err_primary: Optional[str] = None
 
+    # Prefer Alpaca if keys exist; else try Yahoo automatically (no UI toggle)
     if _has_keys_in_secrets():
         try:
             df = _cached_load_alpaca(symbol, force_refresh=force_refresh)
@@ -502,9 +494,15 @@ def _load_and_prepare(
             err_primary = f"{type(e).__name__}: {e}"
             df = None
 
-    if (df is None or getattr(df, "empty", True)) and yahoo_fallback:
+    if (df is None or getattr(df, "empty", True)):
+        if not YF_AVAILABLE:
+            st.session_state["load_error"] = err_primary or "No data."
+            st.session_state["df_raw"] = None
+            st.session_state["df_chart"] = None
+            st.session_state["last_symbol"] = None
+            return
         try:
-            df = _cached_load_yahoo(symbol, period=yahoo_period, interval="1d")
+            df = _cached_load_yahoo(symbol, period="5y", interval="1d")
         except Exception as e:
             err_y = f"{type(e).__name__}: {e}"
             st.session_state["load_error"] = f"{err_primary} | {err_y}" if err_primary else err_y
@@ -560,7 +558,7 @@ _ss_setdefault("bt_params_sig", None)
 
 # Live
 _ss_setdefault("live_stream", None)
-_ss_setdefault("live_rows", [])            # store dicts only
+_ss_setdefault("live_rows", [])
 _ss_setdefault("live_autorefresh", True)
 _ss_setdefault("live_last_symbol", None)
 
@@ -573,7 +571,7 @@ st.caption("Signals • Charts • Backtests • Optional live quotes")
 
 
 # =============================================================================
-# Sidebar controls (UPDATED: removed Execution + Charts options)
+# Sidebar controls (UPDATED: removed Data section + removed Run Backtest button)
 # =============================================================================
 with st.sidebar:
     st.header("Controls")
@@ -592,25 +590,16 @@ with st.sidebar:
         rvol_min = st.number_input("RVOL min", 0.0, 10.0, float(ss_get("rvol_min", 1.2)))
         vol_max = st.number_input("Max annual vol", 0.0, 5.0, float(ss_get("vol_max", 1.0)))
 
-    # ✅ Fixed defaults (no Execution + Charts options)
+    # Fixed defaults
     include_spread_penalty = True
     assumed_spread_bps = 5.0
     sr_lookback = 50
     chart_window = 700
 
-    with st.expander("Data", expanded=False):
-        yahoo_fallback = st.toggle("Use Yahoo fallback", value=bool(ss_get("yahoo_fallback", True)))
-        opts = ["1y", "2y", "5y", "10y", "max"]
-        default = str(ss_get("yahoo_period", "5y"))
-        idx = opts.index(default) if default in opts else opts.index("5y")
-        yahoo_period = st.selectbox("Yahoo history", options=opts, index=idx)
-
     st.divider()
-    c1, c2 = st.columns(2)
-    load_btn = c1.button("🔄 Load / Refresh", use_container_width=True)
-    run_backtest_btn = c2.button("🧪 Run Backtest", use_container_width=True)
+    load_btn = st.button("🔄 Load / Refresh", use_container_width=True)
 
-# Persist inputs (UPDATED: removed execution/chart keys)
+# Persist inputs
 for k, v in {
     "symbol": symbol,
     "horizon": horizon,
@@ -621,8 +610,6 @@ for k, v in {
     "rsi_max": rsi_max,
     "rvol_min": rvol_min,
     "vol_max": vol_max,
-    "yahoo_fallback": yahoo_fallback,
-    "yahoo_period": yahoo_period,
 }.items():
     st.session_state[k] = v
 
@@ -642,16 +629,11 @@ if st.session_state.get("live_stream") is not None and st.session_state.get("liv
     _stop_live_stream()
 
 force_refresh = int(time.time()) if load_btn else 0
-should_load = load_btn or _needs_load_for_current(symbol) or run_backtest_btn
+should_load = load_btn or _needs_load_for_current(symbol)
 
 if should_load:
     with st.spinner(f"Loading {symbol}…"):
-        _load_and_prepare(
-            symbol,
-            yahoo_fallback=bool(yahoo_fallback),
-            yahoo_period=str(yahoo_period),
-            force_refresh=force_refresh,
-        )
+        _load_and_prepare(symbol, force_refresh=force_refresh)
 
 df_raw = st.session_state.get("df_raw")
 df_chart = st.session_state.get("df_chart")
@@ -787,26 +769,17 @@ with tab_charts:
     c1, c2, c3 = st.columns(3, gap="large")
     with c1:
         if "rsi14" in df_plot.columns:
-            st.plotly_chart(
-                plot_indicator(df_plot, "rsi14", "RSI(14)", height=260, hlines=[30, 70], ymin=0, ymax=100),
-                use_container_width=True,
-            )
+            st.plotly_chart(plot_indicator(df_plot, "rsi14", "RSI(14)", height=260, hlines=[30, 70], ymin=0, ymax=100), use_container_width=True)
         else:
             st.info("RSI not available.")
     with c2:
         if "rvol" in df_plot.columns:
-            st.plotly_chart(
-                plot_indicator(df_plot, "rvol", "RVOL", height=260, hlines=[1.0]),
-                use_container_width=True,
-            )
+            st.plotly_chart(plot_indicator(df_plot, "rvol", "RVOL", height=260, hlines=[1.0]), use_container_width=True)
         else:
             st.info("RVOL not available.")
     with c3:
         if "vol_ann" in df_plot.columns:
-            st.plotly_chart(
-                plot_indicator(df_plot, "vol_ann", "Annualized Volatility", height=260),
-                use_container_width=True,
-            )
+            st.plotly_chart(plot_indicator(df_plot, "vol_ann", "Annualized Volatility", height=260), use_container_width=True)
         else:
             st.info("Volatility not available.")
 
@@ -815,11 +788,13 @@ with tab_charts:
 
 
 # =============================================================================
-# Backtest tab
+# Backtest tab (UPDATED: Run Backtest button moved here)
 # =============================================================================
 with tab_backtest:
     st.subheader("Backtest (Breakout-only)")
     st.caption("Uses your `utils.backtester.backtest_strategy()`; results persist across reruns.")
+
+    run_backtest_btn = st.button("🧪 Run Backtest", use_container_width=True)
 
     bt_params = dict(
         symbol=symbol,
@@ -875,7 +850,7 @@ with tab_backtest:
     df_bt = st.session_state.get("bt_results")
 
     if trades is None or getattr(trades, "empty", True):
-        st.info("No results yet. Click **🧪 Run Backtest** in the sidebar.")
+        st.info("No results yet. Click **🧪 Run Backtest** above.")
     else:
         if st.session_state.get("bt_params_sig") != sig:
             st.warning("Showing results from earlier parameters. Run again to update.")
@@ -893,7 +868,6 @@ with tab_backtest:
 
             total_ret = np.nan
             maxdd = np.nan
-
             if isinstance(df_bt, pd.DataFrame) and (not df_bt.empty) and ("equity" in df_bt.columns):
                 eq = pd.to_numeric(df_bt["equity"], errors="coerce").dropna()
                 if len(eq) > 2:
@@ -946,7 +920,6 @@ with tab_backtest:
             mime="text/csv",
             use_container_width=True,
         )
-
         st.dataframe(t, use_container_width=True, height=560)
 
 
