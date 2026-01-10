@@ -16,20 +16,7 @@ from utils.data_loader import load_historical, sanity_check_bars
 from utils.indicators import add_indicators_inplace
 from utils.backtester import backtest_strategy
 
-# Optional: auto-refresh
-try:
-    from streamlit_autorefresh import st_autorefresh  # pip install streamlit-autorefresh
-except Exception:
-    st_autorefresh = None  # type: ignore
-
-# Optional: live quotes
-LIVE_AVAILABLE = True
-try:
-    from utils.live_stream import RealtimeStream
-except Exception:
-    LIVE_AVAILABLE = False
-
-# Optional: Yahoo fallback
+# Optional: Yahoo fallback + "current-ish" price
 YF_AVAILABLE = True
 try:
     import yfinance as yf  # pip install yfinance
@@ -40,10 +27,7 @@ except Exception:
 # =============================================================================
 # Logging (keeps utils warnings visible in Streamlit logs)
 # =============================================================================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("app")
 
 
@@ -200,6 +184,42 @@ def cached_load_yahoo(symbol: str, period: str = "5y", interval: str = "1d") -> 
     return hist
 
 
+@st.cache_data(ttl=30, show_spinner=False)
+def cached_current_price_yahoo(symbol: str) -> tuple[float, str]:
+    """
+    Best-effort 'current-ish' price from Yahoo.
+    Note: may be delayed, and behaves differently pre/after-market.
+    """
+    if not YF_AVAILABLE:
+        return np.nan, "Unavailable (yfinance not installed)"
+
+    try:
+        t = yf.Ticker(symbol)
+
+        fi = getattr(t, "fast_info", None)
+        if fi and isinstance(fi, dict):
+            px = fi.get("last_price") or fi.get("lastPrice") or fi.get("regularMarketPrice")
+            px = safe_float(px)
+            if np.isfinite(px) and px > 0:
+                return float(px), "Yahoo (fast_info)"
+
+        info = getattr(t, "info", None)
+        if isinstance(info, dict):
+            px = safe_float(info.get("regularMarketPrice"))
+            if np.isfinite(px) and px > 0:
+                return float(px), "Yahoo (info)"
+
+        intr = t.history(period="1d", interval="1m")
+        if intr is not None and not intr.empty:
+            last = safe_float(intr["Close"].iloc[-1])
+            if np.isfinite(last) and last > 0:
+                return float(last), "Yahoo (1m)"
+    except Exception:
+        pass
+
+    return np.nan, "Unavailable"
+
+
 def load_and_prepare(symbol: str, *, force_refresh: int) -> None:
     st.session_state["load_error"] = None
     st.session_state["ind_error"] = None
@@ -208,6 +228,7 @@ def load_and_prepare(symbol: str, *, force_refresh: int) -> None:
     df: pd.DataFrame | None = None
     err_primary: str | None = None
 
+    # Primary: Alpaca (if keys exist)
     if has_alpaca_keys():
         try:
             df = cached_load_alpaca(symbol, force_refresh=force_refresh)
@@ -216,6 +237,7 @@ def load_and_prepare(symbol: str, *, force_refresh: int) -> None:
             err_primary = f"{type(e).__name__}: {e}"
             df = None
 
+    # Fallback: Yahoo
     if df is None or getattr(df, "empty", True):
         try:
             df = cached_load_yahoo(symbol, period="5y", interval="1d")
@@ -252,14 +274,24 @@ def load_and_prepare(symbol: str, *, force_refresh: int) -> None:
 # =============================================================================
 # Support/Resistance + Trade Plan
 # =============================================================================
-def compute_lookback_low_high(df_ind: pd.DataFrame, lookback: int) -> tuple[float, float]:
-    lb = int(max(10, lookback))
+def compute_support_resistance(df_ind: pd.DataFrame, lookback: int) -> tuple[float, float]:
+    """
+    Beginner-friendly, robust S/R:
+    Uses percentiles instead of raw min/max so a single wick doesn't dominate.
+    """
+    lb = int(max(20, lookback))
     tail = df_ind.tail(lb)
     if tail.empty or ("low" not in tail.columns) or ("high" not in tail.columns):
         return np.nan, np.nan
-    lo = float(np.nanmin(pd.to_numeric(tail["low"], errors="coerce").values))
-    hi = float(np.nanmax(pd.to_numeric(tail["high"], errors="coerce").values))
-    return lo, hi
+
+    lows = pd.to_numeric(tail["low"], errors="coerce").dropna()
+    highs = pd.to_numeric(tail["high"], errors="coerce").dropna()
+    if lows.empty or highs.empty:
+        return np.nan, np.nan
+
+    support = float(np.nanpercentile(lows.values, 10))
+    resistance = float(np.nanpercentile(highs.values, 90))
+    return support, resistance
 
 
 def compute_trade_plan(
@@ -270,6 +302,12 @@ def compute_trade_plan(
     atr_stop: float,
     atr_target: float,
 ) -> dict[str, float]:
+    """
+    Simple long-only plan:
+    - Breakout: entry above close by ATR multiple
+    - Pullback: entry below close by ATR multiple
+    Stop below entry; target above entry.
+    """
     last = df_ind.iloc[-1]
     close = safe_float(last.get("close", np.nan))
     atr = safe_float(last.get("atr14", np.nan))
@@ -307,17 +345,13 @@ def extract_markers(trades: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
         t["exit_ts"] = pd.to_datetime(t["exit_ts"], errors="coerce", utc=True)
 
     entries = pd.DataFrame(
-        {
-            "ts": t.get("entry_ts", pd.Series(dtype="datetime64[ns, UTC]")),
-            "px": pd.to_numeric(t.get("entry_px", pd.Series(dtype=float)), errors="coerce"),
-        }
+        {"ts": t.get("entry_ts", pd.Series(dtype="datetime64[ns, UTC]")),
+         "px": pd.to_numeric(t.get("entry_px", pd.Series(dtype=float)), errors="coerce")}
     ).dropna(subset=["ts", "px"])
 
     exits = pd.DataFrame(
-        {
-            "ts": t.get("exit_ts", pd.Series(dtype="datetime64[ns, UTC]")),
-            "px": pd.to_numeric(t.get("exit_px", pd.Series(dtype=float)), errors="coerce"),
-        }
+        {"ts": t.get("exit_ts", pd.Series(dtype="datetime64[ns, UTC]")),
+         "px": pd.to_numeric(t.get("exit_px", pd.Series(dtype=float)), errors="coerce")}
     ).dropna(subset=["ts", "px"])
 
     return entries, exits
@@ -328,8 +362,8 @@ def plot_price(
     symbol: str,
     trades: pd.DataFrame | None = None,
     *,
-    sr_low: float | None = None,
-    sr_high: float | None = None,
+    support: float | None = None,
+    resistance: float | None = None,
 ) -> go.Figure:
     x = df.index
     fig = go.Figure()
@@ -353,10 +387,10 @@ def plot_price(
         if col in df.columns:
             fig.add_trace(go.Scatter(x=x, y=df[col], mode="lines", name=label))
 
-    if sr_low is not None and np.isfinite(sr_low):
-        fig.add_hline(y=float(sr_low), line_width=1, line_dash="dot")
-    if sr_high is not None and np.isfinite(sr_high):
-        fig.add_hline(y=float(sr_high), line_width=1, line_dash="dot")
+    if support is not None and np.isfinite(support):
+        fig.add_hline(y=float(support), line_width=1, line_dash="dot")
+    if resistance is not None and np.isfinite(resistance):
+        fig.add_hline(y=float(resistance), line_width=1, line_dash="dot")
 
     if isinstance(trades, pd.DataFrame) and not trades.empty:
         entries, exits = extract_markers(trades)
@@ -427,7 +461,9 @@ class SignalScore:
     reasons: list[str]
 
 
-def compute_signal_score(df_ind: pd.DataFrame, rsi_min: float, rsi_max: float, rvol_min: float, vol_max: float) -> SignalScore:
+def compute_signal_score(
+    df_ind: pd.DataFrame, rsi_min: float, rsi_max: float, rvol_min: float, vol_max: float
+) -> SignalScore:
     need = ["close", "ma50", "ma200", "rsi14", "rvol", "vol_ann", "atr14"]
     missing = [c for c in need if c not in df_ind.columns]
     if missing:
@@ -485,131 +521,32 @@ def compute_signal_score(df_ind: pd.DataFrame, rsi_min: float, rsi_max: float, r
         reasons.append(f"Vol ok ({vol_ann:.2f})")
 
     score = int(np.clip(score, 0, 100))
+
+    # Beginner-friendly labels:
+    # This app is long-only (trade plan is long). So "SELL" means "avoid / bearish".
     if score >= 70 and uptrend:
         return SignalScore("BUY", score, "Favorable trend + filters supportive.", reasons)
     if score <= 30 and downtrend:
-        return SignalScore("SELL", score, "Bearish conditions dominate.", reasons)
+        return SignalScore("AVOID", score, "Bearish conditions dominate (avoid long).", reasons)
     return SignalScore("HOLD", score, "Mixed/neutral conditions.", reasons)
 
 
-# =============================================================================
-# Live helpers
-# =============================================================================
-def live_running(stream_obj: Any) -> bool:
-    try:
-        return bool(stream_obj is not None and getattr(stream_obj, "is_running")())
-    except Exception:
-        return False
+def get_current_price(symbol: str, df_chart: pd.DataFrame) -> tuple[float, str]:
+    """
+    Best-effort current price:
+    - Prefer Yahoo quick price (cached 30s)
+    - Fallback to last historical close
+    """
+    px, src = cached_current_price_yahoo(symbol)
+    if np.isfinite(px) and px > 0:
+        return float(px), src
 
+    if isinstance(df_chart, pd.DataFrame) and (not df_chart.empty) and ("close" in df_chart.columns):
+        last_close = safe_float(df_chart["close"].iloc[-1])
+        if np.isfinite(last_close):
+            return float(last_close), "Last close (historical)"
 
-def stop_live_stream() -> None:
-    stream = st.session_state.get("live_stream")
-    try:
-        if stream is not None:
-            stream.stop()
-    except Exception:
-        pass
-    st.session_state["live_stream"] = None
-
-
-def msg_to_dict(x: Any) -> dict[str, Any]:
-    if isinstance(x, dict):
-        return x
-    for attr in ("model_dump", "dict"):
-        m = getattr(x, attr, None)
-        if callable(m):
-            try:
-                return m()
-            except Exception:
-                pass
-    d: dict[str, Any] = {}
-    for k in ("symbol", "timestamp", "bid_price", "ask_price", "bid_size", "ask_size"):
-        if hasattr(x, k):
-            d[k] = getattr(x, k)
-    if not d:
-        d["message"] = str(x)
-    return d
-
-
-def live_dicts_to_df(rows: list[dict[str, Any]]) -> pd.DataFrame:
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df
-
-    rename_map = {"bp": "bid_price", "ap": "ask_price", "bs": "bid_size", "as": "ask_size", "t": "timestamp", "S": "symbol"}
-    for k, v in rename_map.items():
-        if k in df.columns and v not in df.columns:
-            df[v] = df[k]
-
-    if "timestamp" in df.columns:
-        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
-
-    if "bid_price" in df.columns and "ask_price" in df.columns:
-        bid = pd.to_numeric(df["bid_price"], errors="coerce")
-        ask = pd.to_numeric(df["ask_price"], errors="coerce")
-        mid = (bid + ask) / 2.0
-        spread = ask - bid
-        df["mid"] = mid
-        df["spread_bps"] = np.where(mid > 0, (spread / mid) * 10000.0, np.nan)
-
-    return df
-
-
-def fragment_decorator():
-    frag = getattr(st, "fragment", None)
-    if callable(frag):
-        return frag
-
-    def identity(fn):
-        return fn
-
-    return identity
-
-
-@fragment_decorator()
-def live_panel(symbol: str) -> None:
-    stream = st.session_state.get("live_stream")
-    is_running = live_running(stream)
-
-    if stream is not None:
-        try:
-            new_msgs = stream.get_latest(max_items=250)
-        except Exception:
-            new_msgs = []
-        if new_msgs:
-            st.session_state["live_rows"].extend([msg_to_dict(x) for x in new_msgs])
-            st.session_state["live_rows"] = st.session_state["live_rows"][-800:]
-
-    rows: list[dict[str, Any]] = st.session_state.get("live_rows", [])
-    st.caption("Status: ✅ running" if is_running else "Status: ⏸ stopped")
-
-    if is_running and not rows:
-        st.info("Stream is running. If you see no updates on Alpaca free paper, it’s often a market-data entitlement/feed issue (IEX vs SIP), not your keys.")
-
-    if not rows:
-        st.info("No quote updates received yet.")
-        return
-
-    df_live = live_dicts_to_df(rows)
-    if df_live.empty:
-        st.warning("Received live messages, but couldn't parse them into a table.")
-        return
-
-    latest = df_live.tail(1)
-    if not latest.empty and ("bid_price" in latest.columns) and ("ask_price" in latest.columns):
-        lbid = safe_float(pd.to_numeric(latest["bid_price"], errors="coerce").iloc[0])
-        lask = safe_float(pd.to_numeric(latest["ask_price"], errors="coerce").iloc[0])
-        lmid = (lbid + lask) / 2.0 if np.isfinite([lbid, lask]).all() else np.nan
-        lsp_bps = ((lask - lbid) / lmid) * 10000.0 if np.isfinite([lbid, lask, lmid]).all() and lmid > 0 else np.nan
-
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Bid", f"{lbid:.4f}" if np.isfinite(lbid) else "—")
-        m2.metric("Ask", f"{lask:.4f}" if np.isfinite(lask) else "—")
-        m3.metric("Spread (bps)", f"{lsp_bps:.1f}" if np.isfinite(lsp_bps) else "—")
-
-    show_cols = [c for c in ["timestamp", "symbol", "bid_price", "ask_price", "mid", "spread_bps", "bid_size", "ask_size", "message"] if c in df_live.columns]
-    view = df_live.sort_values("timestamp").tail(160) if "timestamp" in df_live.columns else df_live.tail(160)
-    st.dataframe(view[show_cols] if show_cols else view, use_container_width=True, height=520)
+    return np.nan, "Unavailable"
 
 
 # =============================================================================
@@ -629,10 +566,6 @@ ss_init(
         "bt_trades": None,
         "bt_error": None,
         "bt_params_sig": None,
-        "live_stream": None,
-        "live_rows": [],
-        "live_autorefresh": True,
-        "live_last_symbol": None,
         "cfg_export_json": "",
         "cfg_import_json": "",
     }
@@ -643,11 +576,11 @@ ss_init(
 # Header
 # =============================================================================
 st.title("📈 Pro Algo Trader")
-st.caption("Signals • Charts • Backtests • Live quotes")
+st.caption("Beginner-friendly signals • charts • backtests (educational, not financial advice)")
 
 
 # =============================================================================
-# Sidebar
+# Sidebar (simple + friendly)
 # =============================================================================
 with st.sidebar:
     st.header("Controls")
@@ -655,9 +588,10 @@ with st.sidebar:
     symbol = st.text_input("Ticker", value=str(ss_get("symbol", "AAPL"))).upper().strip()
 
     mode_label = st.selectbox(
-        "Strategy Mode",
+        "Strategy Style",
         options=["Breakout", "Pullback"],
         index=0 if str(ss_get("mode_label", "Breakout")) == "Breakout" else 1,
+        help="Breakout = enter above price. Pullback = enter below price.",
     )
     mode = "breakout" if mode_label == "Breakout" else "pullback"
 
@@ -671,18 +605,20 @@ with st.sidebar:
         rvol_min = st.number_input("RVOL min", 0.0, 10.0, float(ss_get("rvol_min", 1.2)))
         vol_max = st.number_input("Max annual vol", 0.0, 5.0, float(ss_get("vol_max", 1.0)))
 
-        sr_lookback = st.number_input("Support/Resistance lookback (bars)", 10, 300, int(ss_get("sr_lookback", 50)), 5)
+        sr_lookback = st.number_input("Support/Resistance lookback (bars)", 20, 300, int(ss_get("sr_lookback", 80)), 5)
 
     with st.expander("Risk & Sizing", expanded=False):
         enable_position_sizing = st.toggle("Enable Position Sizing", value=bool(ss_get("enable_position_sizing", False)))
 
+        # ✅ allow < £100
         account_capital = st.number_input(
-            "Account Capital",
-            min_value=100.0,
+            "Account Capital (£)",
+            min_value=1.0,
             max_value=100_000_000.0,
-            value=float(ss_get("account_capital", 10_000.0)),
-            step=100.0,
+            value=float(ss_get("account_capital", 100.0)),
+            step=1.0,
             format="%.2f",
+            help="This is used for sizing in the backtest. It does not place real trades.",
         )
 
         if enable_position_sizing:
@@ -743,7 +679,6 @@ with st.sidebar:
                 parsed = json.loads(st.session_state["cfg_import_json"] or "{}")
                 if not isinstance(parsed, dict):
                     raise ValueError("JSON must be an object.")
-
                 allowed = {
                     "symbol",
                     "mode_label",
@@ -797,11 +732,8 @@ for k, v in {
 # Auto-load
 # =============================================================================
 needs_load = load_btn or (st.session_state.get("df_raw") is None) or (st.session_state.get("last_symbol") != symbol)
-
-if st.session_state.get("live_stream") is not None and st.session_state.get("live_last_symbol") != symbol:
-    stop_live_stream()
-
 force_refresh = int(time.time()) if load_btn else 0
+
 if needs_load:
     with st.spinner(f"Loading {symbol}…"):
         load_and_prepare(symbol, force_refresh=force_refresh)
@@ -823,16 +755,15 @@ if df_chart is None or getattr(df_chart, "empty", True):
 
 df_plot = tail_for_plot(df_chart, 700)
 
-# Small status line
 src = st.session_state.get("data_source")
 if src:
     st.caption(f"Data source: **{src}**")
 
 
 # =============================================================================
-# Tabs
+# Tabs (Live tab removed)
 # =============================================================================
-tab_signal, tab_charts, tab_backtest, tab_live = st.tabs(["✅ Signal", "📊 Charts", "🧪 Backtest", "📡 Live"])
+tab_signal, tab_charts, tab_backtest = st.tabs(["✅ Signal", "📊 Charts", "🧪 Backtest"])
 
 
 # =============================================================================
@@ -841,8 +772,11 @@ tab_signal, tab_charts, tab_backtest, tab_live = st.tabs(["✅ Signal", "📊 Ch
 with tab_signal:
     st.subheader(f"{symbol} — Signal")
 
+    current_px, current_src = get_current_price(symbol, df_chart)
+
     score = compute_signal_score(df_chart, float(rsi_min), float(rsi_max), float(rvol_min), float(vol_max))
-    lo, hi = compute_lookback_low_high(df_chart, int(sr_lookback))
+    support, resistance = compute_support_resistance(df_chart, int(sr_lookback))
+
     plan = compute_trade_plan(
         df_chart,
         mode=mode,
@@ -857,8 +791,8 @@ with tab_signal:
         with a:
             if score.label == "BUY":
                 st.success(f"**BUY** • Score {score.score}/100")
-            elif score.label == "SELL":
-                st.error(f"**SELL** • Score {score.score}/100")
+            elif score.label == "AVOID":
+                st.error(f"**AVOID** • Score {score.score}/100")
             elif score.label == "WAIT":
                 st.warning(f"**WAIT** • Score {score.score}/100")
             else:
@@ -866,28 +800,35 @@ with tab_signal:
             st.caption(score.summary)
 
         with b:
-            last = df_chart.iloc[-1]
-            close = safe_float(last.get("close", np.nan))
-            atr14 = safe_float(last.get("atr14", np.nan))
-            st.metric("Close", f"{close:.2f}" if np.isfinite(close) else "—")
-            st.metric("ATR(14)", f"{atr14:.3f}" if np.isfinite(atr14) else "—")
+            st.metric("Current price", f"{current_px:.2f}" if np.isfinite(current_px) else "—")
+            st.caption(f"Source: {current_src}")
 
         with c:
-            st.metric("Support", f"{lo:.2f}" if np.isfinite(lo) else "—")
-            st.metric("Resistance", f"{hi:.2f}" if np.isfinite(hi) else "—")
+            st.metric("Support", f"{support:.2f}" if np.isfinite(support) else "—")
+            st.metric("Resistance", f"{resistance:.2f}" if np.isfinite(resistance) else "—")
 
+    st.markdown("### Where to place support / resistance (simple guidance)")
+    box = st.container(border=True)
+    with box:
+        if np.isfinite(support) and np.isfinite(resistance):
+            st.write(f"• **Support zone** ~ **{support:.2f}** → many traders place a stop a little *below* this.")
+            st.write(f"• **Resistance zone** ~ **{resistance:.2f}** → many traders take profit or get cautious near this.")
+            st.caption("These are robust percentile-based levels from the last lookback window (less sensitive to wicks).")
+        else:
+            st.info("Not enough data to compute stable support/resistance yet.")
+
+    st.markdown("### ATR Plan (optional)")
     p = st.container(border=True)
     with p:
-        st.subheader("Planned Levels (ATR-based)")
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Entry", f"{plan['entry']:.2f}" if np.isfinite(plan["entry"]) else "—")
         c2.metric("Stop", f"{plan['stop']:.2f}" if np.isfinite(plan["stop"]) else "—")
         c3.metric("Target", f"{plan['target']:.2f}" if np.isfinite(plan["target"]) else "—")
         c4.metric("R:R", f"{plan['rr']:.2f}" if np.isfinite(plan["rr"]) else "—")
-        st.caption(f"Mode: {mode_label}")
+        st.caption(f"Mode: {mode_label} • Long-only plan (for beginners)")
 
     with st.expander("Why this score?", expanded=False):
-        for r in score.reasons[:10]:
+        for r in score.reasons[:12]:
             st.write(f"• {r}")
 
 
@@ -898,10 +839,10 @@ with tab_charts:
     st.subheader(f"{symbol} — Charts")
 
     trades_for_markers = st.session_state.get("bt_trades")
-    lo, hi = compute_lookback_low_high(df_chart, int(sr_lookback))
+    support, resistance = compute_support_resistance(df_chart, int(sr_lookback))
 
     st.plotly_chart(
-        plot_price(df_plot, symbol, trades=trades_for_markers, sr_low=lo, sr_high=hi),
+        plot_price(df_plot, symbol, trades=trades_for_markers, support=support, resistance=resistance),
         use_container_width=True,
     )
 
@@ -936,6 +877,9 @@ with tab_backtest:
     with cB:
         run_backtest_btn = st.button("🧪 Run Backtest", use_container_width=True)
 
+    # NOTE:
+    # Keep parameter names aligned with your backtester signature.
+    # If your backtester expects horizon_bars or position_sizing, rename here accordingly.
     bt_params = dict(
         mode=mode,
         horizon=int(horizon_bars),
@@ -1048,49 +992,3 @@ with tab_backtest:
 
         with st.expander("Assumptions", expanded=False):
             st.json(results.get("assumptions", {}))
-
-
-# =============================================================================
-# Live tab
-# =============================================================================
-with tab_live:
-    st.subheader("Live Quotes")
-
-    if not LIVE_AVAILABLE:
-        st.info("Live module not available.")
-    elif not has_alpaca_keys():
-        st.info("Live is disabled (missing Alpaca keys in Streamlit secrets).")
-    else:
-        stream = st.session_state.get("live_stream")
-        is_running = live_running(stream)
-
-        a, b, c, d = st.columns([1, 1, 1, 2], vertical_alignment="center")
-        start_clicked = a.button("▶ Start", use_container_width=True, disabled=is_running)
-        stop_clicked = b.button("⏹ Stop", use_container_width=True, disabled=not is_running)
-        clear_clicked = c.button("🧹 Clear", use_container_width=True)
-        st.session_state["live_autorefresh"] = d.toggle("Auto refresh", value=bool(st.session_state.get("live_autorefresh", True)))
-
-        if clear_clicked:
-            st.session_state["live_rows"] = []
-
-        if start_clicked and not is_running:
-            try:
-                api_key = str(st.secrets.get("ALPACA_KEY", "")).strip()
-                sec_key = str(st.secrets.get("ALPACA_SECRET", "")).strip()
-                stream = RealtimeStream(api_key, sec_key, symbol)
-                stream.start()
-                st.session_state["live_stream"] = stream
-                st.session_state["live_last_symbol"] = symbol
-            except Exception as e:
-                st.session_state["live_stream"] = None
-                st.error("Failed to start live stream.")
-                st.caption(f"{type(e).__name__}: {e}")
-
-        if stop_clicked and is_running:
-            stop_live_stream()
-
-        live_panel(symbol)
-
-        if live_running(st.session_state.get("live_stream")) and bool(st.session_state.get("live_autorefresh", True)):
-            if st_autorefresh is not None:
-                st_autorefresh(interval=2000, key=f"live_refresh_{symbol}")
