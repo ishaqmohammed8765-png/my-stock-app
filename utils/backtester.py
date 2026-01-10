@@ -105,7 +105,7 @@ def _apply_costs_px(
         else:
             # taker_only default
             if side_l == "buy":
-                apply_spread = (fill_type == "stop") or (fill_type == "time")
+                apply_spread = (fill_type in {"stop", "time"})
             else:
                 apply_spread = (reason in {"stop", "time"})
 
@@ -188,32 +188,12 @@ def _rsi_bucket(rsi: float) -> str:
     return "Mid"
 
 
-def _rvol_bucket(rvol: float) -> str:
-    if not np.isfinite(rvol):
-        return "NA"
-    if rvol < 1.0:
-        return "Low"
-    if rvol < 1.5:
-        return "Mid"
-    return "High"
-
-
-def _vol_bucket(vol_ann: float) -> str:
-    if not np.isfinite(vol_ann):
-        return "NA"
-    if vol_ann < 0.35:
-        return "Low"
-    if vol_ann < 0.90:
-        return "Mid"
-    return "High"
-
-
 def _bucket_key(row: pd.Series) -> str:
+    # Reduced bucket complexity to avoid sparse buckets:
+    # Trend (Up/Down/Mixed) + RSI bucket (Low/Mid/High) => 9 buckets total
     return "|".join([
         _trend_bucket(row),
         _rsi_bucket(float(row["rsi14"])),
-        _rvol_bucket(float(row["rvol"])),
-        _vol_bucket(float(row["vol_ann"])),
     ])
 
 
@@ -251,7 +231,6 @@ def _simulate_outcome(
 
         if stop_hit and target_hit:
             if exit_priority in {"stop_first", "worst_case"}:
-                # assume stop first (worst case)
                 exit_px = fill_stop_sell(o, l, stop_px)
                 if exit_px is None:
                     exit_px = stop_px
@@ -304,11 +283,10 @@ def _build_bucket_stats(
     Build in-sample bucket stats from rows [0 .. is_end_i).
     Each stat contains: n, p_win, avg_r
     """
-    stats: Dict[str, List[float]] = {}  # key -> list of r-multiples
+    rs_by_key: Dict[str, List[float]] = {}
     wins: Dict[str, int] = {}
     counts: Dict[str, int] = {}
 
-    # only iterate where i+1 exists and within IS
     end = int(max(2, min(is_end_i, len(df) - 1)))
 
     for i in range(end - 1):
@@ -372,14 +350,12 @@ def _build_bucket_stats(
 
         key = _bucket_key(row)
         counts[key] = counts.get(key, 0) + 1
-        if key not in stats:
-            stats[key] = []
-        stats[key].append(float(r_mult))
+        rs_by_key.setdefault(key, []).append(float(r_mult))
         if reason == "target":
             wins[key] = wins.get(key, 0) + 1
 
     out: Dict[str, Dict[str, float]] = {}
-    for key, rs in stats.items():
+    for key, rs in rs_by_key.items():
         n = int(counts.get(key, 0))
         if n <= 0:
             continue
@@ -425,23 +401,20 @@ def backtest_strategy(
     # --- equity display only (does not change fills/logic) ---
     mark_to_market: bool = False,
 
-    # --- probability gating (NEW) ---
+    # --- probability gating (UPDATED DEFAULTS + reduced buckets) ---
     prob_gating: bool = True,
-    prob_is_frac: float = 0.70,          # first 70% builds stats
-    prob_min: float = 0.52,              # require P(win) >= this
-    min_bucket_trades: int = 30,         # require enough samples in bucket
-    min_avg_r: float = 0.02,             # require avg R >= this (tiny > 0)
+    prob_is_frac: float = 0.85,
+    prob_min: float = 0.50,
+    min_bucket_trades: int = 8,
+    min_avg_r: float = -0.05,
 ) -> Tuple[Dict[str, Any], pd.DataFrame]:
     """
     Next-bar execution breakout/pullback backtest.
 
-    mark_to_market:
-      - If True: equity curve is updated each bar while in position using current bar close.
-      - Does NOT change entry/exit logic or fills (visualization only).
-
     prob_gating:
       - Builds in-sample bucket stats (first prob_is_frac of history)
       - Skips candidate entries whose bucket has weak odds / low sample count
+      - Bucket key is reduced (Trend + RSI) to avoid sparse buckets on a single ticker
     """
     if df is None or df.empty or len(df) < int(min_hist_days):
         return {"error": "Not enough history", "df_bt": pd.DataFrame()}, pd.DataFrame()
@@ -525,7 +498,7 @@ def backtest_strategy(
     qty = 0
     cooldown = 0
 
-    # NEW: gating counters
+    # gating counters
     gated_total = 0
     gated_low_n = 0
     gated_low_p = 0
@@ -679,7 +652,7 @@ def backtest_strategy(
         if vol_ann > float(vol_max):
             continue
 
-        # NEW: probability gating (before placing entry)
+        # Probability gating BEFORE checking fills
         if prob_gating:
             key = _bucket_key(row)
             stt = bucket_stats.get(key)
@@ -788,7 +761,6 @@ def backtest_strategy(
     trades_df = pd.DataFrame(trades)
     results: Dict[str, Any] = {"df_bt": df_bt}
 
-    # Include gating diagnostics in results
     gating_info = {
         "enabled": bool(prob_gating),
         "is_frac": float(prob_is_frac),
@@ -828,8 +800,8 @@ def backtest_strategy(
                     "probability_gating": gating_info,
                 },
                 "notes_for_beginners": [
-                    "No trades were taken. This can happen if probability gating is strict or buckets have low sample counts.",
-                    "Try lowering prob_min (e.g., 0.50), lowering min_bucket_trades (e.g., 15), or widening RSI/RVOL filters.",
+                    "No trades were taken. Probability gating may still be strict or the ticker had few qualifying setups.",
+                    "Try lowering prob_min (0.50), lowering min_bucket_trades (5–10), or widening RSI/RVOL filters.",
                 ],
             }
         )
