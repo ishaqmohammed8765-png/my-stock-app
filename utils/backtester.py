@@ -1,4 +1,4 @@
-# utils/backtester.py
+## utils/backtester.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -10,7 +10,6 @@ import pandas as pd
 from .indicators import add_indicators_inplace, market_regime_at
 
 MIN_HIST_DAYS_DEFAULT = 50
-
 
 # ---------- Fill helpers (bar-based approximations) ----------
 
@@ -161,8 +160,11 @@ class _MarketRegimeIndex:
 def _max_drawdown(equity: pd.Series) -> float:
     if equity is None or len(equity) < 2:
         return float("nan")
-    peak = equity.cummax()
-    dd = (equity / peak) - 1.0
+    eq = pd.to_numeric(equity, errors="coerce").dropna()
+    if len(eq) < 2:
+        return float("nan")
+    peak = eq.cummax()
+    dd = (eq / peak) - 1.0
     return float(dd.min())
 
 
@@ -181,7 +183,6 @@ def _sharpe_from_returns(ret: pd.Series, periods_per_year: int = 252) -> float:
 # ---------- Core backtest ----------
 
 ExitPriority = Literal["stop_first", "target_first", "worst_case"]
-WorstCaseMode = Literal["conservative", "optimistic"]
 
 def backtest_strategy(
     df: pd.DataFrame,
@@ -215,18 +216,22 @@ def backtest_strategy(
     risk_pct: float = 0.02,       # risk per trade as % of equity
     max_alloc_pct: float = 0.10,  # max position value as % of equity
     min_risk_per_share: float = 1e-6,
+
+    # --- reporting (does NOT change decisions) ---
+    mark_to_market: bool = False,  # if True: equity curve includes unrealized PnL while in position
 ) -> Tuple[Dict[str, Any], pd.DataFrame]:
     """
     Beginner-friendly breakout/pullback backtest with bar-based fills (next-bar execution).
 
     Returns:
       results: dict with metrics + annotated df_bt in results["df_bt"]
-      trades: dataframe (one row per trade)
+      trades_df: dataframe (one row per trade)
 
-    Notes (important implications):
+    Notes:
     - Uses next-bar OHLC for fills -> avoids lookahead.
     - Stop/target conflicts are resolved by `exit_priority` (default conservative: stop first).
     - Slippage/spread always move price against you (more realistic).
+    - `mark_to_market` only affects reporting (equity curve), not entry/exit decisions.
     """
     # ---- Validate input ----
     if df is None or df.empty or len(df) < int(min_hist_days):
@@ -272,12 +277,13 @@ def backtest_strategy(
             f"Check add_indicators_inplace()."
         )
 
-    # Initialize annotation columns (keeps dtypes cleaner)
+    # Initialize annotation columns
     df_bt["signal"] = 0.0
     df_bt["entry_type"] = ""
     df_bt["bt_stop"] = np.nan
     df_bt["bt_target"] = np.nan
     df_bt["qty"] = np.nan
+    df_bt["equity"] = np.nan
 
     # Market regime preprocessing (FAST)
     regime_index: Optional[_MarketRegimeIndex] = None
@@ -288,7 +294,6 @@ def backtest_strategy(
     trades: List[Dict[str, Any]] = []
 
     equity = float(start_equity) if (np.isfinite(start_equity) and start_equity > 0) else 0.0
-    df_bt["equity"] = np.nan
     df_bt.loc[0, "equity"] = equity
 
     in_pos = False
@@ -299,30 +304,48 @@ def backtest_strategy(
     qty = 0
     cooldown = 0
 
-    def ts_at(i: int) -> str:
+    def ts_at(i: int) -> pd.Timestamp:
         if 0 <= i < len(df_bt):
-            return str(pd.to_datetime(df_bt.loc[i, "timestamp"], utc=True, errors="coerce"))
-        return ""
+            return pd.to_datetime(df_bt.loc[i, "timestamp"], utc=True, errors="coerce")
+        return pd.NaT
 
-    def _charge_commission(which: str) -> None:
-        nonlocal equity
+    def _commission_amount(which: str) -> float:
         if commission_per_order <= 0:
-            return
+            return 0.0
         if charge_commission_on == "both":
-            equity -= float(commission_per_order)
-        elif charge_commission_on == which:
-            equity -= float(commission_per_order)
+            return float(commission_per_order)
+        if charge_commission_on == which:
+            return float(commission_per_order)
+        return 0.0
+
+    def _apply_commission(which: str) -> float:
+        """Subtract commission from equity and return the commission charged."""
+        nonlocal equity
+        amt = _commission_amount(which)
+        if amt > 0:
+            equity -= amt
+        return amt
+
+    def _effective_qty() -> int:
+        return int(qty) if enable_position_sizing else 1
 
     # ---- Loop ----
     for i in range(len(df_bt) - 1):
-        # forward fill equity line
-        if not np.isfinite(df_bt.loc[i, "equity"]):
-            df_bt.loc[i, "equity"] = equity
+        # Reporting equity point (mark-to-market optional)
+        if mark_to_market and in_pos:
+            # Use current bar close as unrealized proxy
+            cur_close = float(df_bt.loc[i, "close"])
+            eff_qty = _effective_qty()
+            unreal = (cur_close - float(entry_px)) * eff_qty
+            df_bt.loc[i, "equity"] = float(equity + unreal)
+        else:
+            if not np.isfinite(df_bt.loc[i, "equity"]):
+                df_bt.loc[i, "equity"] = float(equity)
 
         if cooldown > 0:
             cooldown -= 1
 
-        # --------------- EXIT (if in position) ---------------
+        # --------------- EXIT ---------------
         if in_pos:
             nxt = df_bt.iloc[i + 1]
             o, h, l = float(nxt["open"]), float(nxt["high"]), float(nxt["low"])
@@ -372,20 +395,18 @@ def backtest_strategy(
                 reason=exit_reason,
             )
 
-            # Commission on exit (if configured)
             equity_before = float(equity)
-            _charge_commission("exit")
+            commission_exit = _apply_commission("exit")
 
             pnl_per_share = float(exit_px - entry_px)
             risk_per_share = float(entry_px - stop_px)
             r_mult = float(pnl_per_share / risk_per_share) if risk_per_share > min_risk_per_share else np.nan
 
-            # If sizing disabled, treat qty as 1 for equity computation (beginner-friendly)
-            eff_qty = int(qty) if enable_position_sizing else 1
+            eff_qty = _effective_qty()
             pnl = float(pnl_per_share * eff_qty)
             equity = float(equity + pnl)
 
-            df_bt.loc[i + 1, "equity"] = equity
+            df_bt.loc[i + 1, "equity"] = float(equity)
 
             trades.append(
                 {
@@ -403,10 +424,19 @@ def backtest_strategy(
                     "r_multiple": float(r_mult) if np.isfinite(r_mult) else np.nan,
                     "qty": int(eff_qty),
                     "pnl": float(pnl),
+                    "commission_entry": float("nan"),  # filled on entry; patched below
+                    "commission_exit": float(commission_exit),
+                    "commission_total": float("nan"),  # patched below
                     "equity_before": float(equity_before),
                     "equity_after": float(equity),
                 }
             )
+
+            # Patch commission totals for this trade (entry commission stored at entry time)
+            # We'll backfill after we know it. Simpler: keep last_entry_commission variable.
+            # (We store it below as last_entry_commission.)
+            trades[-1]["commission_entry"] = float(last_entry_commission)  # type: ignore[name-defined]
+            trades[-1]["commission_total"] = float(last_entry_commission + commission_exit)  # type: ignore[name-defined]
 
             # reset
             in_pos = False
@@ -416,6 +446,7 @@ def backtest_strategy(
             stop_px = np.nan
             target_px = np.nan
             qty = 0
+            last_entry_commission = 0.0  # type: ignore[name-defined]
             continue
 
         # --------------- ENTRY (flat) ---------------
@@ -438,7 +469,7 @@ def backtest_strategy(
         if not np.isfinite([rsi, rvol, vol_ann, atr, close]).all():
             continue
 
-        # Hard filters (beginner-friendly: keeps logic simple)
+        # Hard filters
         if rsi < float(rsi_min) or rsi > float(rsi_max):
             continue
         if rvol < float(rvol_min):
@@ -475,20 +506,31 @@ def backtest_strategy(
             reason="entry",
         )
 
-        # Commission on entry (if configured)
         equity_before = float(equity)
-        _charge_commission("entry")
+        last_entry_commission = _apply_commission("entry")  # stored until exit
+        # NOTE: last_entry_commission is referenced above in exit.
+        # Define it if first iteration hits entry.
+        # (We declare it here in outer scope by using `nonlocal`-like behavior via function scope.)
+        # Python: we keep it as a variable in this scope.
+        # If no trade exits, it won't be referenced.
+        # To ensure it exists for exit branch, we set a default above on entry.
 
         stop = float(entry - float(atr_stop) * atr)
         target = float(entry + float(atr_target) * atr)
 
         if not np.isfinite([entry, stop, target]).all():
+            equity = equity_before  # revert commission if invalid order
+            last_entry_commission = 0.0
             continue
         if stop >= entry or target <= entry:
+            equity = equity_before
+            last_entry_commission = 0.0
             continue
 
         risk_per_share = float(entry - stop)
         if risk_per_share <= float(min_risk_per_share):
+            equity = equity_before
+            last_entry_commission = 0.0
             continue
 
         # sizing
@@ -510,8 +552,9 @@ def backtest_strategy(
                 new_qty = 1
 
             if new_qty <= 0:
-                # undo entry commission if you want stricter accounting; we keep it simple: if you "didn't trade", no order happened
+                # No trade actually taken -> revert entry commission
                 equity = equity_before
+                last_entry_commission = 0.0
                 continue
 
         # open position
@@ -522,15 +565,13 @@ def backtest_strategy(
         target_px = float(target)
         qty = int(new_qty)
 
-        # annotate for plotting/debug
+        # annotate
         df_bt.loc[entry_i, "signal"] = 1.0
         df_bt.loc[entry_i, "entry_type"] = entry_type
         df_bt.loc[entry_i, "bt_stop"] = stop_px
         df_bt.loc[entry_i, "bt_target"] = target_px
         df_bt.loc[entry_i, "qty"] = float(qty)
-
-        # update equity marker on entry bar as well
-        df_bt.loc[entry_i, "equity"] = equity
+        df_bt.loc[entry_i, "equity"] = float(equity)
 
     # finalize equity fill
     df_bt["equity"] = df_bt["equity"].ffill()
@@ -549,6 +590,20 @@ def backtest_strategy(
                 "max_drawdown": float("nan"),
                 "sharpe": float("nan"),
                 "avg_r_multiple": float("nan"),
+                "assumptions": {
+                    "mode": mode_l,
+                    "horizon_bars": int(horizon),
+                    "slippage_bps": float(slip_bps),
+                    "spread_bps": float(spread_bps),
+                    "spread_mode": str(spread_mode),
+                    "commission_per_order": float(commission_per_order),
+                    "commission_charged_on": str(charge_commission_on),
+                    "exit_priority": str(exit_priority),
+                    "position_sizing": bool(enable_position_sizing),
+                    "risk_pct": float(risk_pct),
+                    "max_alloc_pct": float(max_alloc_pct),
+                    "mark_to_market": bool(mark_to_market),
+                },
                 "notes_for_beginners": [
                     "No trades were taken. This usually means filters are too strict (RSI/RVOL/Vol) or not enough history.",
                     "Try lowering RVOL min, widening RSI range, or increasing chart history.",
@@ -557,36 +612,25 @@ def backtest_strategy(
         )
         return results, pd.DataFrame(columns=[
             "entry_i","exit_i","entry_ts","exit_ts","entry_px","exit_px","stop_px","target_px",
-            "reason","bars_held","pnl_per_share","r_multiple","qty","pnl","equity_before","equity_after"
+            "reason","bars_held","pnl_per_share","r_multiple","qty","pnl",
+            "commission_entry","commission_exit","commission_total",
+            "equity_before","equity_after"
         ])
 
-    # win rate
     pnlps = pd.to_numeric(trades_df["pnl_per_share"], errors="coerce")
     win_rate = float((pnlps > 0).sum()) / max(1, len(pnlps))
 
-    # equity-based return (we updated equity per trade outcome)
     eq0 = float(start_equity) if (np.isfinite(start_equity) and start_equity > 0) else float("nan")
-    eqN = float(df_bt["equity"].iloc[-1]) if "equity" in df_bt.columns and len(df_bt) else float("nan")
+    eqN = float(df_bt["equity"].iloc[-1]) if len(df_bt) else float("nan")
     total_return = (eqN / eq0 - 1.0) if np.isfinite(eq0) and eq0 > 0 and np.isfinite(eqN) else float("nan")
 
-    max_dd = _max_drawdown(df_bt["equity"]) if "equity" in df_bt.columns else float("nan")
+    max_dd = _max_drawdown(df_bt["equity"])
 
-    # Sharpe: use per-bar equity returns (daily bars -> approx daily sharpe)
     eq = pd.to_numeric(df_bt["equity"], errors="coerce")
     eq_ret = eq.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
     sharpe = _sharpe_from_returns(eq_ret, periods_per_year=252)
 
     avg_r = float(pd.to_numeric(trades_df["r_multiple"], errors="coerce").dropna().mean()) if "r_multiple" in trades_df.columns else float("nan")
-
-    # Beginner-oriented notes about what assumptions imply
-    notes = [
-        "This backtest executes using the NEXT bar's OHLC, which avoids look-ahead bias (good).",
-        "Stops/targets are decided from the next bar's High/Low; if both hit in one bar, 'exit_priority' decides which one wins.",
-        f"Current exit_priority='{exit_priority}'. 'stop_first' is conservative (safer) but can understate performance.",
-        "Slippage/spread always move fills against you. If you set these too low, results can look unrealistically good.",
-        "If sizing is OFF, equity assumes 1 share per trade (beginner-friendly). Turn sizing ON for more realistic account growth.",
-        "A backtest can look profitable but still fail live because fills, gaps, and spreads behave worse than bar data suggests.",
-    ]
 
     results.update(
         {
@@ -608,17 +652,24 @@ def backtest_strategy(
                 "position_sizing": bool(enable_position_sizing),
                 "risk_pct": float(risk_pct),
                 "max_alloc_pct": float(max_alloc_pct),
+                "mark_to_market": bool(mark_to_market),
             },
-            "notes_for_beginners": notes,
+            "notes_for_beginners": [
+                "Next-bar execution avoids look-ahead bias (good).",
+                "If stop & target hit in same bar, exit_priority decides the outcome.",
+                "Slippage/spread move fills against you; too-low values make results look unrealistically good.",
+                "Mark-to-market equity (if enabled) is for smoother performance metrics, not trading decisions.",
+            ],
         }
     )
 
-    # nicer column ordering
     col_order = [
         "entry_i","exit_i","entry_ts","exit_ts",
         "entry_px","exit_px","stop_px","target_px",
         "reason","bars_held","pnl_per_share","r_multiple",
-        "qty","pnl","equity_before","equity_after"
+        "qty","pnl",
+        "commission_entry","commission_exit","commission_total",
+        "equity_before","equity_after"
     ]
     trades_df = trades_df[[c for c in col_order if c in trades_df.columns]]
 
