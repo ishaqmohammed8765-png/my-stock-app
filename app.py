@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -37,9 +38,24 @@ except Exception:
 
 
 # =============================================================================
-# Page config
+# Logging (keeps utils warnings visible in Streamlit logs)
 # =============================================================================
-st.set_page_config(page_title="Pro Algo Trader", page_icon="📈", layout="wide", initial_sidebar_state="expanded")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+log = logging.getLogger("app")
+
+
+# =============================================================================
+# Page config + CSS
+# =============================================================================
+st.set_page_config(
+    page_title="Pro Algo Trader",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
 st.markdown(
     """
@@ -61,16 +77,17 @@ footer { visibility: hidden; }
 # =============================================================================
 # Session helpers
 # =============================================================================
-def _ss_setdefault(key: str, value: Any) -> None:
-    if key not in st.session_state:
-        st.session_state[key] = value
+def ss_init(defaults: dict[str, Any]) -> None:
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
 
 def ss_get(key: str, default: Any) -> Any:
     return st.session_state.get(key, default)
 
 
-def _safe_float(x: Any) -> float:
+def safe_float(x: Any) -> float:
     try:
         v = float(x)
         return v if np.isfinite(v) else np.nan
@@ -78,29 +95,29 @@ def _safe_float(x: Any) -> float:
         return np.nan
 
 
-def _has_keys_in_secrets() -> bool:
+def has_alpaca_keys() -> bool:
     k = str(st.secrets.get("ALPACA_KEY", "")).strip()
     s = str(st.secrets.get("ALPACA_SECRET", "")).strip()
     return bool(k and s)
 
 
-def _as_utc_dtindex(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    if "timestamp" in out.columns:
-        out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True, errors="coerce")
-        out = out.dropna(subset=["timestamp"]).sort_values("timestamp").set_index("timestamp")
-    elif isinstance(out.index, pd.DatetimeIndex):
-        out = out.sort_index()
-        out.index = out.index.tz_localize("UTC") if out.index.tz is None else out.index.tz_convert("UTC")
-    return out
+def tail_for_plot(df: pd.DataFrame, n: int) -> pd.DataFrame:
+    n = int(max(120, n))
+    return df.tail(n) if len(df) > n else df
 
 
-def _ensure_ohlcv_cols(df: pd.DataFrame) -> pd.DataFrame:
+def bt_params_signature(d: dict[str, Any]) -> str:
+    return "|".join([f"{k}={v}" for k, v in sorted((k, str(v)) for k, v in d.items())])
+
+
+# =============================================================================
+# Data preparation
+# =============================================================================
+def ensure_ohlcv_cols(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or getattr(df, "empty", True):
         return df
     out = df.copy()
     lower = {str(c).lower(): c for c in out.columns}
-    mapping: Dict[str, str] = {}
 
     variants = {
         "open": ["open", "o", "opn"],
@@ -110,6 +127,7 @@ def _ensure_ohlcv_cols(df: pd.DataFrame) -> pd.DataFrame:
         "volume": ["volume", "v", "vol"],
     }
 
+    mapping: dict[str, str] = {}
     for want, keys in variants.items():
         if want in out.columns:
             continue
@@ -121,7 +139,7 @@ def _ensure_ohlcv_cols(df: pd.DataFrame) -> pd.DataFrame:
     return out.rename(columns=mapping) if mapping else out
 
 
-def _coerce_ohlcv_numeric(df: pd.DataFrame) -> pd.DataFrame:
+def coerce_ohlcv_numeric(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or getattr(df, "empty", True):
         return df
     out = df.copy()
@@ -132,13 +150,19 @@ def _coerce_ohlcv_numeric(df: pd.DataFrame) -> pd.DataFrame:
     return out.dropna(subset=price_cols) if price_cols else out
 
 
-def _tail_for_plot(df: pd.DataFrame, n: int) -> pd.DataFrame:
-    n = int(max(120, n))
-    return df.tail(n) if len(df) > n else df
+def as_utc_dtindex(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if "timestamp" in out.columns:
+        out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True, errors="coerce")
+        out = out.dropna(subset=["timestamp"]).sort_values("timestamp").set_index("timestamp")
+    elif isinstance(out.index, pd.DatetimeIndex):
+        out = out.sort_index()
+        out.index = out.index.tz_localize("UTC") if out.index.tz is None else out.index.tz_convert("UTC")
+    return out
 
 
-def _df_for_backtest(df_chart: pd.DataFrame) -> pd.DataFrame:
-    """Ensure backtester receives a frame with a `timestamp` column."""
+def df_for_backtest(df_chart: pd.DataFrame) -> pd.DataFrame:
+    """Backtester expects a `timestamp` column."""
     if isinstance(df_chart.index, pd.DatetimeIndex):
         idx_name = df_chart.index.name or "timestamp"
         tmp = df_chart.reset_index()
@@ -149,9 +173,86 @@ def _df_for_backtest(df_chart: pd.DataFrame) -> pd.DataFrame:
 
 
 # =============================================================================
+# Cached loaders
+# =============================================================================
+@st.cache_data(ttl=15 * 60, show_spinner=False)
+def cached_load_alpaca(symbol: str, force_refresh: int) -> pd.DataFrame:
+    api_key = str(st.secrets.get("ALPACA_KEY", "")).strip()
+    sec_key = str(st.secrets.get("ALPACA_SECRET", "")).strip()
+    if not api_key or not sec_key:
+        raise RuntimeError("Missing Alpaca keys in Streamlit secrets.")
+    df, _dbg = load_historical(symbol, api_key, sec_key, force_refresh=force_refresh)
+    return df
+
+
+@st.cache_data(ttl=30 * 60, show_spinner=False)
+def cached_load_yahoo(symbol: str, period: str = "5y", interval: str = "1d") -> pd.DataFrame:
+    if not YF_AVAILABLE:
+        raise RuntimeError("yfinance not installed.")
+    t = yf.Ticker(symbol)
+    hist = t.history(period=period, interval=interval, auto_adjust=False)
+    if hist is None or hist.empty:
+        raise RuntimeError("Yahoo returned no data.")
+    hist = hist.rename(columns={c: c.lower() for c in hist.columns})
+    hist = hist.reset_index().rename(columns={"Date": "timestamp", "Datetime": "timestamp"})
+    if "timestamp" not in hist.columns:
+        hist["timestamp"] = pd.to_datetime(hist.index)
+    return hist
+
+
+def load_and_prepare(symbol: str, *, force_refresh: int) -> None:
+    st.session_state["load_error"] = None
+    st.session_state["ind_error"] = None
+    st.session_state["data_source"] = None
+
+    df: pd.DataFrame | None = None
+    err_primary: str | None = None
+
+    if has_alpaca_keys():
+        try:
+            df = cached_load_alpaca(symbol, force_refresh=force_refresh)
+            st.session_state["data_source"] = "Alpaca"
+        except Exception as e:
+            err_primary = f"{type(e).__name__}: {e}"
+            df = None
+
+    if df is None or getattr(df, "empty", True):
+        try:
+            df = cached_load_yahoo(symbol, period="5y", interval="1d")
+            st.session_state["data_source"] = "Yahoo"
+        except Exception as e:
+            err_y = f"{type(e).__name__}: {e}"
+            st.session_state["load_error"] = f"{err_primary} | {err_y}" if err_primary else err_y
+            st.session_state["df_raw"] = None
+            st.session_state["df_chart"] = None
+            st.session_state["last_symbol"] = None
+            st.session_state["data_source"] = None
+            return
+
+    df = coerce_ohlcv_numeric(ensure_ohlcv_cols(df))
+    st.session_state["df_raw"] = df
+    st.session_state["last_symbol"] = symbol
+    st.session_state["last_loaded_at"] = pd.Timestamp.utcnow()
+
+    # Keep sanity checks internal (no debug-heavy UI)
+    try:
+        st.session_state["sanity"] = sanity_check_bars(df)
+    except Exception:
+        st.session_state["sanity"] = None
+
+    try:
+        df_chart = as_utc_dtindex(df)
+        add_indicators_inplace(df_chart)
+        st.session_state["df_chart"] = df_chart
+    except Exception as e:
+        st.session_state["df_chart"] = as_utc_dtindex(df)
+        st.session_state["ind_error"] = f"{type(e).__name__}: {e}"
+
+
+# =============================================================================
 # Support/Resistance + Trade Plan
 # =============================================================================
-def compute_lookback_low_high(df_ind: pd.DataFrame, lookback: int) -> Tuple[float, float]:
+def compute_lookback_low_high(df_ind: pd.DataFrame, lookback: int) -> tuple[float, float]:
     lb = int(max(10, lookback))
     tail = df_ind.tail(lb)
     if tail.empty or ("low" not in tail.columns) or ("high" not in tail.columns):
@@ -168,10 +269,10 @@ def compute_trade_plan(
     atr_entry: float,
     atr_stop: float,
     atr_target: float,
-) -> Dict[str, float]:
+) -> dict[str, float]:
     last = df_ind.iloc[-1]
-    close = _safe_float(last.get("close", np.nan))
-    atr = _safe_float(last.get("atr14", np.nan))
+    close = safe_float(last.get("close", np.nan))
+    atr = safe_float(last.get("atr14", np.nan))
 
     if not np.isfinite(close) or not np.isfinite(atr) or atr <= 0:
         return {"entry": np.nan, "stop": np.nan, "target": np.nan, "rr": np.nan}
@@ -184,13 +285,18 @@ def compute_trade_plan(
     risk = entry - stop
     reward = target - entry
     rr = (reward / risk) if risk > 0 else np.nan
-    return {"entry": float(entry), "stop": float(stop), "target": float(target), "rr": float(rr) if np.isfinite(rr) else np.nan}
+    return {
+        "entry": float(entry),
+        "stop": float(stop),
+        "target": float(target),
+        "rr": float(rr) if np.isfinite(rr) else np.nan,
+    }
 
 
 # =============================================================================
-# Plots (trade markers + SR)
+# Plots
 # =============================================================================
-def _extract_markers(trades: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def extract_markers(trades: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     if trades is None or getattr(trades, "empty", True):
         return pd.DataFrame(columns=["ts", "px"]), pd.DataFrame(columns=["ts", "px"])
 
@@ -201,13 +307,17 @@ def _extract_markers(trades: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
         t["exit_ts"] = pd.to_datetime(t["exit_ts"], errors="coerce", utc=True)
 
     entries = pd.DataFrame(
-        {"ts": t.get("entry_ts", pd.Series(dtype="datetime64[ns, UTC]")),
-         "px": pd.to_numeric(t.get("entry_px", pd.Series(dtype=float)), errors="coerce")}
+        {
+            "ts": t.get("entry_ts", pd.Series(dtype="datetime64[ns, UTC]")),
+            "px": pd.to_numeric(t.get("entry_px", pd.Series(dtype=float)), errors="coerce"),
+        }
     ).dropna(subset=["ts", "px"])
 
     exits = pd.DataFrame(
-        {"ts": t.get("exit_ts", pd.Series(dtype="datetime64[ns, UTC]")),
-         "px": pd.to_numeric(t.get("exit_px", pd.Series(dtype=float)), errors="coerce")}
+        {
+            "ts": t.get("exit_ts", pd.Series(dtype="datetime64[ns, UTC]")),
+            "px": pd.to_numeric(t.get("exit_px", pd.Series(dtype=float)), errors="coerce"),
+        }
     ).dropna(subset=["ts", "px"])
 
     return entries, exits
@@ -216,10 +326,10 @@ def _extract_markers(trades: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
 def plot_price(
     df: pd.DataFrame,
     symbol: str,
-    trades: Optional[pd.DataFrame] = None,
+    trades: pd.DataFrame | None = None,
     *,
-    sr_low: Optional[float] = None,
-    sr_high: Optional[float] = None,
+    sr_low: float | None = None,
+    sr_high: float | None = None,
 ) -> go.Figure:
     x = df.index
     fig = go.Figure()
@@ -227,8 +337,13 @@ def plot_price(
     if all(c in df.columns for c in ["open", "high", "low", "close"]):
         fig.add_trace(
             go.Candlestick(
-                x=x, open=df["open"], high=df["high"], low=df["low"], close=df["close"],
-                name="Price", showlegend=False
+                x=x,
+                open=df["open"],
+                high=df["high"],
+                low=df["low"],
+                close=df["close"],
+                name="Price",
+                showlegend=False,
             )
         )
     else:
@@ -238,25 +353,33 @@ def plot_price(
         if col in df.columns:
             fig.add_trace(go.Scatter(x=x, y=df[col], mode="lines", name=label))
 
-    # Support/Resistance
     if sr_low is not None and np.isfinite(sr_low):
         fig.add_hline(y=float(sr_low), line_width=1, line_dash="dot")
     if sr_high is not None and np.isfinite(sr_high):
         fig.add_hline(y=float(sr_high), line_width=1, line_dash="dot")
 
-    # Trade markers
     if isinstance(trades, pd.DataFrame) and not trades.empty:
-        entries, exits = _extract_markers(trades)
+        entries, exits = extract_markers(trades)
         if not entries.empty:
-            fig.add_trace(go.Scatter(
-                x=entries["ts"], y=entries["px"], mode="markers", name="Entry",
-                marker=dict(symbol="triangle-up", size=10, color="green"),
-            ))
+            fig.add_trace(
+                go.Scatter(
+                    x=entries["ts"],
+                    y=entries["px"],
+                    mode="markers",
+                    name="Entry",
+                    marker=dict(symbol="triangle-up", size=10, color="green"),
+                )
+            )
         if not exits.empty:
-            fig.add_trace(go.Scatter(
-                x=exits["ts"], y=exits["px"], mode="markers", name="Exit",
-                marker=dict(symbol="triangle-down", size=10, color="red"),
-            ))
+            fig.add_trace(
+                go.Scatter(
+                    x=exits["ts"],
+                    y=exits["px"],
+                    mode="markers",
+                    name="Exit",
+                    marker=dict(symbol="triangle-down", size=10, color="red"),
+                )
+            )
 
     fig.update_layout(
         title=f"{symbol} — Price",
@@ -276,9 +399,9 @@ def plot_indicator(
     title: str,
     *,
     height: int = 260,
-    hlines: Optional[List[float]] = None,
-    ymin: Optional[float] = None,
-    ymax: Optional[float] = None,
+    hlines: list[float] | None = None,
+    ymin: float | None = None,
+    ymax: float | None = None,
 ) -> go.Figure:
     x = df.index
     fig = go.Figure([go.Scatter(x=x, y=df[col], mode="lines")])
@@ -294,14 +417,14 @@ def plot_indicator(
 
 
 # =============================================================================
-# Signal helpers (simple)
+# Signals
 # =============================================================================
 @dataclass(frozen=True)
 class SignalScore:
     label: str
     score: int
     summary: str
-    reasons: List[str]
+    reasons: list[str]
 
 
 def compute_signal_score(df_ind: pd.DataFrame, rsi_min: float, rsi_max: float, rvol_min: float, vol_max: float) -> SignalScore:
@@ -311,19 +434,19 @@ def compute_signal_score(df_ind: pd.DataFrame, rsi_min: float, rsi_max: float, r
         return SignalScore("WAIT", 0, "Indicators not ready.", [f"Missing: {', '.join(missing[:6])}"])
 
     last = df_ind.iloc[-1]
-    close = _safe_float(last.get("close"))
-    ma50 = _safe_float(last.get("ma50"))
-    ma200 = _safe_float(last.get("ma200"))
-    rsi = _safe_float(last.get("rsi14"))
-    rvol = _safe_float(last.get("rvol"))
-    vol_ann = _safe_float(last.get("vol_ann"))
-    atr = _safe_float(last.get("atr14"))
+    close = safe_float(last.get("close"))
+    ma50 = safe_float(last.get("ma50"))
+    ma200 = safe_float(last.get("ma200"))
+    rsi = safe_float(last.get("rsi14"))
+    rvol = safe_float(last.get("rvol"))
+    vol_ann = safe_float(last.get("vol_ann"))
+    atr = safe_float(last.get("atr14"))
 
     vals = np.array([close, ma50, ma200, rsi, rvol, vol_ann, atr], dtype="float64")
     if not np.isfinite(vals).all():
         return SignalScore("WAIT", 0, "Waiting for enough history.", ["Non-finite indicator values"])
 
-    reasons: List[str] = []
+    reasons: list[str] = []
     score = 50
 
     uptrend = (close > ma50 > ma200)
@@ -369,93 +492,17 @@ def compute_signal_score(df_ind: pd.DataFrame, rsi_min: float, rsi_max: float, r
     return SignalScore("HOLD", score, "Mixed/neutral conditions.", reasons)
 
 
-def _bt_params_signature(d: Dict[str, Any]) -> str:
-    return "|".join([f"{k}={v}" for k, v in sorted((k, str(v)) for k, v in d.items())])
-
-
-# =============================================================================
-# Data loading (Alpaca preferred; Yahoo fallback)
-# =============================================================================
-@st.cache_data(ttl=15 * 60, show_spinner=False)
-def _cached_load_alpaca(symbol: str, force_refresh: int) -> pd.DataFrame:
-    api_key = str(st.secrets.get("ALPACA_KEY", "")).strip()
-    sec_key = str(st.secrets.get("ALPACA_SECRET", "")).strip()
-    if not api_key or not sec_key:
-        raise RuntimeError("Missing Alpaca keys in Streamlit secrets.")
-    df, _dbg = load_historical(symbol, api_key, sec_key, force_refresh=force_refresh)
-    return df
-
-
-@st.cache_data(ttl=30 * 60, show_spinner=False)
-def _cached_load_yahoo(symbol: str, period: str = "5y", interval: str = "1d") -> pd.DataFrame:
-    if not YF_AVAILABLE:
-        raise RuntimeError("yfinance not installed.")
-    t = yf.Ticker(symbol)
-    hist = t.history(period=period, interval=interval, auto_adjust=False)
-    if hist is None or hist.empty:
-        raise RuntimeError("Yahoo returned no data.")
-    hist = hist.rename(columns={c: c.lower() for c in hist.columns})
-    hist = hist.reset_index().rename(columns={"Date": "timestamp", "Datetime": "timestamp"})
-    if "timestamp" not in hist.columns:
-        hist["timestamp"] = pd.to_datetime(hist.index)
-    return hist
-
-
-def _load_and_prepare(symbol: str, *, force_refresh: int) -> None:
-    st.session_state["load_error"] = None
-    st.session_state["ind_error"] = None
-
-    df: Optional[pd.DataFrame] = None
-    err_primary: Optional[str] = None
-
-    if _has_keys_in_secrets():
-        try:
-            df = _cached_load_alpaca(symbol, force_refresh=force_refresh)
-        except Exception as e:
-            err_primary = f"{type(e).__name__}: {e}"
-            df = None
-
-    if df is None or getattr(df, "empty", True):
-        try:
-            df = _cached_load_yahoo(symbol, period="5y", interval="1d")
-        except Exception as e:
-            err_y = f"{type(e).__name__}: {e}"
-            st.session_state["load_error"] = f"{err_primary} | {err_y}" if err_primary else err_y
-            st.session_state["df_raw"] = None
-            st.session_state["df_chart"] = None
-            st.session_state["last_symbol"] = None
-            return
-
-    df = _coerce_ohlcv_numeric(_ensure_ohlcv_cols(df))
-    st.session_state["df_raw"] = df
-    st.session_state["last_symbol"] = symbol
-    st.session_state["last_loaded_at"] = pd.Timestamp.utcnow()
-
-    try:
-        st.session_state["sanity"] = sanity_check_bars(df)
-    except Exception:
-        st.session_state["sanity"] = None
-
-    try:
-        df_chart = _as_utc_dtindex(df)
-        add_indicators_inplace(df_chart)
-        st.session_state["df_chart"] = df_chart
-    except Exception as e:
-        st.session_state["df_chart"] = _as_utc_dtindex(df)
-        st.session_state["ind_error"] = f"{type(e).__name__}: {e}"
-
-
 # =============================================================================
 # Live helpers
 # =============================================================================
-def _live_running(stream_obj) -> bool:
+def live_running(stream_obj: Any) -> bool:
     try:
         return bool(stream_obj is not None and getattr(stream_obj, "is_running")())
     except Exception:
         return False
 
 
-def _stop_live_stream() -> None:
+def stop_live_stream() -> None:
     stream = st.session_state.get("live_stream")
     try:
         if stream is not None:
@@ -465,7 +512,7 @@ def _stop_live_stream() -> None:
     st.session_state["live_stream"] = None
 
 
-def _msg_to_dict(x: Any) -> dict:
+def msg_to_dict(x: Any) -> dict[str, Any]:
     if isinstance(x, dict):
         return x
     for attr in ("model_dump", "dict"):
@@ -475,7 +522,7 @@ def _msg_to_dict(x: Any) -> dict:
                 return m()
             except Exception:
                 pass
-    d: Dict[str, Any] = {}
+    d: dict[str, Any] = {}
     for k in ("symbol", "timestamp", "bid_price", "ask_price", "bid_size", "ask_size"):
         if hasattr(x, k):
             d[k] = getattr(x, k)
@@ -484,7 +531,7 @@ def _msg_to_dict(x: Any) -> dict:
     return d
 
 
-def _live_dicts_to_df(rows: List[dict]) -> pd.DataFrame:
+def live_dicts_to_df(rows: list[dict[str, Any]]) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     if df.empty:
         return df
@@ -508,19 +555,21 @@ def _live_dicts_to_df(rows: List[dict]) -> pd.DataFrame:
     return df
 
 
-def _fragment_decorator():
+def fragment_decorator():
     frag = getattr(st, "fragment", None)
     if callable(frag):
         return frag
+
     def identity(fn):
         return fn
+
     return identity
 
 
-@_fragment_decorator()
-def _live_panel(symbol: str) -> None:
+@fragment_decorator()
+def live_panel(symbol: str) -> None:
     stream = st.session_state.get("live_stream")
-    live_running = _live_running(stream)
+    is_running = live_running(stream)
 
     if stream is not None:
         try:
@@ -528,25 +577,28 @@ def _live_panel(symbol: str) -> None:
         except Exception:
             new_msgs = []
         if new_msgs:
-            st.session_state["live_rows"].extend([_msg_to_dict(x) for x in new_msgs])
+            st.session_state["live_rows"].extend([msg_to_dict(x) for x in new_msgs])
             st.session_state["live_rows"] = st.session_state["live_rows"][-800:]
 
-    rows: List[dict] = st.session_state.get("live_rows", [])
-    st.caption("Status: ✅ running" if live_running else "Status: ⏸ stopped")
+    rows: list[dict[str, Any]] = st.session_state.get("live_rows", [])
+    st.caption("Status: ✅ running" if is_running else "Status: ⏸ stopped")
+
+    if is_running and not rows:
+        st.info("Stream is running. If you see no updates on Alpaca free paper, it’s often a market-data entitlement/feed issue (IEX vs SIP), not your keys.")
 
     if not rows:
         st.info("No quote updates received yet.")
         return
 
-    df_live = _live_dicts_to_df(rows)
+    df_live = live_dicts_to_df(rows)
     if df_live.empty:
         st.warning("Received live messages, but couldn't parse them into a table.")
         return
 
     latest = df_live.tail(1)
     if not latest.empty and ("bid_price" in latest.columns) and ("ask_price" in latest.columns):
-        lbid = _safe_float(pd.to_numeric(latest["bid_price"], errors="coerce").iloc[0])
-        lask = _safe_float(pd.to_numeric(latest["ask_price"], errors="coerce").iloc[0])
+        lbid = safe_float(pd.to_numeric(latest["bid_price"], errors="coerce").iloc[0])
+        lask = safe_float(pd.to_numeric(latest["ask_price"], errors="coerce").iloc[0])
         lmid = (lbid + lask) / 2.0 if np.isfinite([lbid, lask]).all() else np.nan
         lsp_bps = ((lask - lbid) / lmid) * 10000.0 if np.isfinite([lbid, lask, lmid]).all() and lmid > 0 else np.nan
 
@@ -563,26 +615,28 @@ def _live_panel(symbol: str) -> None:
 # =============================================================================
 # Session init
 # =============================================================================
-for k, v in {
-    "df_raw": None,
-    "df_chart": None,
-    "sanity": None,
-    "load_error": None,
-    "ind_error": None,
-    "last_symbol": None,
-    "last_loaded_at": None,
-    "bt_results": None,
-    "bt_trades": None,
-    "bt_error": None,
-    "bt_params_sig": None,
-    "live_stream": None,
-    "live_rows": [],
-    "live_autorefresh": True,
-    "live_last_symbol": None,
-    "cfg_export_json": "",
-    "cfg_import_json": "",
-}.items():
-    _ss_setdefault(k, v)
+ss_init(
+    {
+        "df_raw": None,
+        "df_chart": None,
+        "sanity": None,
+        "load_error": None,
+        "ind_error": None,
+        "last_symbol": None,
+        "last_loaded_at": None,
+        "data_source": None,
+        "bt_results": None,
+        "bt_trades": None,
+        "bt_error": None,
+        "bt_params_sig": None,
+        "live_stream": None,
+        "live_rows": [],
+        "live_autorefresh": True,
+        "live_last_symbol": None,
+        "cfg_export_json": "",
+        "cfg_import_json": "",
+    }
+)
 
 
 # =============================================================================
@@ -683,17 +737,28 @@ with st.sidebar:
             value=str(ss_get("cfg_import_json", "")),
             height=140,
         )
+
         if st.button("Import Settings", use_container_width=True):
             try:
                 parsed = json.loads(st.session_state["cfg_import_json"] or "{}")
                 if not isinstance(parsed, dict):
                     raise ValueError("JSON must be an object.")
+
                 allowed = {
-                    "symbol","mode_label",
-                    "atr_entry","atr_stop","atr_target",
-                    "rsi_min","rsi_max","rvol_min","vol_max",
+                    "symbol",
+                    "mode_label",
+                    "atr_entry",
+                    "atr_stop",
+                    "atr_target",
+                    "rsi_min",
+                    "rsi_max",
+                    "rvol_min",
+                    "vol_max",
                     "sr_lookback",
-                    "enable_position_sizing","account_capital","risk_per_trade_pct","max_alloc_pct",
+                    "enable_position_sizing",
+                    "account_capital",
+                    "risk_per_trade_pct",
+                    "max_alloc_pct",
                     "mark_to_market",
                 }
                 for k, v in parsed.items():
@@ -707,7 +772,7 @@ with st.sidebar:
     st.divider()
     load_btn = st.button("🔄 Load / Refresh", use_container_width=True)
 
-# Persist sidebar inputs
+# Persist inputs
 for k, v in {
     "symbol": symbol,
     "mode_label": mode_label,
@@ -729,17 +794,17 @@ for k, v in {
 
 
 # =============================================================================
-# Auto-load logic
+# Auto-load
 # =============================================================================
-needs_load = (load_btn or (st.session_state.get("df_raw") is None) or (st.session_state.get("last_symbol") != symbol))
+needs_load = load_btn or (st.session_state.get("df_raw") is None) or (st.session_state.get("last_symbol") != symbol)
 
 if st.session_state.get("live_stream") is not None and st.session_state.get("live_last_symbol") != symbol:
-    _stop_live_stream()
+    stop_live_stream()
 
 force_refresh = int(time.time()) if load_btn else 0
 if needs_load:
     with st.spinner(f"Loading {symbol}…"):
-        _load_and_prepare(symbol, force_refresh=force_refresh)
+        load_and_prepare(symbol, force_refresh=force_refresh)
 
 df_raw = st.session_state.get("df_raw")
 df_chart = st.session_state.get("df_chart")
@@ -756,7 +821,12 @@ if df_chart is None or getattr(df_chart, "empty", True):
         st.caption(st.session_state["ind_error"])
     st.stop()
 
-df_plot = _tail_for_plot(df_chart, 700)
+df_plot = tail_for_plot(df_chart, 700)
+
+# Small status line
+src = st.session_state.get("data_source")
+if src:
+    st.caption(f"Data source: **{src}**")
 
 
 # =============================================================================
@@ -766,23 +836,19 @@ tab_signal, tab_charts, tab_backtest, tab_live = st.tabs(["✅ Signal", "📊 Ch
 
 
 # =============================================================================
-# Signal tab (NOW includes support/resistance + planned entry/stop/target)
+# Signal tab
 # =============================================================================
 with tab_signal:
     st.subheader(f"{symbol} — Signal")
 
-    san = st.session_state.get("sanity")
-    if isinstance(san, dict) and san.get("warnings"):
-        with st.expander("Data notes", expanded=False):
-            for w in san["warnings"][:5]:
-                st.write(f"• {w}")
-
     score = compute_signal_score(df_chart, float(rsi_min), float(rsi_max), float(rvol_min), float(vol_max))
-
     lo, hi = compute_lookback_low_high(df_chart, int(sr_lookback))
     plan = compute_trade_plan(
-        df_chart, mode=mode,
-        atr_entry=float(atr_entry), atr_stop=float(atr_stop), atr_target=float(atr_target)
+        df_chart,
+        mode=mode,
+        atr_entry=float(atr_entry),
+        atr_stop=float(atr_stop),
+        atr_target=float(atr_target),
     )
 
     hero = st.container(border=True)
@@ -801,8 +867,8 @@ with tab_signal:
 
         with b:
             last = df_chart.iloc[-1]
-            close = _safe_float(last.get("close", np.nan))
-            atr14 = _safe_float(last.get("atr14", np.nan))
+            close = safe_float(last.get("close", np.nan))
+            atr14 = safe_float(last.get("atr14", np.nan))
             st.metric("Close", f"{close:.2f}" if np.isfinite(close) else "—")
             st.metric("ATR(14)", f"{atr14:.3f}" if np.isfinite(atr14) else "—")
 
@@ -826,10 +892,11 @@ with tab_signal:
 
 
 # =============================================================================
-# Charts tab (SR lines + trade markers)
+# Charts tab
 # =============================================================================
 with tab_charts:
     st.subheader(f"{symbol} — Charts")
+
     trades_for_markers = st.session_state.get("bt_trades")
     lo, hi = compute_lookback_low_high(df_chart, int(sr_lookback))
 
@@ -857,7 +924,7 @@ with tab_charts:
 
 
 # =============================================================================
-# Backtest tab (FIXED: removes symbol kwarg + uses horizon input)
+# Backtest tab
 # =============================================================================
 with tab_backtest:
     st.subheader("Backtest")
@@ -869,7 +936,6 @@ with tab_backtest:
     with cB:
         run_backtest_btn = st.button("🧪 Run Backtest", use_container_width=True)
 
-    # ✅ IMPORTANT: do NOT include symbol here
     bt_params = dict(
         mode=mode,
         horizon=int(horizon_bars),
@@ -894,13 +960,13 @@ with tab_backtest:
         spread_mode="taker_only",
         exit_priority="stop_first",
     )
-    sig = _bt_params_signature(bt_params)
+    sig = bt_params_signature(bt_params)
 
     if run_backtest_btn:
         st.session_state["bt_error"] = None
         with st.spinner("Running backtest…"):
             try:
-                df_in = _df_for_backtest(df_chart)
+                df_in = df_for_backtest(df_chart)
                 results, trades_df = backtest_strategy(df=df_in, market_df=None, **bt_params)
                 st.session_state["bt_results"] = results
                 st.session_state["bt_trades"] = trades_df
@@ -970,11 +1036,6 @@ with tab_backtest:
 
         if not isinstance(trades, pd.DataFrame) or trades.empty:
             st.warning("Backtest completed but produced no trades.")
-            notes = results.get("notes_for_beginners", [])
-            if isinstance(notes, list) and notes:
-                with st.expander("Notes", expanded=False):
-                    for n in notes[:8]:
-                        st.write(f"• {n}")
         else:
             st.download_button(
                 "⬇️ Download trades (CSV)",
@@ -997,22 +1058,22 @@ with tab_live:
 
     if not LIVE_AVAILABLE:
         st.info("Live module not available.")
-    elif not _has_keys_in_secrets():
+    elif not has_alpaca_keys():
         st.info("Live is disabled (missing Alpaca keys in Streamlit secrets).")
     else:
         stream = st.session_state.get("live_stream")
-        live_running = _live_running(stream)
+        is_running = live_running(stream)
 
         a, b, c, d = st.columns([1, 1, 1, 2], vertical_alignment="center")
-        start_clicked = a.button("▶ Start", use_container_width=True, disabled=live_running)
-        stop_clicked = b.button("⏹ Stop", use_container_width=True, disabled=not live_running)
+        start_clicked = a.button("▶ Start", use_container_width=True, disabled=is_running)
+        stop_clicked = b.button("⏹ Stop", use_container_width=True, disabled=not is_running)
         clear_clicked = c.button("🧹 Clear", use_container_width=True)
         st.session_state["live_autorefresh"] = d.toggle("Auto refresh", value=bool(st.session_state.get("live_autorefresh", True)))
 
         if clear_clicked:
             st.session_state["live_rows"] = []
 
-        if start_clicked and not live_running:
+        if start_clicked and not is_running:
             try:
                 api_key = str(st.secrets.get("ALPACA_KEY", "")).strip()
                 sec_key = str(st.secrets.get("ALPACA_SECRET", "")).strip()
@@ -1025,11 +1086,11 @@ with tab_live:
                 st.error("Failed to start live stream.")
                 st.caption(f"{type(e).__name__}: {e}")
 
-        if stop_clicked and live_running:
-            _stop_live_stream()
+        if stop_clicked and is_running:
+            stop_live_stream()
 
-        _live_panel(symbol)
+        live_panel(symbol)
 
-        if _live_running(st.session_state.get("live_stream")) and bool(st.session_state.get("live_autorefresh", True)):
+        if live_running(st.session_state.get("live_stream")) and bool(st.session_state.get("live_autorefresh", True)):
             if st_autorefresh is not None:
                 st_autorefresh(interval=2000, key=f"live_refresh_{symbol}")
