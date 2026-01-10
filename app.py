@@ -5,7 +5,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -22,6 +22,48 @@ try:
     import yfinance as yf  # pip install yfinance
 except Exception:
     YF_AVAILABLE = False
+
+
+# =============================================================================
+# Constants (centralize "magic numbers")
+# =============================================================================
+APP_TITLE = "📈 Pro Algo Trader"
+APP_CAPTION = "Beginner-friendly signals • charts • backtests (educational, not financial advice)"
+
+CACHE_TTL_ALPACA_SEC = 15 * 60
+CACHE_TTL_YAHOO_HIST_SEC = 30 * 60
+CACHE_TTL_YAHOO_PRICE_SEC = 30
+
+PLOT_TAIL_MIN_BARS = 120
+PLOT_TAIL_DEFAULT_BARS = 700
+
+SR_MIN_LOOKBACK = 20
+SR_SUPPORT_PCTL = 10
+SR_RESIST_PCTL = 90
+
+# Signal score weights
+SCORE_BASE = 50
+SCORE_TREND_BONUS = 22
+SCORE_RSI_GOOD = 6
+SCORE_RSI_BAD = 10
+SCORE_RVOL_GOOD = 8
+SCORE_RVOL_BAD = 10
+SCORE_VOL_GOOD = 6
+SCORE_VOL_BAD = 10
+
+SCORE_BUY_MIN = 70
+SCORE_AVOID_MAX = 30
+
+# Backtest defaults (execution realism)
+DEFAULT_SLIPPAGE_BPS = 5.0
+DEFAULT_SPREAD_BPS = 5.0
+DEFAULT_COMMISSION = 0.0
+
+# Gating defaults (simple)
+DEFAULT_PROB_IS_FRAC = 0.85
+DEFAULT_PROB_MIN = 0.50
+DEFAULT_MIN_BUCKET_TRADES = 6
+DEFAULT_MIN_AVG_R = -0.05
 
 
 # =============================================================================
@@ -86,12 +128,11 @@ def has_alpaca_keys() -> bool:
 
 
 def tail_for_plot(df: pd.DataFrame, n: int) -> pd.DataFrame:
-    n = int(max(120, n))
+    n = int(max(PLOT_TAIL_MIN_BARS, n))
     return df.tail(n) if len(df) > n else df
 
 
 def bt_params_signature(d: dict[str, Any]) -> str:
-    # Make a stable signature string so you can warn if params changed
     def _val(v: Any) -> str:
         if isinstance(v, float):
             if np.isnan(v):
@@ -106,10 +147,15 @@ def bt_params_signature(d: dict[str, Any]) -> str:
 # Data preparation
 # =============================================================================
 def ensure_ohlcv_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalize common OHLCV column name variants to: open, high, low, close, volume.
+    Keeps other columns intact.
+    """
     if df is None or getattr(df, "empty", True):
         return df
+
     out = df.copy()
-    lower = {str(c).lower(): c for c in out.columns}
+    cols_lower = {str(c).lower(): str(c) for c in out.columns}
 
     variants = {
         "open": ["open", "o", "opn"],
@@ -123,10 +169,13 @@ def ensure_ohlcv_cols(df: pd.DataFrame) -> pd.DataFrame:
     for want, keys in variants.items():
         if want in out.columns:
             continue
+        found_original: Optional[str] = None
         for k in keys:
-            if k in lower:
-                mapping[lower[k]] = want
+            if k in cols_lower:
+                found_original = cols_lower[k]
                 break
+        if found_original is not None:
+            mapping[found_original] = want
 
     return out.rename(columns=mapping) if mapping else out
 
@@ -144,12 +193,20 @@ def coerce_ohlcv_numeric(df: pd.DataFrame) -> pd.DataFrame:
 
 def as_utc_dtindex(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
+
+    # If we have a timestamp column, use it.
     if "timestamp" in out.columns:
         out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True, errors="coerce")
         out = out.dropna(subset=["timestamp"]).sort_values("timestamp").set_index("timestamp")
-    elif isinstance(out.index, pd.DatetimeIndex):
+        return out
+
+    # If already datetime index, normalize to UTC
+    if isinstance(out.index, pd.DatetimeIndex):
         out = out.sort_index()
         out.index = out.index.tz_localize("UTC") if out.index.tz is None else out.index.tz_convert("UTC")
+        return out
+
+    # Otherwise leave unchanged
     return out
 
 
@@ -167,7 +224,7 @@ def df_for_backtest(df_chart: pd.DataFrame) -> pd.DataFrame:
 # =============================================================================
 # Cached loaders
 # =============================================================================
-@st.cache_data(ttl=15 * 60, show_spinner=False)
+@st.cache_data(ttl=CACHE_TTL_ALPACA_SEC, show_spinner=False)
 def cached_load_alpaca(symbol: str, force_refresh: int) -> pd.DataFrame:
     api_key = str(st.secrets.get("ALPACA_KEY", "")).strip()
     sec_key = str(st.secrets.get("ALPACA_SECRET", "")).strip()
@@ -177,24 +234,72 @@ def cached_load_alpaca(symbol: str, force_refresh: int) -> pd.DataFrame:
     return df
 
 
-@st.cache_data(ttl=30 * 60, show_spinner=False)
+def _normalize_yahoo_history_to_timestamp(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    yfinance .history() returns a DataFrame indexed by Date/Datetime.
+    This function reliably produces a 'timestamp' column without the common reset_index pitfalls.
+    """
+    if df is None or df.empty:
+        raise RuntimeError("Yahoo returned no data.")
+
+    hist = df.copy()
+
+    # yfinance typically uses DatetimeIndex; keep it, then reset to a proper column.
+    if not isinstance(hist.index, pd.DatetimeIndex):
+        # Try to coerce index to datetime if possible
+        try:
+            hist.index = pd.to_datetime(hist.index)
+        except Exception:
+            pass
+
+    # Reset index into a column and discover its name
+    hist = hist.reset_index()
+    # Common names: 'Date', 'Datetime', or 'index'
+    idx_col = None
+    for cand in ["Datetime", "Date", "index"]:
+        if cand in hist.columns:
+            idx_col = cand
+            break
+    # If none found, try the first column if it looks datetime-like
+    if idx_col is None and len(hist.columns) > 0:
+        first = hist.columns[0]
+        try:
+            pd.to_datetime(hist[first], errors="raise")
+            idx_col = first
+        except Exception:
+            idx_col = None
+
+    if idx_col is None:
+        raise RuntimeError("Could not determine timestamp column from Yahoo history.")
+
+    hist = hist.rename(columns={idx_col: "timestamp"})
+
+    # Lowercase OHLCV columns (but keep 'timestamp' as-is)
+    ren = {}
+    for c in hist.columns:
+        if c != "timestamp":
+            ren[c] = str(c).lower()
+    hist = hist.rename(columns=ren)
+
+    # Coerce timestamp
+    hist["timestamp"] = pd.to_datetime(hist["timestamp"], utc=True, errors="coerce")
+    hist = hist.dropna(subset=["timestamp"]).sort_values("timestamp")
+
+    return hist
+
+
+@st.cache_data(ttl=CACHE_TTL_YAHOO_HIST_SEC, show_spinner=False)
 def cached_load_yahoo(symbol: str, period: str = "5y", interval: str = "1d") -> pd.DataFrame:
     if not YF_AVAILABLE:
         raise RuntimeError("yfinance not installed.")
     t = yf.Ticker(symbol)
-    hist = t.history(period=period, interval=interval, auto_adjust=False)
-    if hist is None or hist.empty:
-        raise RuntimeError("Yahoo returned no data.")
-    hist = hist.rename(columns={c: c.lower() for c in hist.columns})
-    hist = hist.reset_index().rename(columns={"Date": "timestamp", "Datetime": "timestamp"})
-    if "timestamp" not in hist.columns:
-        hist["timestamp"] = pd.to_datetime(hist.index)
-    return hist
+    raw = t.history(period=period, interval=interval, auto_adjust=False)
+    return _normalize_yahoo_history_to_timestamp(raw)
 
 
-@st.cache_data(ttl=30, show_spinner=False)
-def cached_current_price_yahoo(symbol: str) -> tuple[float, str]:
-    """Best-effort 'current-ish' price from Yahoo (may be delayed)."""
+@st.cache_data(ttl=CACHE_TTL_YAHOO_PRICE_SEC, show_spinner=False)
+def cached_current_price_yahoo(symbol: str) -> Tuple[float, str]:
+    """Best-effort last price from Yahoo (often delayed)."""
     if not YF_AVAILABLE:
         return np.nan, "Unavailable (yfinance not installed)"
 
@@ -206,19 +311,19 @@ def cached_current_price_yahoo(symbol: str) -> tuple[float, str]:
             px = fi.get("last_price") or fi.get("lastPrice") or fi.get("regularMarketPrice")
             px = safe_float(px)
             if np.isfinite(px) and px > 0:
-                return float(px), "Yahoo (fast_info)"
+                return float(px), "Yahoo (fast_info, may be delayed)"
 
         info = getattr(t, "info", None)
         if isinstance(info, dict):
             px = safe_float(info.get("regularMarketPrice"))
             if np.isfinite(px) and px > 0:
-                return float(px), "Yahoo (info)"
+                return float(px), "Yahoo (info, may be delayed)"
 
         intr = t.history(period="1d", interval="1m")
         if intr is not None and not intr.empty:
-            last = safe_float(intr["Close"].iloc[-1])
+            last = safe_float(intr["Close"].iloc[-1] if "Close" in intr.columns else np.nan)
             if np.isfinite(last) and last > 0:
-                return float(last), "Yahoo (1m)"
+                return float(last), "Yahoo (1m, may be delayed)"
     except Exception:
         pass
 
@@ -230,8 +335,8 @@ def load_and_prepare(symbol: str, *, force_refresh: int) -> None:
     st.session_state["ind_error"] = None
     st.session_state["data_source"] = None
 
-    df: pd.DataFrame | None = None
-    err_primary: str | None = None
+    df: Optional[pd.DataFrame] = None
+    err_primary: Optional[str] = None
 
     # Primary: Alpaca (if keys exist)
     if has_alpaca_keys():
@@ -256,17 +361,21 @@ def load_and_prepare(symbol: str, *, force_refresh: int) -> None:
             st.session_state["data_source"] = None
             return
 
-    df = coerce_ohlcv_numeric(ensure_ohlcv_cols(df))
+    # Normalize columns
+    df = ensure_ohlcv_cols(df)
+    df = coerce_ohlcv_numeric(df)
+
     st.session_state["df_raw"] = df
     st.session_state["last_symbol"] = symbol
     st.session_state["last_loaded_at"] = pd.Timestamp.utcnow()
 
-    # Keep sanity checks internal (no debug-heavy UI)
+    # Internal sanity checks (kept out of UI)
     try:
         st.session_state["sanity"] = sanity_check_bars(df)
     except Exception:
         st.session_state["sanity"] = None
 
+    # Indicators
     try:
         df_chart = as_utc_dtindex(df)
         add_indicators_inplace(df_chart)
@@ -279,9 +388,9 @@ def load_and_prepare(symbol: str, *, force_refresh: int) -> None:
 # =============================================================================
 # Support/Resistance + Trade Plan
 # =============================================================================
-def compute_support_resistance(df_ind: pd.DataFrame, lookback: int) -> tuple[float, float]:
-    """Robust S/R: uses percentiles so a single wick doesn't dominate."""
-    lb = int(max(20, lookback))
+def compute_support_resistance(df_ind: pd.DataFrame, lookback: int) -> Tuple[float, float]:
+    """Robust S/R: percentiles so a single wick doesn't dominate."""
+    lb = int(max(SR_MIN_LOOKBACK, lookback))
     tail = df_ind.tail(lb)
     if tail.empty or ("low" not in tail.columns) or ("high" not in tail.columns):
         return np.nan, np.nan
@@ -291,8 +400,8 @@ def compute_support_resistance(df_ind: pd.DataFrame, lookback: int) -> tuple[flo
     if lows.empty or highs.empty:
         return np.nan, np.nan
 
-    support = float(np.nanpercentile(lows.values, 10))
-    resistance = float(np.nanpercentile(highs.values, 90))
+    support = float(np.nanpercentile(lows.values, SR_SUPPORT_PCTL))
+    resistance = float(np.nanpercentile(highs.values, SR_RESIST_PCTL))
     return support, resistance
 
 
@@ -304,7 +413,7 @@ def compute_trade_plan(
     atr_stop: float,
     atr_target: float,
 ) -> dict[str, float]:
-    """Simple long-only plan (for beginners)."""
+    """Simple long-only plan (beginner-friendly)."""
     last = df_ind.iloc[-1]
     close = safe_float(last.get("close", np.nan))
     atr = safe_float(last.get("atr14", np.nan))
@@ -320,13 +429,19 @@ def compute_trade_plan(
     risk = entry - stop
     reward = target - entry
     rr = (reward / risk) if risk > 0 else np.nan
-    return {"entry": float(entry), "stop": float(stop), "target": float(target), "rr": float(rr) if np.isfinite(rr) else np.nan}
+
+    return {
+        "entry": float(entry),
+        "stop": float(stop),
+        "target": float(target),
+        "rr": float(rr) if np.isfinite(rr) else np.nan,
+    }
 
 
 # =============================================================================
 # Plots
 # =============================================================================
-def extract_markers(trades: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+def extract_markers(trades: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if trades is None or getattr(trades, "empty", True):
         return pd.DataFrame(columns=["ts", "px"]), pd.DataFrame(columns=["ts", "px"])
 
@@ -337,13 +452,17 @@ def extract_markers(trades: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
         t["exit_ts"] = pd.to_datetime(t["exit_ts"], errors="coerce", utc=True)
 
     entries = pd.DataFrame(
-        {"ts": t.get("entry_ts", pd.Series(dtype="datetime64[ns, UTC]")),
-         "px": pd.to_numeric(t.get("entry_px", pd.Series(dtype=float)), errors="coerce")}
+        {
+            "ts": t.get("entry_ts", pd.Series(dtype="datetime64[ns, UTC]")),
+            "px": pd.to_numeric(t.get("entry_px", pd.Series(dtype=float)), errors="coerce"),
+        }
     ).dropna(subset=["ts", "px"])
 
     exits = pd.DataFrame(
-        {"ts": t.get("exit_ts", pd.Series(dtype="datetime64[ns, UTC]")),
-         "px": pd.to_numeric(t.get("exit_px", pd.Series(dtype=float)), errors="coerce")}
+        {
+            "ts": t.get("exit_ts", pd.Series(dtype="datetime64[ns, UTC]")),
+            "px": pd.to_numeric(t.get("exit_px", pd.Series(dtype=float)), errors="coerce"),
+        }
     ).dropna(subset=["ts", "px"])
 
     return entries, exits
@@ -352,10 +471,10 @@ def extract_markers(trades: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
 def plot_price(
     df: pd.DataFrame,
     symbol: str,
-    trades: pd.DataFrame | None = None,
+    trades: Optional[pd.DataFrame] = None,
     *,
-    support: float | None = None,
-    resistance: float | None = None,
+    support: Optional[float] = None,
+    resistance: Optional[float] = None,
 ) -> go.Figure:
     x = df.index
     fig = go.Figure()
@@ -425,9 +544,9 @@ def plot_indicator(
     title: str,
     *,
     height: int = 260,
-    hlines: list[float] | None = None,
-    ymin: float | None = None,
-    ymax: float | None = None,
+    hlines: Optional[list[float]] = None,
+    ymin: Optional[float] = None,
+    ymax: Optional[float] = None,
 ) -> go.Figure:
     x = df.index
     fig = go.Figure([go.Scatter(x=x, y=df[col], mode="lines")])
@@ -453,9 +572,7 @@ class SignalScore:
     reasons: list[str]
 
 
-def compute_signal_score(
-    df_ind: pd.DataFrame, rsi_min: float, rsi_max: float, rvol_min: float, vol_max: float
-) -> SignalScore:
+def compute_signal_score(df_ind: pd.DataFrame, rsi_min: float, rsi_max: float, rvol_min: float, vol_max: float) -> SignalScore:
     need = ["close", "ma50", "ma200", "rsi14", "rvol", "vol_ann", "atr14"]
     missing = [c for c in need if c not in df_ind.columns]
     if missing:
@@ -475,55 +592,58 @@ def compute_signal_score(
         return SignalScore("WAIT", 0, "Waiting for enough history.", ["Non-finite indicator values"])
 
     reasons: list[str] = []
-    score = 50
+    score = SCORE_BASE
 
     uptrend = (close > ma50 > ma200)
     downtrend = (close < ma50 < ma200)
     if uptrend:
-        score += 22
+        score += SCORE_TREND_BONUS
         reasons.append("Uptrend (close > MA50 > MA200)")
     elif downtrend:
-        score -= 22
+        score -= SCORE_TREND_BONUS
         reasons.append("Downtrend (close < MA50 < MA200)")
     else:
         reasons.append("Trend mixed")
 
     if rsi < rsi_min:
-        score -= 10
+        score -= SCORE_RSI_BAD
         reasons.append(f"RSI low ({rsi:.1f})")
     elif rsi > rsi_max:
-        score -= 10
+        score -= SCORE_RSI_BAD
         reasons.append(f"RSI high ({rsi:.1f})")
     else:
-        score += 6
+        score += SCORE_RSI_GOOD
         reasons.append(f"RSI ok ({rsi:.1f})")
 
     if rvol < rvol_min:
-        score -= 10
+        score -= SCORE_RVOL_BAD
         reasons.append(f"RVOL low ({rvol:.2f})")
     else:
-        score += 8
+        score += SCORE_RVOL_GOOD
         reasons.append(f"RVOL ok ({rvol:.2f})")
 
     if vol_ann > vol_max:
-        score -= 10
+        score -= SCORE_VOL_BAD
         reasons.append(f"Vol high ({vol_ann:.2f})")
     else:
-        score += 6
+        score += SCORE_VOL_GOOD
         reasons.append(f"Vol ok ({vol_ann:.2f})")
 
     score = int(np.clip(score, 0, 100))
 
-    # Long-only labels (beginner friendly)
-    if score >= 70 and uptrend:
+    # Clear beginner-friendly label logic:
+    # - BUY requires both a high score and an uptrend
+    # - AVOID requires low score and downtrend
+    # - Otherwise HOLD (neutral/mixed)
+    if score >= SCORE_BUY_MIN and uptrend:
         return SignalScore("BUY", score, "Favorable trend + filters supportive.", reasons)
-    if score <= 30 and downtrend:
+    if score <= SCORE_AVOID_MAX and downtrend:
         return SignalScore("AVOID", score, "Bearish conditions dominate (avoid long).", reasons)
     return SignalScore("HOLD", score, "Mixed/neutral conditions.", reasons)
 
 
-def get_current_price(symbol: str, df_chart: pd.DataFrame) -> tuple[float, str]:
-    """Best-effort current price: Yahoo (cached) else last close."""
+def get_latest_price(symbol: str, df_chart: pd.DataFrame) -> Tuple[float, str]:
+    """Best-effort latest available price: Yahoo (cached) else last close."""
     px, src = cached_current_price_yahoo(symbol)
     if np.isfinite(px) and px > 0:
         return float(px), src
@@ -568,8 +688,8 @@ ss_init(
 # =============================================================================
 # Header
 # =============================================================================
-st.title("📈 Pro Algo Trader")
-st.caption("Beginner-friendly signals • charts • backtests (educational, not financial advice)")
+st.title(APP_TITLE)
+st.caption(APP_CAPTION)
 
 
 # =============================================================================
@@ -601,7 +721,6 @@ with st.sidebar:
         sr_lookback = st.number_input("Support/Resistance lookback (bars)", 20, 300, int(ss_get("sr_lookback", 80)), 5)
 
     with st.expander("Account", expanded=False):
-        # ✅ allow < £100
         account_capital = st.number_input(
             "Starting account (£)",
             min_value=1.0,
@@ -713,15 +832,19 @@ if df_chart is None or getattr(df_chart, "empty", True):
         st.caption(st.session_state["ind_error"])
     st.stop()
 
-df_plot = tail_for_plot(df_chart, 700)
+df_plot = tail_for_plot(df_chart, PLOT_TAIL_DEFAULT_BARS)
 
 src = st.session_state.get("data_source")
 if src:
     st.caption(f"Data source: **{src}**")
 
 
+# Precompute S/R once per rerun (used in multiple tabs)
+support_level, resistance_level = compute_support_resistance(df_chart, int(sr_lookback))
+
+
 # =============================================================================
-# Tabs (Live tab removed)
+# Tabs
 # =============================================================================
 tab_signal, tab_charts, tab_backtest = st.tabs(["✅ Signal", "📊 Charts", "🧪 Backtest"])
 
@@ -732,10 +855,8 @@ tab_signal, tab_charts, tab_backtest = st.tabs(["✅ Signal", "📊 Charts", "�
 with tab_signal:
     st.subheader(f"{symbol} — Signal")
 
-    current_px, current_src = get_current_price(symbol, df_chart)
-
+    latest_px, latest_src = get_latest_price(symbol, df_chart)
     score = compute_signal_score(df_chart, float(rsi_min), float(rsi_max), float(rvol_min), float(vol_max))
-    support, resistance = compute_support_resistance(df_chart, int(sr_lookback))
 
     plan = compute_trade_plan(
         df_chart,
@@ -758,21 +879,22 @@ with tab_signal:
             else:
                 st.info(f"**HOLD** • Score {score.score}/100")
             st.caption(score.summary)
+            st.caption("Note: This is a heuristic score, not a guaranteed prediction.")
 
         with b:
-            st.metric("Current price", f"{current_px:.2f}" if np.isfinite(current_px) else "—")
-            st.caption(f"Source: {current_src}")
+            st.metric("Latest available price", f"{latest_px:.2f}" if np.isfinite(latest_px) else "—")
+            st.caption(f"Source: {latest_src}")
 
         with c:
-            st.metric("Support", f"{support:.2f}" if np.isfinite(support) else "—")
-            st.metric("Resistance", f"{resistance:.2f}" if np.isfinite(resistance) else "—")
+            st.metric("Support", f"{support_level:.2f}" if np.isfinite(support_level) else "—")
+            st.metric("Resistance", f"{resistance_level:.2f}" if np.isfinite(resistance_level) else "—")
 
     st.markdown("### Where to place support / resistance (simple guidance)")
     box = st.container(border=True)
     with box:
-        if np.isfinite(support) and np.isfinite(resistance):
-            st.write(f"• **Support zone** ~ **{support:.2f}** → many traders place a stop a little *below* this.")
-            st.write(f"• **Resistance zone** ~ **{resistance:.2f}** → many traders take profit or get cautious near this.")
+        if np.isfinite(support_level) and np.isfinite(resistance_level):
+            st.write(f"• **Support zone** ~ **{support_level:.2f}** → many traders place a stop a little *below* this.")
+            st.write(f"• **Resistance zone** ~ **{resistance_level:.2f}** → many traders take profit or get cautious near this.")
             st.caption("These are percentile-based levels from the lookback window (less sensitive to single wicks).")
         else:
             st.info("Not enough data to compute stable support/resistance yet.")
@@ -786,10 +908,12 @@ with tab_signal:
         c3.metric("Target", f"{plan['target']:.2f}" if np.isfinite(plan["target"]) else "—")
         c4.metric("R:R", f"{plan['rr']:.2f}" if np.isfinite(plan["rr"]) else "—")
         st.caption(f"Mode: {mode_label} • Long-only plan")
+        st.caption("Important: Backtests can differ from this snapshot plan because fills and gaps vary day-to-day.")
 
     with st.expander("Why this score?", expanded=False):
         for r in score.reasons[:12]:
             st.write(f"• {r}")
+        st.caption("Label rules: BUY requires both a high score and an uptrend; AVOID requires low score and downtrend.")
 
 
 # =============================================================================
@@ -799,17 +923,19 @@ with tab_charts:
     st.subheader(f"{symbol} — Charts")
 
     trades_for_markers = st.session_state.get("bt_trades")
-    support, resistance = compute_support_resistance(df_chart, int(sr_lookback))
 
     st.plotly_chart(
-        plot_price(df_plot, symbol, trades=trades_for_markers, support=support, resistance=resistance),
+        plot_price(df_plot, symbol, trades=trades_for_markers, support=support_level, resistance=resistance_level),
         use_container_width=True,
     )
 
     c1, c2, c3 = st.columns(3, gap="large")
     with c1:
         if "rsi14" in df_plot.columns:
-            st.plotly_chart(plot_indicator(df_plot, "rsi14", "RSI(14)", hlines=[30, 70], ymin=0, ymax=100), use_container_width=True)
+            st.plotly_chart(
+                plot_indicator(df_plot, "rsi14", "RSI(14)", hlines=[30, 70], ymin=0, ymax=100),
+                use_container_width=True,
+            )
         else:
             st.info("RSI not available.")
     with c2:
@@ -834,7 +960,7 @@ with tab_backtest:
     with st.form("bt_form", clear_on_submit=False):
         c1, c2, c3, c4, c5 = st.columns(
             [1.25, 1.15, 1.25, 1.35, 1.6],
-            vertical_alignment="bottom",  # ✅ aligns the button with the inputs
+            vertical_alignment="bottom",
         )
 
         horizon_bars = c1.number_input("Max hold (bars)", 1, 200, int(ss_get("horizon_bars", 20)), 1)
@@ -877,9 +1003,21 @@ with tab_backtest:
         )
         st.session_state["invest_amount"] = float(invest_amount)
         sizing_mode = "fixed_amount"
-        # risk cap (still applied) - keep moderate default
+
+        # Conservative default: keep risk_pct moderate (still applied in your backtester logic)
         risk_pct = 0.02
-        max_alloc_pct_frac = 1.0  # not used in fixed_amount mode (kept for signature completeness)
+        max_alloc_pct_frac = 1.0  # not used in fixed_amount mode
+
+        # Helpful affordability hint for beginners (approx)
+        # Use latest available price as a rough estimate, but remind it's approximate.
+        latest_px, _latest_src = get_latest_price(symbol, df_chart)
+        if np.isfinite(latest_px) and latest_px > 0:
+            min_needed = float(latest_px)
+            if invest_amount < min_needed:
+                st.info(
+                    f"At ~{latest_px:.2f} per share, you may need about **£{min_needed:.2f}** to buy 1 share. "
+                    "If your per-trade amount is smaller, some trades can be skipped."
+                )
     else:
         invest_amount = float(ss_get("invest_amount", 25.0))
         sizing_mode = "percent"
@@ -912,7 +1050,17 @@ with tab_backtest:
     prob_gating = (gate_ui != "off")
     gate_mode = "soft" if gate_ui == "soft" else "hard"
 
-    # Build params for your NEW backtester
+    # Small visible execution box (so assumptions aren’t “hidden”)
+    exec_box = st.container(border=True)
+    with exec_box:
+        st.markdown("**Execution assumptions (affects results)**")
+        a, b, c = st.columns(3)
+        a.metric("Slippage", f"{DEFAULT_SLIPPAGE_BPS:.1f} bps")
+        b.metric("Spread", f"{DEFAULT_SPREAD_BPS:.1f} bps" if True else "—")
+        c.metric("Commission", f"£{DEFAULT_COMMISSION:.2f} / order")
+        st.caption("These are simplified costs. Real fills can be better or worse depending on liquidity and volatility.")
+
+    # Build params for your backtester
     bt_params = dict(
         mode=mode,
         horizon=int(horizon_bars),
@@ -926,20 +1074,20 @@ with tab_backtest:
         vol_max=float(vol_max),
         cooldown_bars=0,
         include_spread_penalty=True,
-        assumed_spread_bps=5.0,
+        assumed_spread_bps=float(DEFAULT_SPREAD_BPS),
         start_equity=float(account_capital),
 
-        # execution realism (simple defaults)
-        slippage_bps=5.0,
-        commission_per_order=0.0,
+        # execution realism
+        slippage_bps=float(DEFAULT_SLIPPAGE_BPS),
+        commission_per_order=float(DEFAULT_COMMISSION),
         spread_mode="taker_only",
         exit_priority="stop_first",
         time_exit_price="open",
 
         # sizing
         enable_position_sizing=True,
-        sizing_mode=str(sizing_mode),          # NEW
-        invest_amount=float(invest_amount),    # NEW (used in fixed_amount mode)
+        sizing_mode=str(sizing_mode),
+        invest_amount=float(invest_amount),
         risk_pct=float(risk_pct),
         max_alloc_pct=float(max_alloc_pct_frac),
         min_risk_per_share=1e-6,
@@ -953,10 +1101,10 @@ with tab_backtest:
 
         # gating
         prob_gating=bool(prob_gating),
-        prob_is_frac=0.85,
-        prob_min=0.50,
-        min_bucket_trades=6,
-        min_avg_r=-0.05,
+        prob_is_frac=float(DEFAULT_PROB_IS_FRAC),
+        prob_min=float(DEFAULT_PROB_MIN),
+        min_bucket_trades=int(DEFAULT_MIN_BUCKET_TRADES),
+        min_avg_r=float(DEFAULT_MIN_AVG_R),
         gate_mode=str(gate_mode),
     )
 
@@ -1011,14 +1159,16 @@ with tab_backtest:
                 "- **Max drawdown**: worst peak-to-trough drop. Lower is generally better.\n"
                 "- **Sharpe**: risk-adjusted return. Higher is better, but not very meaningful with few trades.\n"
                 "- **Fixed £ per trade**: if £ is too small to buy 1 share, trades may be skipped.\n"
-                "- **Realistic cash**: ON means the backtest won’t magically buy what you can’t afford."
+                "- **Realistic cash**: ON means the backtest won’t magically buy what you can’t afford.\n"
+                "- **Execution assumptions**: slippage/spread/commission can materially change results."
             )
 
         if isinstance(df_bt, pd.DataFrame) and (not df_bt.empty) and ("equity" in df_bt.columns):
             eq = pd.to_numeric(df_bt["equity"], errors="coerce").dropna()
             if len(eq) > 2:
-                ts = pd.to_datetime(df_bt.get("timestamp", pd.Series(index=df_bt.index, dtype="datetime64[ns]")), errors="coerce", utc=True)
-                x = np.arange(len(eq)) if (not isinstance(ts, pd.Series) or ts.isna().all()) else ts.iloc[-len(eq):]
+                ts_series = df_bt.get("timestamp", None)
+                ts = pd.to_datetime(ts_series, errors="coerce", utc=True) if ts_series is not None else None
+                x = np.arange(len(eq)) if (ts is None or (isinstance(ts, pd.Series) and ts.isna().all())) else ts.iloc[-len(eq):]
 
                 peak = eq.cummax()
                 dd = (eq / peak) - 1.0
@@ -1047,6 +1197,7 @@ with tab_backtest:
 
         if not isinstance(trades, pd.DataFrame) or trades.empty:
             st.warning("Backtest completed but produced no trades.")
+            st.caption("Tip: try a longer lookback period (data), adjust filters (RSI/RVOL/Vol), or use a different ticker.")
         else:
             st.download_button(
                 "⬇️ Download trades (CSV)",
