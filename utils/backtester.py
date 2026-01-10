@@ -15,7 +15,8 @@ ExitPriority = Literal["stop_first", "target_first", "worst_case"]
 SpreadMode = Literal["taker_only", "always", "never"]
 CommissionChargeOn = Literal["entry", "exit", "both"]
 TimeExitPrice = Literal["open", "close"]
-GateMode = Literal["hard", "soft"]  # hard = skip trades, soft = size-down / score-down
+GateMode = Literal["hard", "soft"]  # hard = skip trades, soft = size-down weak setups
+SizingMode = Literal["percent", "fixed_amount"]  # NEW
 
 
 # =============================================================================
@@ -98,8 +99,8 @@ def _apply_costs_px(
     Apply slippage + spread penalties to a fill price (always adverse).
 
     Beginner note:
-      - Slippage: pay a bit worse than the raw fill price.
-      - Spread: taker (market/stop/time) pays spread, maker (limit) often doesn't.
+      - Slippage: you pay slightly worse than the 'ideal' fill.
+      - Spread: taker-like fills (stop/time) tend to pay spread more often than limits.
     """
     px = float(px)
     side_l = str(side).lower().strip()
@@ -222,16 +223,12 @@ def _choose_entry_fill(
     next_high: float,
     next_low: float,
 ) -> Tuple[Optional[float], str]:
-    """
-    Decide entry fill price on the next bar.
-    Returns (raw_entry_px, entry_fill_type) where fill_type ∈ {"limit","stop"}.
-    """
+    """Return (raw_entry_px, entry_fill_type) where fill_type ∈ {"limit","stop"}."""
     if mode_l == "pullback":
         limit_px = float(close - float(atr_entry) * float(atr))
         fill = fill_limit_buy(next_open, next_low, limit_px)
         return (float(fill) if fill is not None else None), "limit"
 
-    # breakout
     stop_px = float(close + float(atr_entry) * float(atr))
     fill = fill_stop_buy(next_open, next_high, stop_px)
     return (float(fill) if fill is not None else None), "stop"
@@ -250,10 +247,7 @@ def _choose_exit_fill(
     time_exit_price: TimeExitPrice,
     next_close: float,
 ) -> Tuple[Optional[float], str]:
-    """
-    Decide exit fill price on next bar.
-    Returns (raw_exit_px, exit_fill_type) where fill_type ∈ {"limit","stop","time"}.
-    """
+    """Return (raw_exit_px, exit_fill_type) where fill_type ∈ {"limit","stop","time"}."""
     stop_hit = (next_low <= float(stop_px))
     target_hit = (next_high >= float(target_px))
 
@@ -272,11 +266,8 @@ def _choose_exit_fill(
         raw = fill_limit_sell(next_open, next_high, float(target_px))
         return (float(raw) if raw is not None else float(target_px)), "limit"
 
-    # Time exit
     if bars_held >= int(horizon):
-        if time_exit_price == "close":
-            return float(next_close), "time"
-        return float(next_open), "time"
+        return (float(next_close), "time") if time_exit_price == "close" else (float(next_open), "time")
 
     return None, "time"
 
@@ -293,9 +284,9 @@ def _simulate_outcome_r_multiple(
     time_exit_price: TimeExitPrice,
 ) -> Tuple[str, float]:
     """
-    Used for bucket stats (in-sample learning).
+    Used for in-sample bucket stats.
     Returns (reason, r_multiple) where reason ∈ {"target","stop","time","none"}.
-    Uses RAW prices (no costs) because it’s just estimating setup quality.
+    Uses RAW prices (no costs): estimates setup quality, not execution quality.
     """
     n = len(df)
     if entry_i < 0 or entry_i >= n:
@@ -328,13 +319,7 @@ def _simulate_outcome_r_multiple(
         if raw_exit is None:
             continue
 
-        if fill_type == "stop":
-            reason = "stop"
-        elif fill_type == "limit":
-            reason = "target"
-        else:
-            reason = "time"
-
+        reason = "stop" if fill_type == "stop" else ("target" if fill_type == "limit" else "time")
         r = (float(raw_exit) - entry_px) / risk
         return reason, float(r)
 
@@ -357,10 +342,7 @@ def _build_bucket_stats(
     time_exit_price: TimeExitPrice,
     is_end_i: int,
 ) -> Dict[str, Dict[str, float]]:
-    """
-    Build in-sample bucket stats from rows [0 .. is_end_i).
-    Each stat contains: n, p_win, avg_r
-    """
+    """Build in-sample bucket stats from rows [0 .. is_end_i). Each stat: n, p_win, avg_r."""
     rs_by_key: Dict[str, List[float]] = {}
     wins: Dict[str, int] = {}
     counts: Dict[str, int] = {}
@@ -380,7 +362,6 @@ def _build_bucket_stats(
         if not (np.isfinite(rsi) and np.isfinite(rvol) and np.isfinite(vol_ann) and np.isfinite(atr) and np.isfinite(close)):
             continue
 
-        # same base filters as strategy
         if rsi < float(rsi_min) or rsi > float(rsi_max):
             continue
         if rvol < float(rvol_min):
@@ -454,12 +435,10 @@ def _gate_multiplier(
     """
     Returns (multiplier, reason).
 
-    Multiplier meaning (for soft gating):
-      - 0.0 means "skip completely"
-      - 0.25 means "take but 25% size"
-      - 1.0 means "no penalty"
-
-    For hard gating, caller can treat multiplier == 0.0 as skip.
+    multiplier (soft gating):
+      - 0.0 => skip completely
+      - 0.25 => take but 25% size
+      - 1.0 => no penalty
     """
     key = _bucket_key(row)
     stt = bucket_stats.get(key)
@@ -473,10 +452,8 @@ def _gate_multiplier(
     if n < float(min_bucket_trades):
         return 0.0, "low_n"
     if (not np.isfinite(p)) or (p < float(prob_min)):
-        # soft penalty for weak win rate
         return 0.25, "low_p"
     if (not np.isfinite(ar)) or (ar < float(min_avg_r)):
-        # soft penalty for weak average outcome
         return 0.25, "low_avg_r"
 
     return 1.0, "ok"
@@ -516,12 +493,14 @@ def backtest_strategy(
 
     # --- sizing ---
     enable_position_sizing: bool = False,
-    risk_pct: float = 0.02,
-    max_alloc_pct: float = 0.10,
+    sizing_mode: SizingMode = "percent",     # NEW
+    invest_amount: float = 25.0,             # NEW: £ per trade when sizing_mode="fixed_amount"
+    risk_pct: float = 0.02,                  # risk cap (still applies if you want)
+    max_alloc_pct: float = 0.10,             # used when sizing_mode="percent"
     min_risk_per_share: float = 1e-6,
 
     # --- accounting model ---
-    use_cash_ledger: bool = False,   # NEW: if True, buys consume cash; sells restore cash
+    use_cash_ledger: bool = False,   # if True, buys consume cash; sells restore cash
     allow_margin: bool = False,      # if cash ledger on: allow cash to go negative or not
 
     # --- equity display only ---
@@ -538,17 +517,13 @@ def backtest_strategy(
     """
     Beginner-friendly next-bar execution backtest (pullback or breakout).
 
-    Key features:
-      - Next-bar fills with limit/stop approximations
-      - Optional slippage/spread costs
-      - Optional commissions
-      - Optional position sizing (risk cap + allocation cap)
-      - Optional cash ledger (more realistic for small accounts)
-      - Optional market regime filter (risk-on only)
-      - Optional probability gating (hard or soft)
+    NEW: sizing_mode
+      - "percent": original behavior (risk_pct + max_alloc_pct)
+      - "fixed_amount": invest ~£invest_amount per trade (still respects risk cap if enabled)
 
     IMPORTANT:
-      - This is educational and simplified. Daily bars cannot capture intraday path perfectly.
+      - Daily bars cannot capture intraday path perfectly (this is simplified).
+      - Long-only logic (buy then sell).
     """
     if df is None or df.empty or len(df) < int(min_hist_days):
         return {"error": "Not enough history", "df_bt": pd.DataFrame()}, pd.DataFrame()
@@ -587,21 +562,25 @@ def backtest_strategy(
     if gate_mode not in {"hard", "soft"}:
         gate_mode = "hard"  # type: ignore[assignment]
 
+    sizing_mode = str(sizing_mode).lower().strip()  # type: ignore[assignment]
+    if sizing_mode not in {"percent", "fixed_amount"}:
+        sizing_mode = "percent"  # type: ignore[assignment]
+
+    invest_amount = float(invest_amount)
+    if not np.isfinite(invest_amount) or invest_amount <= 0:
+        invest_amount = 25.0
+
     df_bt = _ensure_timestamp_column(df)
     df_bt = _to_numeric_ohlcv(df_bt)
 
     if df_bt.empty or len(df_bt) < int(min_hist_days):
         return {"error": "Not enough usable bars after timestamp normalization", "df_bt": pd.DataFrame()}, pd.DataFrame()
 
-    # Add indicators in-place
     add_indicators_inplace(df_bt)
     needed_ind_cols = {"rsi14", "rvol", "vol_ann", "atr14", "ma50", "ma200"}
     missing_ind = needed_ind_cols - set(df_bt.columns)
     if missing_ind:
-        raise KeyError(
-            f"Indicators missing expected columns: {sorted(missing_ind)}. "
-            f"Check add_indicators_inplace()."
-        )
+        raise KeyError(f"Indicators missing expected columns: {sorted(missing_ind)}. Check add_indicators_inplace().")
 
     # Market regime index (optional)
     regime_index: Optional[_MarketRegimeIndex] = None
@@ -623,8 +602,8 @@ def backtest_strategy(
             rvol_min=float(rvol_min),
             vol_max=float(vol_max),
             horizon=int(horizon),
-            exit_priority=exit_priority,  # type: ignore[arg-type]
-            time_exit_price=time_exit_price,  # type: ignore[arg-type]
+            exit_priority=exit_priority,       # type: ignore[arg-type]
+            time_exit_price=time_exit_price,   # type: ignore[arg-type]
             is_end_i=is_end_i,
         )
 
@@ -635,13 +614,13 @@ def backtest_strategy(
     df_bt["bt_target"] = np.nan
     df_bt["qty"] = np.nan
     df_bt["equity"] = np.nan
-    df_bt["cash"] = np.nan  # only meaningful when use_cash_ledger True
+    df_bt["cash"] = np.nan  # meaningful when use_cash_ledger True
 
     trades: List[Dict[str, Any]] = []
 
     # Accounting state
     equity = float(start_equity) if (np.isfinite(start_equity) and start_equity > 0) else 0.0
-    cash = float(equity)  # cash ledger starts as full equity
+    cash = float(equity)
 
     df_bt.loc[0, "equity"] = equity
     df_bt.loc[0, "cash"] = cash
@@ -655,14 +634,13 @@ def backtest_strategy(
     qty = 0
     cooldown = 0
 
-    # Gating counters (useful to show in UI)
+    # Gating counters
     gated_total = 0
     gated_unknown = 0
     gated_low_n = 0
     gated_low_p = 0
     gated_low_r = 0
 
-    # Helper: timestamp string
     def ts_at(i: int) -> str:
         if 0 <= i < len(df_bt):
             return str(pd.to_datetime(df_bt.loc[i, "timestamp"], utc=True, errors="coerce"))
@@ -672,19 +650,13 @@ def backtest_strategy(
         if commission_per_order <= 0:
             return True
         if not use_cash_ledger:
-            # In "equity-only" mode, we still prevent going negative for beginner sanity
             return (equity - float(commission_per_order)) >= 0.0
-        # In cash-ledger mode, commission is paid from cash
         if allow_margin:
             return True
         return (cash - float(commission_per_order)) >= 0.0
 
     def charge_commission(which: CommissionChargeOn) -> bool:
-        """
-        Returns True if commission charged, False if not possible (insufficient funds).
-        """
         nonlocal equity, cash
-
         if commission_per_order <= 0:
             return True
 
@@ -697,32 +669,21 @@ def backtest_strategy(
 
         if use_cash_ledger:
             cash -= float(commission_per_order)
-            # equity will be updated later (equity = cash + position_value)
         else:
             equity -= float(commission_per_order)
-
         return True
 
     def update_equity_mark_to_market(i: int) -> None:
-        """
-        Update df_bt equity/cash display at row i.
-        In equity-only mode: equity just carries forward (or marks MTM if enabled).
-        In cash-ledger mode: equity = cash + position_value (if mark_to_market), else cash + realized only.
-        """
         nonlocal equity, cash
-
         if use_cash_ledger:
             df_bt.loc[i, "cash"] = float(cash)
-
             if in_pos and mark_to_market:
                 cur_close = float(df_bt.loc[i, "close"])
                 pos_val = float(cur_close * int(qty)) if (np.isfinite(cur_close) and qty > 0) else 0.0
                 df_bt.loc[i, "equity"] = float(cash + pos_val)
             else:
-                # If not MTM, equity shown as cash + (realized PnL already embedded in cash)
                 df_bt.loc[i, "equity"] = float(cash)
         else:
-            # equity-only mode
             if in_pos and mark_to_market:
                 cur_close = float(df_bt.loc[i, "close"])
                 eff_qty = int(qty) if enable_position_sizing else 1
@@ -734,16 +695,14 @@ def backtest_strategy(
                 if not np.isfinite(df_bt.loc[i, "equity"]):
                     df_bt.loc[i, "equity"] = float(equity)
 
-    # Main loop: we trade using next bar fills, so iterate to len-2 at most for entries
+    # Main loop
     for i in range(len(df_bt) - 1):
         update_equity_mark_to_market(i)
 
         if cooldown > 0:
             cooldown -= 1
 
-        # ---------------------------------------------------------
-        # EXIT (we check next bar OHLC and decide if stop/target/time)
-        # ---------------------------------------------------------
+        # -------------------- EXIT --------------------
         if in_pos:
             nxt = df_bt.iloc[i + 1]
             o = float(nxt["open"])
@@ -760,60 +719,47 @@ def backtest_strategy(
                 target_px=float(target_px),
                 bars_held=bars_held,
                 horizon=int(horizon),
-                exit_priority=exit_priority,  # type: ignore[arg-type]
+                exit_priority=exit_priority,      # type: ignore[arg-type]
                 time_exit_price=time_exit_price,  # type: ignore[arg-type]
                 next_close=c,
             )
             if raw_exit is None:
                 continue
 
-            exit_px = _apply_costs_px(
+            exit_px_eff = _apply_costs_px(
                 float(raw_exit),
                 "sell",
                 slippage_bps=slip_bps,
                 spread_bps=spread_bps,
-                spread_mode=spread_mode,  # type: ignore[arg-type]
-                fill_type=exit_fill_type,  # type: ignore[arg-type]
+                spread_mode=spread_mode,          # type: ignore[arg-type]
+                fill_type=exit_fill_type,         # type: ignore[arg-type]
             )
 
             # Commission (exit)
-            if not charge_commission("exit"):
-                # If you can't afford commission, we still exit but clamp for beginner sanity
-                # (Real brokers would reject the order or liquidate; we keep it simple.)
-                pass
+            charge_commission("exit")  # best-effort
 
             equity_before = float(df_bt.loc[i, "equity"]) if np.isfinite(df_bt.loc[i, "equity"]) else float(equity)
             eff_qty = int(qty) if enable_position_sizing else 1
 
-            pnl_per_share = float(exit_px - float(entry_px))
+            pnl_per_share = float(exit_px_eff - float(entry_px))
             pnl = float(pnl_per_share * eff_qty)
 
             risk_per_share = float(float(entry_px) - float(stop_px))
             r_mult = float(pnl_per_share / risk_per_share) if risk_per_share > float(min_risk_per_share) else np.nan
 
-            # Update accounting
+            # Accounting update
             if use_cash_ledger:
-                # Sell returns cash
-                cash += float(exit_px) * eff_qty
-                # PnL is implicitly realized in cash (because we paid entry cost earlier)
-                # Equity will be updated by update_equity_mark_to_market
+                cash += float(exit_px_eff) * eff_qty
             else:
                 equity = float(equity + pnl)
 
-            # Write equity on exit bar
             if use_cash_ledger:
                 df_bt.loc[i + 1, "cash"] = float(cash)
-                df_bt.loc[i + 1, "equity"] = float(cash)  # if MTM, will update next iteration
+                df_bt.loc[i + 1, "equity"] = float(cash)
             else:
                 df_bt.loc[i + 1, "equity"] = float(equity)
 
-            # Determine reason label
-            if exit_fill_type == "stop":
-                reason = "stop"
-            elif exit_fill_type == "limit":
-                reason = "target"
-            else:
-                reason = "time"
+            reason = "stop" if exit_fill_type == "stop" else ("target" if exit_fill_type == "limit" else "time")
 
             trades.append(
                 {
@@ -822,7 +768,7 @@ def backtest_strategy(
                     "entry_ts": ts_at(entry_i),
                     "exit_ts": ts_at(i + 1),
                     "entry_px": float(entry_px),
-                    "exit_px": float(exit_px),
+                    "exit_px": float(exit_px_eff),
                     "stop_px": float(stop_px),
                     "target_px": float(target_px),
                     "reason": str(reason),
@@ -836,7 +782,7 @@ def backtest_strategy(
                 }
             )
 
-            # Reset position state
+            # Reset
             in_pos = False
             cooldown = int(cooldown_bars)
             entry_px = np.nan
@@ -846,13 +792,10 @@ def backtest_strategy(
             qty = 0
             continue
 
-        # ---------------------------------------------------------
-        # ENTRY
-        # ---------------------------------------------------------
+        # -------------------- ENTRY --------------------
         if cooldown > 0:
             continue
 
-        # Market regime filter (optional)
         if require_risk_on and regime_index is not None:
             ts = df_bt.loc[i, "timestamp"]
             if not regime_index.risk_on_at(ts, ma_len=200, price_col="close"):
@@ -875,7 +818,6 @@ def backtest_strategy(
         if vol_ann > float(vol_max):
             continue
 
-        # Probability gating (optional)
         gate_mult = 1.0
         gate_reason = "ok"
         if prob_gating:
@@ -888,7 +830,6 @@ def backtest_strategy(
             )
             gate_mult, gate_reason = float(gm), str(gr)
 
-            # Count gate outcomes (for reporting)
             if gate_mult <= 0.0:
                 gated_total += 1
                 if gate_reason == "unknown_bucket":
@@ -903,7 +844,6 @@ def backtest_strategy(
             if gate_mode == "hard" and gate_mult <= 0.0:
                 continue
 
-        # Look at next bar for entry fill
         nxt = df_bt.iloc[i + 1]
         o = float(nxt["open"])
         h = float(nxt["high"])
@@ -926,8 +866,8 @@ def backtest_strategy(
             "buy",
             slippage_bps=slip_bps,
             spread_bps=spread_bps,
-            spread_mode=spread_mode,  # type: ignore[arg-type]
-            fill_type=entry_fill_type,  # type: ignore[arg-type]
+            spread_mode=spread_mode,         # type: ignore[arg-type]
+            fill_type=entry_fill_type,       # type: ignore[arg-type]
         )
 
         stop = float(entry_px_eff - float(atr_stop) * atr)
@@ -942,49 +882,51 @@ def backtest_strategy(
         if risk_per_share <= float(min_risk_per_share):
             continue
 
-        # Choose quantity (default 1 share), then apply gating as size-down if soft mode
+        # -------- Choose quantity --------
         new_qty = 1
+
         if enable_position_sizing:
-            # Base sizing by risk + allocation
             account_base = float(cash) if use_cash_ledger else float(equity)
             if account_base <= 0:
                 continue
 
-            rpct = float(risk_pct)
-            apct = float(max_alloc_pct)
+            # Risk cap (optional but recommended)
+            rpct = max(0.0, float(risk_pct))
+            risk_budget = account_base * rpct
+            qty_risk = int(np.floor(risk_budget / risk_per_share)) if rpct > 0 else 10**9
 
-            risk_budget = account_base * max(0.0, rpct)
-            qty_risk = int(np.floor(risk_budget / risk_per_share))
-
-            alloc_budget = account_base * max(0.0, apct)
-            qty_alloc = int(np.floor(alloc_budget / max(1e-12, entry_px_eff)))
-
-            new_qty = int(max(0, min(qty_risk, qty_alloc)))
+            if sizing_mode == "fixed_amount":
+                # NEW: invest ~£invest_amount per trade
+                qty_amt = int(np.floor(float(invest_amount) / max(1e-12, entry_px_eff)))
+                new_qty = int(max(0, min(qty_amt, qty_risk)))
+            else:
+                # percent allocation mode
+                apct = max(0.0, float(max_alloc_pct))
+                alloc_budget = account_base * apct
+                qty_alloc = int(np.floor(alloc_budget / max(1e-12, entry_px_eff)))
+                new_qty = int(max(0, min(qty_risk, qty_alloc)))
         else:
             new_qty = 1
 
-        # Apply soft gating size-down (only if sizing is enabled; otherwise you still get 1 share)
+        # Apply soft gating size-down
         if prob_gating and gate_mode == "soft":
             if enable_position_sizing:
                 new_qty = int(np.floor(new_qty * max(0.0, min(1.0, gate_mult))))
             else:
-                # If not sizing, you can still choose to skip unknown buckets in soft mode
                 if gate_mult <= 0.0:
                     continue
 
         if new_qty <= 0:
             continue
 
-        # Commission (entry) - must be affordable
+        # Commission (entry)
         if not charge_commission("entry"):
-            # Can't pay commission => skip trade (beginner-friendly)
             continue
 
         # Cash ledger: buy consumes cash
         if use_cash_ledger:
             cost = float(entry_px_eff) * int(new_qty)
             if (not allow_margin) and (cash - cost) < 0.0:
-                # Can't afford the shares
                 continue
             cash -= cost
 
@@ -1002,10 +944,9 @@ def backtest_strategy(
         df_bt.loc[entry_i, "bt_target"] = float(target_px)
         df_bt.loc[entry_i, "qty"] = float(qty)
 
-        # Update equity/cash display at entry bar
         if use_cash_ledger:
             df_bt.loc[entry_i, "cash"] = float(cash)
-            df_bt.loc[entry_i, "equity"] = float(cash)  # MTM updates on next iterations
+            df_bt.loc[entry_i, "equity"] = float(cash)
         else:
             df_bt.loc[entry_i, "equity"] = float(equity)
 
@@ -1031,7 +972,7 @@ def backtest_strategy(
         "buckets_learned": int(len(bucket_stats)),
     }
 
-    # Compute summary stats
+    # Summary stats
     if trades_df.empty:
         results.update(
             {
@@ -1052,6 +993,8 @@ def backtest_strategy(
                     "exit_priority": str(exit_priority),
                     "time_exit_price": str(time_exit_price),
                     "position_sizing": bool(enable_position_sizing),
+                    "sizing_mode": str(sizing_mode),
+                    "invest_amount": float(invest_amount),
                     "risk_pct": float(risk_pct),
                     "max_alloc_pct": float(max_alloc_pct),
                     "use_cash_ledger": bool(use_cash_ledger),
@@ -1061,7 +1004,8 @@ def backtest_strategy(
                 },
                 "notes_for_beginners": [
                     "No trades were taken. This can happen if filters or gating are strict for this ticker/time period.",
-                    "Try: widen RSI filter, lower rvol_min, raise vol_max, reduce min_bucket_trades, or switch gate_mode to 'soft'.",
+                    "Try: widen RSI filter, lower rvol_min, raise vol_max, reduce min_bucket_trades, or switch gate_mode to 'soft' / turn gating off.",
+                    "If using fixed amount sizing: make sure invest_amount is large enough to buy at least 1 share.",
                 ],
             }
         )
@@ -1105,6 +1049,8 @@ def backtest_strategy(
                 "exit_priority": str(exit_priority),
                 "time_exit_price": str(time_exit_price),
                 "position_sizing": bool(enable_position_sizing),
+                "sizing_mode": str(sizing_mode),
+                "invest_amount": float(invest_amount),
                 "risk_pct": float(risk_pct),
                 "max_alloc_pct": float(max_alloc_pct),
                 "use_cash_ledger": bool(use_cash_ledger),
