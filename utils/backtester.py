@@ -15,30 +15,20 @@ MIN_HIST_DAYS_DEFAULT = 50
 # ---------- Fill helpers (bar-based approximations) ----------
 
 def fill_limit_buy(open_px: float, low_px: float, limit_px: float) -> Optional[float]:
-    """Limit buy fills if bar low trades through limit. Assumes fill at limit price."""
     return float(limit_px) if low_px <= limit_px else None
 
 
 def fill_stop_buy(open_px: float, high_px: float, stop_px: float) -> Optional[float]:
-    """
-    Stop buy (breakout) fills if bar high crosses stop.
-    If gap up above stop, assume fill at open; else at stop.
-    """
     if high_px >= stop_px:
         return float(open_px) if open_px > stop_px else float(stop_px)
     return None
 
 
 def fill_limit_sell(open_px: float, high_px: float, limit_px: float) -> Optional[float]:
-    """Limit sell fills if bar high trades through limit. Assumes fill at limit price."""
     return float(limit_px) if high_px >= limit_px else None
 
 
 def fill_stop_sell(open_px: float, low_px: float, stop_px: float) -> Optional[float]:
-    """
-    Stop sell fills if bar low crosses stop.
-    If gap down below stop, assume fill at open; else at stop.
-    """
     if low_px <= stop_px:
         return float(open_px) if open_px < stop_px else float(stop_px)
     return None
@@ -47,7 +37,6 @@ def fill_stop_sell(open_px: float, low_px: float, stop_px: float) -> Optional[fl
 # ---------- Internal helpers ----------
 
 def _ensure_timestamp_column(df: pd.DataFrame) -> pd.DataFrame:
-    """Ensure df has a normalized UTC `timestamp` column, sorted ascending."""
     out = df.copy()
 
     if "timestamp" in out.columns:
@@ -63,12 +52,33 @@ def _ensure_timestamp_column(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _to_numeric_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
-    """Coerce OHLCV to numeric floats; invalid values become NaN."""
     out = df.copy()
     for c in ["open", "high", "low", "close", "volume"]:
         if c in out.columns:
             out[c] = pd.to_numeric(out[c], errors="coerce")
     return out
+
+
+def _max_drawdown(equity: pd.Series) -> float:
+    if equity is None or len(equity) < 2:
+        return float("nan")
+    eq = pd.to_numeric(equity, errors="coerce").dropna()
+    if len(eq) < 2:
+        return float("nan")
+    peak = eq.cummax()
+    dd = (eq / peak) - 1.0
+    return float(dd.min())
+
+
+def _sharpe_from_returns(ret: pd.Series, periods_per_year: int = 252) -> float:
+    r = pd.to_numeric(ret, errors="coerce").dropna()
+    if len(r) < 2:
+        return float("nan")
+    mu = float(r.mean())
+    sd = float(r.std(ddof=1))
+    if sd <= 1e-12:
+        return float("nan")
+    return float((mu / sd) * np.sqrt(periods_per_year))
 
 
 def _apply_costs_px(
@@ -81,21 +91,20 @@ def _apply_costs_px(
     fill_type: str,
     reason: str,
 ) -> float:
-    """Apply slippage + spread penalties to a fill price (always adverse)."""
     px = float(px)
     side_l = str(side).lower().strip()
     spread_mode = str(spread_mode).lower().strip()
     fill_type = str(fill_type).lower().strip()
     reason = str(reason).lower().strip()
 
-    # Slippage: always adverse
+    # Slippage always adverse
     if slippage_bps and slippage_bps > 0:
         if side_l == "buy":
             px *= (1.0 + slippage_bps / 10000.0)
         else:
             px *= (1.0 - slippage_bps / 10000.0)
 
-    # Spread: optionally applied
+    # Spread application
     apply_spread = False
     if spread_bps and spread_bps > 0:
         if spread_mode == "always":
@@ -131,34 +140,13 @@ class _MarketRegimeIndex:
     def risk_on_at(self, ts: pd.Timestamp, *, ma_len: int = 200, price_col: str = "close") -> bool:
         if self.df is None or self.df.empty or ts is pd.NaT:
             return True
-
         idx = int(self.df["timestamp"].searchsorted(ts, side="right") - 1)
         if idx < 0:
             return True
-
         try:
             return bool(market_regime_at(self.df, idx, ma_len=ma_len, price_col=price_col))
         except Exception:
             return True
-
-
-def _max_drawdown(equity: pd.Series) -> float:
-    if equity is None or len(equity) < 2:
-        return float("nan")
-    peak = equity.cummax()
-    dd = (equity / peak) - 1.0
-    return float(dd.min())
-
-
-def _sharpe_from_returns(ret: pd.Series, periods_per_year: int = 252) -> float:
-    ret = pd.to_numeric(ret, errors="coerce").dropna()
-    if len(ret) < 2:
-        return float("nan")
-    mu = float(ret.mean())
-    sd = float(ret.std(ddof=1))
-    if sd <= 1e-12:
-        return float("nan")
-    return float((mu / sd) * np.sqrt(periods_per_year))
 
 
 ExitPriority = Literal["stop_first", "target_first", "worst_case"]
@@ -197,16 +185,14 @@ def backtest_strategy(
     max_alloc_pct: float = 0.10,
     min_risk_per_share: float = 1e-6,
 
-    # --- equity display only (does not change fills/logic) ---
+    # --- equity display only ---
     mark_to_market: bool = False,
-) -> Tuple[Dict[str, Any], pd.DataFrame]:
-    """
-    Next-bar execution breakout/pullback backtest.
 
-    mark_to_market:
-      - If True: equity curve is updated each bar while in position using current bar close.
-      - Does NOT change entry/exit logic or fills (visualization only).
-    """
+    # --- optional better costs ---
+    dynamic_spread: bool = False,
+    dyn_spread_min_bps: float = 2.0,
+    dyn_spread_max_bps: float = 50.0,
+) -> Tuple[Dict[str, Any], pd.DataFrame]:
     if df is None or df.empty or len(df) < int(min_hist_days):
         return {"error": "Not enough history", "df_bt": pd.DataFrame()}, pd.DataFrame()
 
@@ -217,9 +203,6 @@ def backtest_strategy(
 
     horizon = int(max(1, horizon))
     cooldown_bars = int(max(0, cooldown_bars))
-
-    spread_bps = float(assumed_spread_bps) if include_spread_penalty else 0.0
-    slip_bps = float(slippage_bps)
 
     mode_l = str(mode).lower().strip()
     if mode_l not in {"pullback", "breakout"}:
@@ -235,23 +218,29 @@ def backtest_strategy(
 
     df_bt = _ensure_timestamp_column(df)
     df_bt = _to_numeric_ohlcv(df_bt)
-
     if df_bt.empty or len(df_bt) < int(min_hist_days):
-        return {"error": "Not enough usable bars after timestamp normalization", "df_bt": pd.DataFrame()}, pd.DataFrame()
+        return {"error": "Not enough usable bars after normalization", "df_bt": pd.DataFrame()}, pd.DataFrame()
 
     add_indicators_inplace(df_bt)
 
     needed_ind_cols = {"rsi14", "rvol", "vol_ann", "atr14"}
     missing_ind = needed_ind_cols - set(df_bt.columns)
     if missing_ind:
-        raise KeyError(f"Indicators missing expected columns: {sorted(missing_ind)}. Check add_indicators_inplace().")
+        raise KeyError(f"Indicators missing expected columns: {sorted(missing_ind)}")
 
-    df_bt["signal"] = 0.0
-    df_bt["entry_type"] = ""
-    df_bt["bt_stop"] = np.nan
-    df_bt["bt_target"] = np.nan
-    df_bt["qty"] = np.nan
-    df_bt["equity"] = np.nan
+    # Prepare columns
+    for col, default in [
+        ("signal", 0.0),
+        ("entry_type", ""),
+        ("bt_stop", np.nan),
+        ("bt_target", np.nan),
+        ("qty", np.nan),
+        ("equity", np.nan),
+    ]:
+        if col not in df_bt.columns:
+            df_bt[col] = default
+        else:
+            df_bt[col] = df_bt[col] if col != "equity" else np.nan
 
     regime_index: Optional[_MarketRegimeIndex] = None
     if require_risk_on and market_df is not None and not market_df.empty:
@@ -275,32 +264,29 @@ def backtest_strategy(
             return str(pd.to_datetime(df_bt.loc[i, "timestamp"], utc=True, errors="coerce"))
         return ""
 
-    def _charge_commission(which: str) -> None:
-        nonlocal equity
+    def _commission_due(which: str) -> float:
         if commission_per_order <= 0:
-            return
+            return 0.0
         if charge_commission_on == "both":
-            equity -= float(commission_per_order)
-        elif charge_commission_on == which:
-            equity -= float(commission_per_order)
+            return float(commission_per_order)
+        return float(commission_per_order) if charge_commission_on == which else 0.0
 
     for i in range(len(df_bt) - 1):
-        # Mark-to-market equity display while holding (does not change strategy)
+        # Equity series fill (realized baseline)
+        if not np.isfinite(df_bt.loc[i, "equity"]):
+            df_bt.loc[i, "equity"] = equity
+
+        # MTM display option (doesn't change logic)
         if in_pos and mark_to_market:
             cur_close = float(df_bt.loc[i, "close"])
             eff_qty = int(qty) if enable_position_sizing else 1
             if np.isfinite(cur_close) and np.isfinite(entry_px) and eff_qty > 0:
                 df_bt.loc[i, "equity"] = float(equity + (cur_close - entry_px) * eff_qty)
-            else:
-                df_bt.loc[i, "equity"] = equity
-        else:
-            if not np.isfinite(df_bt.loc[i, "equity"]):
-                df_bt.loc[i, "equity"] = equity
 
         if cooldown > 0:
             cooldown -= 1
 
-        # -------- EXIT --------
+        # ---------------- EXIT ----------------
         if in_pos:
             nxt = df_bt.iloc[i + 1]
             o, h, l = float(nxt["open"]), float(nxt["high"]), float(nxt["low"])
@@ -338,6 +324,10 @@ def backtest_strategy(
             if raw_exit_px is None:
                 continue
 
+            # Spread/slippage assumptions
+            spread_bps = float(assumed_spread_bps) if include_spread_penalty else 0.0
+            slip_bps = float(slippage_bps)
+
             exit_px = _apply_costs_px(
                 float(raw_exit_px),
                 "sell",
@@ -349,7 +339,7 @@ def backtest_strategy(
             )
 
             equity_before = float(equity)
-            _charge_commission("exit")
+            equity -= _commission_due("exit")
 
             pnl_per_share = float(exit_px - entry_px)
             risk_per_share = float(entry_px - stop_px)
@@ -391,7 +381,7 @@ def backtest_strategy(
             qty = 0
             continue
 
-        # -------- ENTRY --------
+        # ---------------- ENTRY ----------------
         if cooldown > 0:
             continue
 
@@ -400,16 +390,21 @@ def backtest_strategy(
             if not regime_index.risk_on_at(ts, ma_len=200, price_col="close"):
                 continue
 
+        # Optional readiness gate
+        if "ind_ready" in df_bt.columns:
+            if not bool(df_bt.loc[i, "ind_ready"]):
+                continue
+
         row = df_bt.iloc[i]
         rsi = float(row["rsi14"])
         rvol = float(row["rvol"])
         vol_ann = float(row["vol_ann"])
         atr = float(row["atr14"])
         close = float(row["close"])
+        vol = float(row["volume"])
 
         if not np.isfinite([rsi, rvol, vol_ann, atr, close]).all():
             continue
-
         if rsi < float(rsi_min) or rsi > float(rsi_max):
             continue
         if rvol < float(rvol_min):
@@ -435,18 +430,24 @@ def backtest_strategy(
             raw_entry_px = float(fill)
             entry_type = "stop"
 
+        # Costs
+        spread_bps = float(assumed_spread_bps) if include_spread_penalty else 0.0
+        if dynamic_spread and np.isfinite([close, vol]).all() and close > 0 and vol > 0:
+            # crude liquidity proxy: higher volume -> smaller spread
+            # keep it bounded
+            liq = close * vol
+            est = 10000.0 / np.sqrt(max(1.0, liq)) * 50.0  # heuristic scale
+            spread_bps = float(np.clip(max(spread_bps, est), dyn_spread_min_bps, dyn_spread_max_bps))
+
         entry = _apply_costs_px(
             raw_entry_px,
             "buy",
-            slippage_bps=slip_bps,
-            spread_bps=spread_bps,
+            slippage_bps=float(slippage_bps),
+            spread_bps=float(spread_bps),
             spread_mode=spread_mode,
             fill_type=entry_type,
             reason="entry",
         )
-
-        equity_before = float(equity)
-        _charge_commission("entry")
 
         stop = float(entry - float(atr_stop) * atr)
         target = float(entry + float(atr_target) * atr)
@@ -460,6 +461,7 @@ def backtest_strategy(
         if risk_per_share <= float(min_risk_per_share):
             continue
 
+        # Determine qty BEFORE charging commission
         new_qty = 1
         if enable_position_sizing:
             eq = float(equity)
@@ -478,8 +480,11 @@ def backtest_strategy(
                 new_qty = 1
 
             if new_qty <= 0:
-                equity = equity_before
                 continue
+
+        # Now charge commission once we know we will enter
+        equity_before = float(equity)
+        equity -= _commission_due("entry")
 
         in_pos = True
         entry_px = float(entry)
@@ -512,8 +517,8 @@ def backtest_strategy(
                 "assumptions": {
                     "mode": mode_l,
                     "horizon_bars": int(horizon),
-                    "slippage_bps": float(slip_bps),
-                    "spread_bps": float(spread_bps),
+                    "slippage_bps": float(slippage_bps),
+                    "spread_bps": float(assumed_spread_bps if include_spread_penalty else 0.0),
                     "spread_mode": str(spread_mode),
                     "commission_per_order": float(commission_per_order),
                     "commission_charged_on": str(charge_commission_on),
@@ -522,17 +527,15 @@ def backtest_strategy(
                     "risk_pct": float(risk_pct),
                     "max_alloc_pct": float(max_alloc_pct),
                     "mark_to_market": bool(mark_to_market),
+                    "dynamic_spread": bool(dynamic_spread),
                 },
                 "notes_for_beginners": [
-                    "No trades were taken. This usually means filters are too strict or not enough history.",
+                    "No trades were taken. Filters may be too strict or there isn't enough history.",
                     "Try lowering RVOL min, widening RSI range, or increasing history.",
                 ],
             }
         )
-        return results, pd.DataFrame(columns=[
-            "entry_i","exit_i","entry_ts","exit_ts","entry_px","exit_px","stop_px","target_px",
-            "reason","bars_held","pnl_per_share","r_multiple","qty","pnl","equity_before","equity_after"
-        ])
+        return results, trades_df
 
     pnlps = pd.to_numeric(trades_df["pnl_per_share"], errors="coerce")
     win_rate = float((pnlps > 0).sum()) / max(1, len(pnlps))
@@ -542,9 +545,11 @@ def backtest_strategy(
     total_return = (eqN / eq0 - 1.0) if np.isfinite(eq0) and eq0 > 0 and np.isfinite(eqN) else float("nan")
 
     max_dd = _max_drawdown(df_bt["equity"])
+
     eq = pd.to_numeric(df_bt["equity"], errors="coerce")
     eq_ret = eq.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
     sharpe = _sharpe_from_returns(eq_ret, periods_per_year=252)
+
     avg_r = float(pd.to_numeric(trades_df["r_multiple"], errors="coerce").dropna().mean())
 
     results.update(
@@ -558,8 +563,8 @@ def backtest_strategy(
             "assumptions": {
                 "mode": mode_l,
                 "horizon_bars": int(horizon),
-                "slippage_bps": float(slip_bps),
-                "spread_bps": float(spread_bps),
+                "slippage_bps": float(slippage_bps),
+                "spread_bps": float(assumed_spread_bps if include_spread_penalty else 0.0),
                 "spread_mode": str(spread_mode),
                 "commission_per_order": float(commission_per_order),
                 "commission_charged_on": str(charge_commission_on),
@@ -568,6 +573,7 @@ def backtest_strategy(
                 "risk_pct": float(risk_pct),
                 "max_alloc_pct": float(max_alloc_pct),
                 "mark_to_market": bool(mark_to_market),
+                "dynamic_spread": bool(dynamic_spread),
             },
         }
     )
