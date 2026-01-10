@@ -1,7 +1,6 @@
 # app.py
 from __future__ import annotations
 
-import inspect
 import json
 import time
 from dataclasses import dataclass
@@ -12,9 +11,9 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from utils.backtester import backtest_strategy
 from utils.data_loader import load_historical, sanity_check_bars
 from utils.indicators import add_indicators_inplace
+from utils.backtester import backtest_strategy
 
 # Optional: auto-refresh
 try:
@@ -38,7 +37,7 @@ except Exception:
 
 
 # =============================================================================
-# Streamlit config
+# Page config
 # =============================================================================
 st.set_page_config(page_title="Pro Algo Trader", page_icon="📈", layout="wide", initial_sidebar_state="expanded")
 
@@ -138,99 +137,35 @@ def _tail_for_plot(df: pd.DataFrame, n: int) -> pd.DataFrame:
     return df.tail(n) if len(df) > n else df
 
 
-def _keep_cfg_keys(cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """Whitelist config keys we allow importing/exporting."""
-    allowed = {
-        "symbol",
-        "strategy_type",
-        "account_capital",
-        "risk_per_trade_pct",
-        "atr_entry",
-        "atr_stop",
-        "atr_target",
-        "rsi_min",
-        "rsi_max",
-        "rvol_min",
-        "vol_max",
-    }
-    return {k: cfg[k] for k in allowed if k in cfg}
-
-
 # =============================================================================
-# Trade marker extraction
+# Plots (trade markers)
 # =============================================================================
-def _trades_to_markers(trades: pd.DataFrame, df_index: pd.DatetimeIndex) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def _extract_markers(trades: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Returns (entries_df, exits_df) with columns ['ts','px'] for plotting markers.
-    Robust to different trade dataframe column names.
+    Expect trades columns: entry_ts, entry_px, exit_ts, exit_px
     """
     if trades is None or getattr(trades, "empty", True):
         return pd.DataFrame(columns=["ts", "px"]), pd.DataFrame(columns=["ts", "px"])
 
     t = trades.copy()
+    if "entry_ts" in t.columns:
+        t["entry_ts"] = pd.to_datetime(t["entry_ts"], errors="coerce", utc=True)
+    if "exit_ts" in t.columns:
+        t["exit_ts"] = pd.to_datetime(t["exit_ts"], errors="coerce", utc=True)
 
-    # Candidate columns (time)
-    entry_time_cols = ["entry_time", "entry_ts", "entry_timestamp", "entry_date", "open_time", "buy_time"]
-    exit_time_cols = ["exit_time", "exit_ts", "exit_timestamp", "exit_date", "close_time", "sell_time"]
+    entries = pd.DataFrame(
+        {"ts": t.get("entry_ts", pd.Series(dtype="datetime64[ns, UTC]")),
+         "px": pd.to_numeric(t.get("entry_px", pd.Series(dtype=float)), errors="coerce")}
+    ).dropna(subset=["ts", "px"])
 
-    # Candidate columns (price)
-    entry_price_cols = ["entry_price", "entry_px", "buy_price", "fill_price", "open_price"]
-    exit_price_cols = ["exit_price", "exit_px", "sell_price", "close_price"]
-
-    # Candidate columns (bar index)
-    entry_idx_cols = ["entry_idx", "entry_i", "buy_idx", "i_entry"]
-    exit_idx_cols = ["exit_idx", "exit_i", "sell_idx", "i_exit"]
-
-    def pick_col(cols: List[str]) -> Optional[str]:
-        for c in cols:
-            if c in t.columns:
-                return c
-        return None
-
-    et = pick_col(entry_time_cols)
-    xt = pick_col(exit_time_cols)
-    ep = pick_col(entry_price_cols)
-    xp = pick_col(exit_price_cols)
-    ei = pick_col(entry_idx_cols)
-    xi = pick_col(exit_idx_cols)
-
-    def to_ts(col_time: Optional[str], col_idx: Optional[str]) -> pd.Series:
-        if col_time:
-            ts = pd.to_datetime(t[col_time], errors="coerce", utc=True)
-            return ts
-        if col_idx:
-            idx = pd.to_numeric(t[col_idx], errors="coerce")
-            out = pd.Series(pd.NaT, index=t.index, dtype="datetime64[ns, UTC]")
-            for j, v in idx.items():
-                if pd.notna(v):
-                    k = int(v)
-                    if 0 <= k < len(df_index):
-                        out.loc[j] = df_index[k]
-            return out
-        return pd.Series(pd.NaT, index=t.index, dtype="datetime64[ns, UTC]")
-
-    entry_ts = to_ts(et, ei)
-    exit_ts = to_ts(xt, xi)
-
-    def to_px(col_price: Optional[str], fallback_col: str) -> pd.Series:
-        if col_price:
-            return pd.to_numeric(t[col_price], errors="coerce")
-        if fallback_col in t.columns:
-            return pd.to_numeric(t[fallback_col], errors="coerce")
-        return pd.Series(np.nan, index=t.index, dtype="float64")
-
-    entry_px = to_px(ep, "entry")
-    exit_px = to_px(xp, "exit")
-
-    entries = pd.DataFrame({"ts": entry_ts, "px": entry_px}).dropna(subset=["ts", "px"])
-    exits = pd.DataFrame({"ts": exit_ts, "px": exit_px}).dropna(subset=["ts", "px"])
+    exits = pd.DataFrame(
+        {"ts": t.get("exit_ts", pd.Series(dtype="datetime64[ns, UTC]")),
+         "px": pd.to_numeric(t.get("exit_px", pd.Series(dtype=float)), errors="coerce")}
+    ).dropna(subset=["ts", "px"])
 
     return entries, exits
 
 
-# =============================================================================
-# Plotting (with optional trade markers)
-# =============================================================================
 def plot_price(df: pd.DataFrame, symbol: str, trades: Optional[pd.DataFrame] = None) -> go.Figure:
     x = df.index
     fig = go.Figure()
@@ -254,17 +189,17 @@ def plot_price(df: pd.DataFrame, symbol: str, trades: Optional[pd.DataFrame] = N
         if col in df.columns:
             fig.add_trace(go.Scatter(x=x, y=df[col], mode="lines", name=label))
 
-    # ---- Trade markers
-    if isinstance(trades, pd.DataFrame) and (not trades.empty):
-        entries, exits = _trades_to_markers(trades, df.index)
+    # Trade markers (color-coded)
+    if isinstance(trades, pd.DataFrame) and not trades.empty:
+        entries, exits = _extract_markers(trades)
         if not entries.empty:
             fig.add_trace(
                 go.Scatter(
                     x=entries["ts"],
                     y=entries["px"],
                     mode="markers",
-                    name="Buy",
-                    marker=dict(symbol="triangle-up", size=10),
+                    name="Entry",
+                    marker=dict(symbol="triangle-up", size=10, color="green"),
                 )
             )
         if not exits.empty:
@@ -273,8 +208,8 @@ def plot_price(df: pd.DataFrame, symbol: str, trades: Optional[pd.DataFrame] = N
                     x=exits["ts"],
                     y=exits["px"],
                     mode="markers",
-                    name="Sell",
-                    marker=dict(symbol="triangle-down", size=10),
+                    name="Exit",
+                    marker=dict(symbol="triangle-down", size=10, color="red"),
                 )
             )
 
@@ -314,74 +249,8 @@ def plot_indicator(
 
 
 # =============================================================================
-# Strategy / signal helpers
+# Signal helpers (simple)
 # =============================================================================
-def compute_lookback_low_high(df_ind: pd.DataFrame, lookback: int) -> Tuple[float, float]:
-    lb = int(max(10, lookback))
-    tail = df_ind.tail(lb)
-    if tail.empty or ("low" not in tail.columns) or ("high" not in tail.columns):
-        return np.nan, np.nan
-    lo = float(np.nanmin(pd.to_numeric(tail["low"], errors="coerce").values))
-    hi = float(np.nanmax(pd.to_numeric(tail["high"], errors="coerce").values))
-    return lo, hi
-
-
-def detect_big_jump(df: pd.DataFrame, thresh: float = 0.18) -> Optional[Dict[str, Any]]:
-    if df is None or getattr(df, "empty", True) or "close" not in df.columns:
-        return None
-    c = pd.to_numeric(df["close"], errors="coerce")
-    r = c.pct_change().abs().dropna()
-    if r.empty:
-        return None
-    ts = r.idxmax()
-    mv = _safe_float(r.loc[ts]) if ts in r.index else np.nan
-    if np.isfinite(mv) and mv >= float(thresh):
-        return {"ts": ts, "abs_move": mv}
-    return None
-
-
-def compute_trade_plan(
-    df_ind: pd.DataFrame,
-    strategy_type: str,
-    atr_entry: float,
-    atr_stop: float,
-    atr_target: float,
-    *,
-    assumed_spread_bps: float,
-    include_spread_penalty: bool,
-) -> Dict[str, Any]:
-    """
-    Strategy-aware plan:
-      - Trend Breakout: entry above close
-      - Mean Reversion: entry below close (pullback)
-    """
-    last = df_ind.iloc[-1]
-    close = _safe_float(last.get("close", np.nan))
-    atr = _safe_float(last.get("atr14", np.nan))
-
-    if not np.isfinite(close) or not np.isfinite(atr) or atr <= 0:
-        return {"entry": np.nan, "stop": np.nan, "target": np.nan, "rr": np.nan, "atr": atr, "type": "—"}
-
-    stype = (strategy_type or "").lower().strip()
-    is_mr = "mean" in stype
-
-    if is_mr:
-        entry = close - float(atr_entry) * atr
-        plan_type = "Mean Reversion (limit buy)"
-    else:
-        entry = close + float(atr_entry) * atr
-        plan_type = "Trend Breakout (stop trigger)"
-
-    if include_spread_penalty and assumed_spread_bps > 0 and np.isfinite(entry):
-        entry *= (1.0 + assumed_spread_bps / 10000.0)
-
-    stop = entry - float(atr_stop) * atr
-    target = entry + float(atr_target) * atr
-    risk = entry - stop
-    rr = ((target - entry) / risk) if risk > 0 else np.nan
-    return {"entry": entry, "stop": stop, "target": target, "rr": rr, "atr": atr, "type": plan_type}
-
-
 @dataclass(frozen=True)
 class SignalScore:
     label: str
@@ -455,8 +324,80 @@ def compute_signal_score(df_ind: pd.DataFrame, rsi_min: float, rsi_max: float, r
     return SignalScore("HOLD", score, "Mixed/neutral conditions.", reasons)
 
 
-def _bt_params_signature(**kwargs) -> str:
-    return "|".join([f"{k}={v}" for k, v in sorted((k, str(v)) for k, v in kwargs.items())])
+def _bt_params_signature(d: Dict[str, Any]) -> str:
+    return "|".join([f"{k}={v}" for k, v in sorted((k, str(v)) for k, v in d.items())])
+
+
+# =============================================================================
+# Data loading (Alpaca preferred; Yahoo fallback)
+# =============================================================================
+@st.cache_data(ttl=15 * 60, show_spinner=False)
+def _cached_load_alpaca(symbol: str, force_refresh: int) -> pd.DataFrame:
+    api_key = str(st.secrets.get("ALPACA_KEY", "")).strip()
+    sec_key = str(st.secrets.get("ALPACA_SECRET", "")).strip()
+    if not api_key or not sec_key:
+        raise RuntimeError("Missing Alpaca keys in Streamlit secrets.")
+    df, _dbg = load_historical(symbol, api_key, sec_key, force_refresh=force_refresh)
+    return df
+
+
+@st.cache_data(ttl=30 * 60, show_spinner=False)
+def _cached_load_yahoo(symbol: str, period: str = "5y", interval: str = "1d") -> pd.DataFrame:
+    if not YF_AVAILABLE:
+        raise RuntimeError("yfinance not installed.")
+    t = yf.Ticker(symbol)
+    hist = t.history(period=period, interval=interval, auto_adjust=False)
+    if hist is None or hist.empty:
+        raise RuntimeError("Yahoo returned no data.")
+    hist = hist.rename(columns={c: c.lower() for c in hist.columns})
+    hist = hist.reset_index().rename(columns={"Date": "timestamp", "Datetime": "timestamp"})
+    if "timestamp" not in hist.columns:
+        hist["timestamp"] = pd.to_datetime(hist.index)
+    return hist
+
+
+def _load_and_prepare(symbol: str, *, force_refresh: int) -> None:
+    st.session_state["load_error"] = None
+    st.session_state["ind_error"] = None
+
+    df: Optional[pd.DataFrame] = None
+    err_primary: Optional[str] = None
+
+    if _has_keys_in_secrets():
+        try:
+            df = _cached_load_alpaca(symbol, force_refresh=force_refresh)
+        except Exception as e:
+            err_primary = f"{type(e).__name__}: {e}"
+            df = None
+
+    if df is None or getattr(df, "empty", True):
+        try:
+            df = _cached_load_yahoo(symbol, period="5y", interval="1d")
+        except Exception as e:
+            err_y = f"{type(e).__name__}: {e}"
+            st.session_state["load_error"] = f"{err_primary} | {err_y}" if err_primary else err_y
+            st.session_state["df_raw"] = None
+            st.session_state["df_chart"] = None
+            st.session_state["last_symbol"] = None
+            return
+
+    df = _coerce_ohlcv_numeric(_ensure_ohlcv_cols(df))
+    st.session_state["df_raw"] = df
+    st.session_state["last_symbol"] = symbol
+    st.session_state["last_loaded_at"] = pd.Timestamp.utcnow()
+
+    try:
+        st.session_state["sanity"] = sanity_check_bars(df)
+    except Exception:
+        st.session_state["sanity"] = None
+
+    try:
+        df_chart = _as_utc_dtindex(df)
+        add_indicators_inplace(df_chart)
+        st.session_state["df_chart"] = df_chart
+    except Exception as e:
+        st.session_state["df_chart"] = _as_utc_dtindex(df)
+        st.session_state["ind_error"] = f"{type(e).__name__}: {e}"
 
 
 # =============================================================================
@@ -522,504 +463,10 @@ def _live_dicts_to_df(rows: List[dict]) -> pd.DataFrame:
     return df
 
 
-# =============================================================================
-# Cached loaders
-# =============================================================================
-@st.cache_data(ttl=15 * 60, show_spinner=False)
-def _cached_load_alpaca(symbol: str, force_refresh: int) -> pd.DataFrame:
-    api_key = str(st.secrets.get("ALPACA_KEY", "")).strip()
-    sec_key = str(st.secrets.get("ALPACA_SECRET", "")).strip()
-    if not api_key or not sec_key:
-        raise RuntimeError("Missing Alpaca keys in Streamlit secrets.")
-    df, _ = load_historical(symbol, api_key, sec_key, force_refresh=force_refresh)
-    return df
-
-
-@st.cache_data(ttl=30 * 60, show_spinner=False)
-def _cached_load_yahoo(symbol: str, period: str = "5y", interval: str = "1d") -> pd.DataFrame:
-    if not YF_AVAILABLE:
-        raise RuntimeError("yfinance not installed.")
-    t = yf.Ticker(symbol)
-    hist = t.history(period=period, interval=interval, auto_adjust=False)
-    if hist is None or hist.empty:
-        raise RuntimeError("Yahoo returned no data.")
-    hist = hist.rename(columns={c: c.lower() for c in hist.columns})
-    hist = hist.reset_index().rename(columns={"Date": "timestamp", "Datetime": "timestamp"})
-    if "timestamp" not in hist.columns:
-        hist["timestamp"] = pd.to_datetime(hist.index)
-    return hist
-
-
-def _load_and_prepare(symbol: str, *, force_refresh: int) -> None:
-    st.session_state["load_error"] = None
-    st.session_state["ind_error"] = None
-
-    df: Optional[pd.DataFrame] = None
-    err_primary: Optional[str] = None
-
-    if _has_keys_in_secrets():
-        try:
-            df = _cached_load_alpaca(symbol, force_refresh=force_refresh)
-        except Exception as e:
-            err_primary = f"{type(e).__name__}: {e}"
-            df = None
-
-    if df is None or getattr(df, "empty", True):
-        try:
-            df = _cached_load_yahoo(symbol, period="5y", interval="1d")
-        except Exception as e:
-            err_y = f"{type(e).__name__}: {e}"
-            st.session_state["load_error"] = f"{err_primary} | {err_y}" if err_primary else err_y
-            st.session_state["df_raw"] = None
-            st.session_state["df_chart"] = None
-            st.session_state["last_symbol"] = None
-            return
-
-    df = _coerce_ohlcv_numeric(_ensure_ohlcv_cols(df))
-    st.session_state["df_raw"] = df
-    st.session_state["last_symbol"] = symbol
-    st.session_state["last_loaded_at"] = pd.Timestamp.utcnow()
-
-    try:
-        st.session_state["sanity"] = sanity_check_bars(df)
-    except Exception:
-        st.session_state["sanity"] = None
-
-    try:
-        df_chart = _as_utc_dtindex(df)
-        add_indicators_inplace(df_chart)
-        st.session_state["df_chart"] = df_chart
-    except Exception as e:
-        st.session_state["df_chart"] = _as_utc_dtindex(df)
-        st.session_state["ind_error"] = f"{type(e).__name__}: {e}"
-
-
-# =============================================================================
-# Backtest call helper (filters kwargs to match your backtester signature)
-# =============================================================================
-def _call_backtest(**kwargs):
-    sig = inspect.signature(backtest_strategy)
-    allowed = {k: v for k, v in kwargs.items() if k in sig.parameters}
-    return backtest_strategy(**allowed)
-
-
-# =============================================================================
-# Session init
-# =============================================================================
-for k, v in {
-    "df_raw": None,
-    "df_chart": None,
-    "sanity": None,
-    "load_error": None,
-    "ind_error": None,
-    "last_symbol": None,
-    "last_loaded_at": None,
-    "bt_results": None,
-    "bt_trades": None,
-    "bt_error": None,
-    "bt_params_sig": None,
-    "live_stream": None,
-    "live_rows": [],
-    "live_autorefresh": True,
-    "live_last_symbol": None,
-}.items():
-    _ss_setdefault(k, v)
-
-
-# =============================================================================
-# Header
-# =============================================================================
-st.title("📈 Pro Algo Trader")
-st.caption("Signals • Charts • Backtests • Optional live quotes")
-
-
-# =============================================================================
-# Sidebar
-#   - Strategy selection
-#   - Risk inputs: Account Capital + Risk per Trade (%)
-#   - Save/Load configuration JSON
-# =============================================================================
-with st.sidebar:
-    st.header("Controls")
-
-    symbol = st.text_input("Ticker", value=ss_get("symbol", "AAPL")).upper().strip()
-
-    strategy_type = st.selectbox(
-        "Strategy Type",
-        options=["Trend Breakout", "Mean Reversion"],
-        index=0 if ss_get("strategy_type", "Trend Breakout") == "Trend Breakout" else 1,
-    )
-
-    account_capital = st.number_input(
-        "Account Capital",
-        min_value=100.0,
-        max_value=100_000_000.0,
-        value=float(ss_get("account_capital", 10_000.0)),
-        step=100.0,
-        format="%.2f",
-    )
-    risk_per_trade_pct = st.number_input(
-        "Risk per Trade (%)",
-        min_value=0.1,
-        max_value=10.0,
-        value=float(ss_get("risk_per_trade_pct", 1.0)),
-        step=0.1,
-        format="%.1f",
-        help="Percent of capital you’re willing to lose if stop is hit (for position sizing, if supported).",
-    )
-
-    with st.expander("Strategy Settings", expanded=False):
-        atr_entry = st.number_input("ATR entry", 0.0, 10.0, float(ss_get("atr_entry", 1.0)), 0.1)
-        atr_stop = st.number_input("ATR stop", 0.1, 20.0, float(ss_get("atr_stop", 2.0)), 0.1)
-        atr_target = st.number_input("ATR target", 0.1, 50.0, float(ss_get("atr_target", 3.0)), 0.1)
-
-        rsi_min = st.number_input("RSI min", 0.0, 100.0, float(ss_get("rsi_min", 30.0)))
-        rsi_max = st.number_input("RSI max", 0.0, 100.0, float(ss_get("rsi_max", 70.0)))
-        rvol_min = st.number_input("RVOL min", 0.0, 10.0, float(ss_get("rvol_min", 1.2)))
-        vol_max = st.number_input("Max annual vol", 0.0, 5.0, float(ss_get("vol_max", 1.0)))
-
-    # Fixed defaults (keep UI simple)
-    include_spread_penalty = True
-    assumed_spread_bps = 5.0
-    sr_lookback = 50
-    chart_window = 700
-
-    with st.expander("Save / Load Configuration", expanded=False):
-        if st.button("Export Settings", use_container_width=True):
-            cfg = _keep_cfg_keys(
-                {
-                    "symbol": symbol,
-                    "strategy_type": strategy_type,
-                    "account_capital": float(account_capital),
-                    "risk_per_trade_pct": float(risk_per_trade_pct),
-                    "atr_entry": float(atr_entry),
-                    "atr_stop": float(atr_stop),
-                    "atr_target": float(atr_target),
-                    "rsi_min": float(rsi_min),
-                    "rsi_max": float(rsi_max),
-                    "rvol_min": float(rvol_min),
-                    "vol_max": float(vol_max),
-                }
-            )
-            st.session_state["cfg_export_json"] = json.dumps(cfg, indent=2)
-
-        export_val = ss_get("cfg_export_json", "")
-        if export_val:
-            st.code(export_val, language="json")
-
-        import_val = st.text_area("Import JSON", value=ss_get("cfg_import_json", ""), height=140, key="cfg_import_json")
-        if st.button("Import Settings", use_container_width=True):
-            try:
-                parsed = json.loads(import_val or "{}")
-                parsed = _keep_cfg_keys(parsed if isinstance(parsed, dict) else {})
-                if not parsed:
-                    st.warning("No valid settings found in JSON.")
-                else:
-                    for k, v in parsed.items():
-                        st.session_state[k] = v
-                    st.rerun()
-            except Exception as e:
-                st.error("Invalid JSON.")
-                st.caption(f"{type(e).__name__}: {e}")
-
-    st.divider()
-    load_btn = st.button("🔄 Load / Refresh", use_container_width=True)
-
-# Persist inputs
-for k, v in {
-    "symbol": symbol,
-    "strategy_type": strategy_type,
-    "account_capital": float(account_capital),
-    "risk_per_trade_pct": float(risk_per_trade_pct),
-    "atr_entry": float(atr_entry),
-    "atr_stop": float(atr_stop),
-    "atr_target": float(atr_target),
-    "rsi_min": float(rsi_min),
-    "rsi_max": float(rsi_max),
-    "rvol_min": float(rvol_min),
-    "vol_max": float(vol_max),
-}.items():
-    st.session_state[k] = v
-
-
-# =============================================================================
-# Load logic
-# =============================================================================
-def _needs_load(symbol_now: str) -> bool:
-    return (st.session_state.get("df_raw") is None) or (st.session_state.get("last_symbol") != symbol_now)
-
-
-if st.session_state.get("live_stream") is not None and st.session_state.get("live_last_symbol") != symbol:
-    _stop_live_stream()
-
-force_refresh = int(time.time()) if load_btn else 0
-if load_btn or _needs_load(symbol):
-    with st.spinner(f"Loading {symbol}…"):
-        _load_and_prepare(symbol, force_refresh=force_refresh)
-
-df_raw = st.session_state.get("df_raw")
-df_chart = st.session_state.get("df_chart")
-
-if df_raw is None or getattr(df_raw, "empty", True):
-    st.error(f"Could not load data for {symbol}.")
-    if st.session_state.get("load_error"):
-        st.caption(st.session_state["load_error"])
-    st.stop()
-
-if df_chart is None or getattr(df_chart, "empty", True):
-    st.error("Data loaded but indicator dataframe is empty.")
-    if st.session_state.get("ind_error"):
-        st.caption(st.session_state["ind_error"])
-    st.stop()
-
-df_plot = _tail_for_plot(df_chart, int(chart_window))
-
-
-# =============================================================================
-# Tabs
-# =============================================================================
-tab_signal, tab_charts, tab_backtest, tab_live = st.tabs(["✅ Signal", "📊 Charts", "🧪 Backtest", "📡 Live"])
-
-
-# =============================================================================
-# Signal tab
-# =============================================================================
-with tab_signal:
-    box = st.container(border=True)
-    with box:
-        st.subheader(f"{symbol} — Signal")
-        ts = st.session_state.get("last_loaded_at")
-        if ts is not None:
-            st.caption(f"Last updated: {ts}")
-        if st.session_state.get("ind_error"):
-            st.warning("Some indicators failed (signal may be degraded).")
-
-    jump = detect_big_jump(df_chart, thresh=0.18)
-    if jump:
-        st.warning("Unusual price jump detected (possible split/corporate action).")
-        st.caption(f"Max |close-to-close| move: {jump['abs_move']:.1%} at {jump['ts']}")
-
-    san = st.session_state.get("sanity")
-    if isinstance(san, dict) and san.get("warnings"):
-        with st.expander("Data notes", expanded=False):
-            for w in san["warnings"][:5]:
-                st.write(f"• {w}")
-
-    score = compute_signal_score(df_chart, float(rsi_min), float(rsi_max), float(rvol_min), float(vol_max))
-
-    plan = compute_trade_plan(
-        df_chart,
-        strategy_type=strategy_type,
-        atr_entry=float(atr_entry),
-        atr_stop=float(atr_stop),
-        atr_target=float(atr_target),
-        assumed_spread_bps=float(assumed_spread_bps),
-        include_spread_penalty=bool(include_spread_penalty),
-    )
-
-    lo, hi = compute_lookback_low_high(df_chart, int(sr_lookback))
-    last = df_chart.iloc[-1]
-    close = _safe_float(last.get("close", np.nan))
-    rsi = _safe_float(last.get("rsi14", np.nan))
-    rvol = _safe_float(last.get("rvol", np.nan))
-    vol_ann = _safe_float(last.get("vol_ann", np.nan))
-    atr14 = _safe_float(last.get("atr14", np.nan))
-
-    hero = st.container(border=True)
-    with hero:
-        a, b, c = st.columns([1.2, 1, 1], vertical_alignment="center")
-        with a:
-            if score.label == "BUY":
-                st.success(f"**BUY** • Score {score.score}/100")
-            elif score.label == "SELL":
-                st.error(f"**SELL** • Score {score.score}/100")
-            elif score.label == "WAIT":
-                st.warning(f"**WAIT** • Score {score.score}/100")
-            else:
-                st.info(f"**HOLD** • Score {score.score}/100")
-            st.caption(score.summary)
-        with b:
-            st.metric("Close", f"{close:.2f}" if np.isfinite(close) else "—")
-            st.metric("ATR(14)", f"{atr14:.3f}" if np.isfinite(atr14) else "—")
-        with c:
-            rr = plan.get("rr", np.nan)
-            st.metric("Planned Entry", f"{plan['entry']:.2f}" if np.isfinite(plan.get("entry", np.nan)) else "—")
-            st.metric("R:R", f"{rr:.2f}" if np.isfinite(rr) else "—")
-
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Lookback Low", f"{lo:.2f}" if np.isfinite(lo) else "—")
-    m2.metric("Lookback High", f"{hi:.2f}" if np.isfinite(hi) else "—")
-    m3.metric("RSI", f"{rsi:.1f}" if np.isfinite(rsi) else "—")
-    m4.metric("RVOL", f"{rvol:.2f}" if np.isfinite(rvol) else "—")
-    m5.metric("Ann. Vol", f"{vol_ann:.2f}" if np.isfinite(vol_ann) else "—")
-
-    st.divider()
-    p = st.container(border=True)
-    with p:
-        st.subheader("Trade Plan (ATR-based)")
-        st.caption(plan.get("type", "—"))
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Entry", f"{plan['entry']:.2f}" if np.isfinite(plan.get("entry", np.nan)) else "—")
-        c2.metric("Stop", f"{plan['stop']:.2f}" if np.isfinite(plan.get("stop", np.nan)) else "—")
-        c3.metric("Target", f"{plan['target']:.2f}" if np.isfinite(plan.get("target", np.nan)) else "—")
-
-    with st.expander("Why this score?", expanded=False):
-        for r in score.reasons[:10]:
-            st.write(f"• {r}")
-
-
-# =============================================================================
-# Charts tab (with trade markers)
-# =============================================================================
-with tab_charts:
-    st.subheader(f"{symbol} — Charts")
-    trades_for_markers = st.session_state.get("bt_trades")
-    st.plotly_chart(plot_price(df_plot, symbol, trades=trades_for_markers), use_container_width=True)
-
-    c1, c2, c3 = st.columns(3, gap="large")
-    with c1:
-        if "rsi14" in df_plot.columns:
-            st.plotly_chart(plot_indicator(df_plot, "rsi14", "RSI(14)", hlines=[30, 70], ymin=0, ymax=100), use_container_width=True)
-        else:
-            st.info("RSI not available.")
-    with c2:
-        if "rvol" in df_plot.columns:
-            st.plotly_chart(plot_indicator(df_plot, "rvol", "RVOL", hlines=[1.0]), use_container_width=True)
-        else:
-            st.info("RVOL not available.")
-    with c3:
-        if "vol_ann" in df_plot.columns:
-            st.plotly_chart(plot_indicator(df_plot, "vol_ann", "Annualized Volatility"), use_container_width=True)
-        else:
-            st.info("Volatility not available.")
-
-    with st.expander("Data preview", expanded=False):
-        st.dataframe(df_plot.tail(160), use_container_width=True, height=460)
-
-
-# =============================================================================
-# Backtest tab
-#   - Run button here
-#   - Uses Account Capital as start equity
-#   - Passes Risk per trade % if your backtester supports it
-# =============================================================================
-with tab_backtest:
-    st.subheader("Backtest")
-    run_backtest_btn = st.button("🧪 Run Backtest", use_container_width=True)
-
-    # Keep this simple & stable
-    horizon_bars = 20
-
-    # Strategy mode mapping (future-proof)
-    mode = "breakout" if strategy_type == "Trend Breakout" else "mean_reversion"
-
-    bt_params = dict(
-        symbol=symbol,
-        strategy_type=strategy_type,
-        mode=mode,
-        horizon=horizon_bars,
-        atr_entry=float(atr_entry),
-        atr_stop=float(atr_stop),
-        atr_target=float(atr_target),
-        rsi_min=float(rsi_min),
-        rsi_max=float(rsi_max),
-        rvol_min=float(rvol_min),
-        vol_max=float(vol_max),
-        include_spread_penalty=bool(include_spread_penalty),
-        assumed_spread_bps=float(assumed_spread_bps),
-        account_capital=float(account_capital),
-        risk_per_trade_pct=float(risk_per_trade_pct),
-    )
-    sig = _bt_params_signature(**bt_params)
-
-    if run_backtest_btn:
-        st.session_state["bt_error"] = None
-        with st.spinner("Running backtest…"):
-            try:
-                df_bt, trades = _call_backtest(
-                    df=df_chart,
-                    market_df=None,
-                    horizon=horizon_bars,
-                    mode=mode,  # may be ignored if your backtester only supports breakout
-                    atr_entry=float(atr_entry),
-                    atr_stop=float(atr_stop),
-                    atr_target=float(atr_target),
-                    require_risk_on=False,
-                    rsi_min=float(rsi_min),
-                    rsi_max=float(rsi_max),
-                    rvol_min=float(rvol_min),
-                    vol_max=float(vol_max),
-                    cooldown_bars=0,
-                    include_spread_penalty=bool(include_spread_penalty),
-                    assumed_spread_bps=float(assumed_spread_bps),
-                    start_equity=float(account_capital),
-                    risk_per_trade_pct=float(risk_per_trade_pct),  # only used if supported by backtester
-                )
-                st.session_state["bt_results"] = df_bt
-                st.session_state["bt_trades"] = trades
-                st.session_state["bt_params_sig"] = sig
-            except Exception as e:
-                st.session_state["bt_results"] = None
-                st.session_state["bt_trades"] = None
-                st.session_state["bt_params_sig"] = None
-                st.session_state["bt_error"] = f"{type(e).__name__}: {e}"
-
-    if st.session_state.get("bt_error"):
-        st.error("Backtest failed.")
-        st.caption(st.session_state["bt_error"])
-
-    trades = st.session_state.get("bt_trades")
-    df_bt = st.session_state.get("bt_results")
-
-    if trades is None or getattr(trades, "empty", True):
-        st.info("No results yet. Click **🧪 Run Backtest** above.")
-    else:
-        if st.session_state.get("bt_params_sig") != sig:
-            st.warning("Showing results from earlier parameters. Run again to update.")
-
-        t = trades.copy()
-
-        wrap = st.container(border=True)
-        with wrap:
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Trades", f"{len(t)}")
-
-            p = pd.to_numeric(t.get("pnl_per_share", pd.Series(dtype=float)), errors="coerce")
-            win_rate = float((p > 0).sum()) / max(1, len(p)) if len(p) else np.nan
-            c2.metric("Win rate", f"{win_rate:.1%}" if np.isfinite(win_rate) else "—")
-
-            total_ret = np.nan
-            maxdd = np.nan
-            if isinstance(df_bt, pd.DataFrame) and (not df_bt.empty) and ("equity" in df_bt.columns):
-                eq = pd.to_numeric(df_bt["equity"], errors="coerce").dropna()
-                if len(eq) > 2:
-                    total_ret = (eq.iloc[-1] / eq.iloc[0]) - 1.0
-                    dd = (eq / eq.cummax()) - 1.0
-                    maxdd = float(dd.min())
-
-            c3.metric("Total return", f"{total_ret:.1%}" if np.isfinite(total_ret) else "—")
-            c4.metric("Max drawdown", f"{maxdd:.1%}" if np.isfinite(maxdd) else "—")
-
-        st.divider()
-        st.download_button(
-            "⬇️ Download trades (CSV)",
-            data=t.to_csv(index=False).encode("utf-8"),
-            file_name=f"{symbol}_trades.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
-        st.dataframe(t, use_container_width=True, height=560)
-
-
-# =============================================================================
-# Live tab (st.fragment if available; fallback to autorefresh/manual)
-# =============================================================================
 def _fragment_decorator():
-    # Streamlit versions differ; prefer st.fragment if present
     frag = getattr(st, "fragment", None)
     if callable(frag):
         return frag
-    # fallback: identity decorator
     def identity(fn):
         return fn
     return identity
@@ -1030,7 +477,6 @@ def _live_panel(symbol: str) -> None:
     stream = st.session_state.get("live_stream")
     live_running = _live_running(stream)
 
-    rows: List[dict] = st.session_state.get("live_rows", [])
     if stream is not None:
         try:
             new_msgs = stream.get_latest(max_items=250)
@@ -1039,8 +485,8 @@ def _live_panel(symbol: str) -> None:
         if new_msgs:
             st.session_state["live_rows"].extend([_msg_to_dict(x) for x in new_msgs])
             st.session_state["live_rows"] = st.session_state["live_rows"][-800:]
-            rows = st.session_state["live_rows"]
 
+    rows: List[dict] = st.session_state.get("live_rows", [])
     st.caption("Status: ✅ running" if live_running else "Status: ⏸ stopped")
 
     if not rows:
@@ -1069,6 +515,414 @@ def _live_panel(symbol: str) -> None:
     st.dataframe(view[show_cols] if show_cols else view, use_container_width=True, height=520)
 
 
+# =============================================================================
+# Session init
+# =============================================================================
+for k, v in {
+    "df_raw": None,
+    "df_chart": None,
+    "sanity": None,
+    "load_error": None,
+    "ind_error": None,
+    "last_symbol": None,
+    "last_loaded_at": None,
+    "bt_results": None,   # dict from backtester
+    "bt_trades": None,    # trades_df
+    "bt_error": None,
+    "bt_params_sig": None,
+    "live_stream": None,
+    "live_rows": [],
+    "live_autorefresh": True,
+    "live_last_symbol": None,
+    "cfg_export_json": "",
+    "cfg_import_json": "",
+}.items():
+    _ss_setdefault(k, v)
+
+
+# =============================================================================
+# Header
+# =============================================================================
+st.title("📈 Pro Algo Trader")
+st.caption("Signals • Charts • Backtests • Live quotes")
+
+
+# =============================================================================
+# Sidebar
+# =============================================================================
+with st.sidebar:
+    st.header("Controls")
+
+    symbol = st.text_input("Ticker", value=str(ss_get("symbol", "AAPL"))).upper().strip()
+
+    mode_label = st.selectbox(
+        "Strategy Mode",
+        options=["Breakout", "Pullback"],
+        index=0 if str(ss_get("mode_label", "Breakout")) == "Breakout" else 1,
+    )
+    mode = "breakout" if mode_label == "Breakout" else "pullback"
+
+    with st.expander("Strategy Settings", expanded=False):
+        atr_entry = st.number_input("ATR entry", 0.0, 10.0, float(ss_get("atr_entry", 1.0)), 0.1)
+        atr_stop = st.number_input("ATR stop", 0.1, 20.0, float(ss_get("atr_stop", 2.0)), 0.1)
+        atr_target = st.number_input("ATR target", 0.1, 50.0, float(ss_get("atr_target", 3.0)), 0.1)
+
+        rsi_min = st.number_input("RSI min", 0.0, 100.0, float(ss_get("rsi_min", 30.0)))
+        rsi_max = st.number_input("RSI max", 0.0, 100.0, float(ss_get("rsi_max", 70.0)))
+        rvol_min = st.number_input("RVOL min", 0.0, 10.0, float(ss_get("rvol_min", 1.2)))
+        vol_max = st.number_input("Max annual vol", 0.0, 5.0, float(ss_get("vol_max", 1.0)))
+
+    with st.expander("Risk & Sizing", expanded=False):
+        enable_position_sizing = st.toggle("Enable Position Sizing", value=bool(ss_get("enable_position_sizing", False)))
+
+        account_capital = st.number_input(
+            "Account Capital",
+            min_value=100.0,
+            max_value=100_000_000.0,
+            value=float(ss_get("account_capital", 10_000.0)),
+            step=100.0,
+            format="%.2f",
+        )
+
+        if enable_position_sizing:
+            risk_per_trade_pct = st.number_input(
+                "Risk per Trade (%)",
+                min_value=0.1,
+                max_value=10.0,
+                value=float(ss_get("risk_per_trade_pct", 1.0)),
+                step=0.1,
+                format="%.1f",
+            )
+            max_alloc_pct = st.number_input(
+                "Max Allocation (%)",
+                min_value=1.0,
+                max_value=100.0,
+                value=float(ss_get("max_alloc_pct", 10.0)),
+                step=1.0,
+                format="%.0f",
+            )
+        else:
+            risk_per_trade_pct = float(ss_get("risk_per_trade_pct", 1.0))
+            max_alloc_pct = float(ss_get("max_alloc_pct", 10.0))
+
+        mark_to_market = st.toggle("Mark-to-market equity (smoother curve)", value=bool(ss_get("mark_to_market", False)))
+
+    with st.expander("Save / Load Configuration", expanded=False):
+        if st.button("Export Settings", use_container_width=True):
+            cfg = {
+                "symbol": symbol,
+                "mode_label": mode_label,
+                "atr_entry": float(atr_entry),
+                "atr_stop": float(atr_stop),
+                "atr_target": float(atr_target),
+                "rsi_min": float(rsi_min),
+                "rsi_max": float(rsi_max),
+                "rvol_min": float(rvol_min),
+                "vol_max": float(vol_max),
+                "enable_position_sizing": bool(enable_position_sizing),
+                "account_capital": float(account_capital),
+                "risk_per_trade_pct": float(risk_per_trade_pct),
+                "max_alloc_pct": float(max_alloc_pct),
+                "mark_to_market": bool(mark_to_market),
+            }
+            st.session_state["cfg_export_json"] = json.dumps(cfg, indent=2)
+
+        if st.session_state.get("cfg_export_json"):
+            st.code(st.session_state["cfg_export_json"], language="json")
+
+        st.session_state["cfg_import_json"] = st.text_area(
+            "Paste JSON to load",
+            value=str(ss_get("cfg_import_json", "")),
+            height=140,
+        )
+        if st.button("Import Settings", use_container_width=True):
+            try:
+                parsed = json.loads(st.session_state["cfg_import_json"] or "{}")
+                if not isinstance(parsed, dict):
+                    raise ValueError("JSON must be an object.")
+                # whitelist keys
+                allowed = {
+                    "symbol","mode_label",
+                    "atr_entry","atr_stop","atr_target",
+                    "rsi_min","rsi_max","rvol_min","vol_max",
+                    "enable_position_sizing","account_capital","risk_per_trade_pct","max_alloc_pct",
+                    "mark_to_market",
+                }
+                for k, v in parsed.items():
+                    if k in allowed:
+                        st.session_state[k] = v
+                st.rerun()
+            except Exception as e:
+                st.error("Invalid JSON.")
+                st.caption(f"{type(e).__name__}: {e}")
+
+    st.divider()
+    load_btn = st.button("🔄 Load / Refresh", use_container_width=True)
+
+# Persist sidebar inputs
+for k, v in {
+    "symbol": symbol,
+    "mode_label": mode_label,
+    "atr_entry": atr_entry,
+    "atr_stop": atr_stop,
+    "atr_target": atr_target,
+    "rsi_min": rsi_min,
+    "rsi_max": rsi_max,
+    "rvol_min": rvol_min,
+    "vol_max": vol_max,
+    "enable_position_sizing": enable_position_sizing,
+    "account_capital": account_capital,
+    "risk_per_trade_pct": risk_per_trade_pct,
+    "max_alloc_pct": max_alloc_pct,
+    "mark_to_market": mark_to_market,
+}.items():
+    st.session_state[k] = v
+
+
+# =============================================================================
+# Auto-load logic
+# =============================================================================
+needs_load = (load_btn or (st.session_state.get("df_raw") is None) or (st.session_state.get("last_symbol") != symbol))
+
+if st.session_state.get("live_stream") is not None and st.session_state.get("live_last_symbol") != symbol:
+    _stop_live_stream()
+
+force_refresh = int(time.time()) if load_btn else 0
+if needs_load:
+    with st.spinner(f"Loading {symbol}…"):
+        _load_and_prepare(symbol, force_refresh=force_refresh)
+
+df_raw = st.session_state.get("df_raw")
+df_chart = st.session_state.get("df_chart")
+
+if df_raw is None or getattr(df_raw, "empty", True):
+    st.error(f"Could not load data for {symbol}.")
+    if st.session_state.get("load_error"):
+        st.caption(st.session_state["load_error"])
+    st.stop()
+
+if df_chart is None or getattr(df_chart, "empty", True):
+    st.error("Data loaded but indicator dataframe is empty.")
+    if st.session_state.get("ind_error"):
+        st.caption(st.session_state["ind_error"])
+    st.stop()
+
+df_plot = _tail_for_plot(df_chart, 700)
+
+
+# =============================================================================
+# Tabs
+# =============================================================================
+tab_signal, tab_charts, tab_backtest, tab_live = st.tabs(["✅ Signal", "📊 Charts", "🧪 Backtest", "📡 Live"])
+
+
+# =============================================================================
+# Signal tab
+# =============================================================================
+with tab_signal:
+    st.subheader(f"{symbol} — Signal")
+
+    san = st.session_state.get("sanity")
+    if isinstance(san, dict) and san.get("warnings"):
+        with st.expander("Data notes", expanded=False):
+            for w in san["warnings"][:5]:
+                st.write(f"• {w}")
+
+    score = compute_signal_score(df_chart, float(rsi_min), float(rsi_max), float(rvol_min), float(vol_max))
+
+    hero = st.container(border=True)
+    with hero:
+        a, b = st.columns([1.2, 1], vertical_alignment="center")
+        with a:
+            if score.label == "BUY":
+                st.success(f"**BUY** • Score {score.score}/100")
+            elif score.label == "SELL":
+                st.error(f"**SELL** • Score {score.score}/100")
+            elif score.label == "WAIT":
+                st.warning(f"**WAIT** • Score {score.score}/100")
+            else:
+                st.info(f"**HOLD** • Score {score.score}/100")
+            st.caption(score.summary)
+        with b:
+            last = df_chart.iloc[-1]
+            close = _safe_float(last.get("close", np.nan))
+            atr14 = _safe_float(last.get("atr14", np.nan))
+            st.metric("Close", f"{close:.2f}" if np.isfinite(close) else "—")
+            st.metric("ATR(14)", f"{atr14:.3f}" if np.isfinite(atr14) else "—")
+
+    with st.expander("Why this score?", expanded=False):
+        for r in score.reasons[:10]:
+            st.write(f"• {r}")
+
+
+# =============================================================================
+# Charts tab (trade markers included if backtest run)
+# =============================================================================
+with tab_charts:
+    st.subheader(f"{symbol} — Charts")
+    trades_for_markers = st.session_state.get("bt_trades")
+    st.plotly_chart(plot_price(df_plot, symbol, trades=trades_for_markers), use_container_width=True)
+
+    c1, c2, c3 = st.columns(3, gap="large")
+    with c1:
+        if "rsi14" in df_plot.columns:
+            st.plotly_chart(plot_indicator(df_plot, "rsi14", "RSI(14)", hlines=[30, 70], ymin=0, ymax=100), use_container_width=True)
+        else:
+            st.info("RSI not available.")
+    with c2:
+        if "rvol" in df_plot.columns:
+            st.plotly_chart(plot_indicator(df_plot, "rvol", "RVOL", hlines=[1.0]), use_container_width=True)
+        else:
+            st.info("RVOL not available.")
+    with c3:
+        if "vol_ann" in df_plot.columns:
+            st.plotly_chart(plot_indicator(df_plot, "vol_ann", "Annualized Volatility"), use_container_width=True)
+        else:
+            st.info("Volatility not available.")
+
+
+# =============================================================================
+# Backtest tab (Performance section + empty safe handling)
+# =============================================================================
+with tab_backtest:
+    st.subheader("Backtest")
+    run_backtest_btn = st.button("🧪 Run Backtest", use_container_width=True)
+
+    # Fixed: keep simple
+    horizon_bars = 20
+
+    bt_params = dict(
+        symbol=symbol,
+        mode=mode,
+        horizon=horizon_bars,
+        atr_entry=float(atr_entry),
+        atr_stop=float(atr_stop),
+        atr_target=float(atr_target),
+        require_risk_on=False,
+        rsi_min=float(rsi_min),
+        rsi_max=float(rsi_max),
+        rvol_min=float(rvol_min),
+        vol_max=float(vol_max),
+        cooldown_bars=0,
+        include_spread_penalty=True,
+        assumed_spread_bps=5.0,
+        start_equity=float(account_capital),
+        enable_position_sizing=bool(enable_position_sizing),
+        risk_pct=float(risk_per_trade_pct) / 100.0,
+        max_alloc_pct=float(max_alloc_pct) / 100.0,
+        mark_to_market=bool(mark_to_market),
+        # You can expose these later if you want:
+        slippage_bps=0.0,
+        commission_per_order=0.0,
+        spread_mode="taker_only",
+        exit_priority="stop_first",
+    )
+    sig = _bt_params_signature(bt_params)
+
+    if run_backtest_btn:
+        st.session_state["bt_error"] = None
+        with st.spinner("Running backtest…"):
+            try:
+                results, trades_df = backtest_strategy(
+                    df=df_chart.reset_index().rename(columns={"index": "timestamp"}) if isinstance(df_chart.index, pd.DatetimeIndex) else df_chart,
+                    market_df=None,
+                    **bt_params,
+                )
+                st.session_state["bt_results"] = results
+                st.session_state["bt_trades"] = trades_df
+                st.session_state["bt_params_sig"] = sig
+            except Exception as e:
+                st.session_state["bt_results"] = None
+                st.session_state["bt_trades"] = None
+                st.session_state["bt_params_sig"] = None
+                st.session_state["bt_error"] = f"{type(e).__name__}: {e}"
+
+    if st.session_state.get("bt_error"):
+        st.error("Backtest failed.")
+        st.caption(st.session_state["bt_error"])
+
+    results = st.session_state.get("bt_results")
+    trades = st.session_state.get("bt_trades")
+
+    if not isinstance(results, dict):
+        st.info("No results yet. Click **🧪 Run Backtest** above.")
+    else:
+        if st.session_state.get("bt_params_sig") != sig:
+            st.warning("Showing results from earlier parameters. Run again to update.")
+
+        df_bt = results.get("df_bt", pd.DataFrame())
+        ntr = int(results.get("trades", 0) or 0)
+
+        st.markdown("### Performance")
+        pwrap = st.container(border=True)
+        with pwrap:
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("Trades", f"{ntr}")
+            c2.metric("Win rate", f"{results.get('win_rate', float('nan')):.1%}" if np.isfinite(results.get("win_rate", np.nan)) else "—")
+            c3.metric("Total return", f"{results.get('total_return', float('nan')):.1%}" if np.isfinite(results.get("total_return", np.nan)) else "—")
+            c4.metric("Max drawdown", f"{results.get('max_drawdown', float('nan')):.1%}" if np.isfinite(results.get("max_drawdown", np.nan)) else "—")
+            c5.metric("Sharpe", f"{results.get('sharpe', float('nan')):.2f}" if np.isfinite(results.get("sharpe", np.nan)) else "—")
+
+        # Equity curve + drawdown
+        if isinstance(df_bt, pd.DataFrame) and (not df_bt.empty) and ("equity" in df_bt.columns):
+            eq = pd.to_numeric(df_bt["equity"], errors="coerce").dropna()
+            if len(eq) > 2:
+                ts = pd.to_datetime(df_bt.get("timestamp", pd.Series(index=df_bt.index, dtype="datetime64[ns]")), errors="coerce", utc=True)
+                if ts.isna().all():
+                    x = np.arange(len(eq))
+                else:
+                    x = ts.iloc[-len(eq):]
+
+                peak = eq.cummax()
+                dd = (eq / peak) - 1.0
+
+                st.plotly_chart(
+                    go.Figure([go.Scatter(x=x, y=eq.values, mode="lines")]).update_layout(
+                        title="Equity Curve",
+                        height=320,
+                        margin=dict(l=10, r=10, t=45, b=10),
+                        hovermode="x unified",
+                        showlegend=False,
+                    ),
+                    use_container_width=True,
+                )
+
+                st.plotly_chart(
+                    go.Figure([go.Scatter(x=x, y=dd.values, mode="lines")]).update_layout(
+                        title="Drawdown",
+                        height=260,
+                        margin=dict(l=10, r=10, t=45, b=10),
+                        hovermode="x unified",
+                        showlegend=False,
+                    ),
+                    use_container_width=True,
+                )
+
+        # Trades table (handle empty safely)
+        if not isinstance(trades, pd.DataFrame) or trades.empty:
+            st.warning("Backtest completed but produced no trades.")
+            notes = results.get("notes_for_beginners", [])
+            if isinstance(notes, list) and notes:
+                with st.expander("Notes", expanded=False):
+                    for n in notes[:8]:
+                        st.write(f"• {n}")
+        else:
+            st.download_button(
+                "⬇️ Download trades (CSV)",
+                data=trades.to_csv(index=False).encode("utf-8"),
+                file_name=f"{symbol}_trades.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+            st.dataframe(trades, use_container_width=True, height=560)
+
+        with st.expander("Assumptions", expanded=False):
+            st.json(results.get("assumptions", {}))
+
+
+# =============================================================================
+# Live tab (fragment + fallback refresh)
+# =============================================================================
 with tab_live:
     st.subheader("Live Quotes")
 
@@ -1105,10 +959,9 @@ with tab_live:
         if stop_clicked and live_running:
             _stop_live_stream()
 
-        # Fragment panel (updates section, not whole page)
         _live_panel(symbol)
 
-        # Fallback refresh loop if fragments are not actually running periodically.
+        # Fallback periodic refresh (helps even when fragment alone doesn't re-run)
         if _live_running(st.session_state.get("live_stream")) and bool(st.session_state.get("live_autorefresh", True)):
             if st_autorefresh is not None:
-                st_autorefresh(interval=900, key=f"live_refresh_{symbol}")
+                st_autorefresh(interval=2000, key=f"live_refresh_{symbol}")
