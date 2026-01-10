@@ -1,6 +1,7 @@
 # app.py
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Any, Optional, Tuple, Dict, List
 
@@ -88,15 +89,16 @@ def _ss_setdefault(key: str, value: Any) -> None:
 # Core state
 _ss_setdefault("df_raw", None)
 _ss_setdefault("df_chart", None)
-_ss_setdefault("sanity", None)  # ✅ FIX: was missing
+_ss_setdefault("sanity", None)
 _ss_setdefault("load_error", None)
 _ss_setdefault("ind_error", None)
 _ss_setdefault("last_symbol", None)
 _ss_setdefault("last_loaded_at", None)
 _ss_setdefault("data_source", None)
+_ss_setdefault("alpaca_dbg", None)  # ✅ NEW: store alpaca debug dict
 
 # Backtest persistence
-_ss_setdefault("bt_results", None)
+_ss_setdefault("bt_results", None)   # will store df_bt
 _ss_setdefault("bt_trades", None)
 _ss_setdefault("bt_error", None)
 _ss_setdefault("bt_params_sig", None)
@@ -147,10 +149,7 @@ def _tail_for_plot(df: pd.DataFrame, n: int) -> pd.DataFrame:
 
 
 def _ensure_ohlcv_cols(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Normalize common naming variants into open/high/low/close/volume.
-    Keeps additional columns if present.
-    """
+    """Normalize common naming variants into open/high/low/close/volume."""
     if df is None or getattr(df, "empty", True):
         return df
     out = df.copy()
@@ -160,7 +159,6 @@ def _ensure_ohlcv_cols(df: pd.DataFrame) -> pd.DataFrame:
     for want in ["open", "high", "low", "close", "volume"]:
         if want in out.columns:
             continue
-
         if want in cols:
             mapping[cols[want]] = want
             continue
@@ -184,14 +182,13 @@ def _ensure_ohlcv_cols(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _coerce_ohlcv_numeric(df: pd.DataFrame) -> pd.DataFrame:
-    """✅ FIX: Keep plotting/indicators stable by forcing numeric OHLCV."""
+    """Keep plotting/indicators stable by forcing numeric OHLCV."""
     if df is None or getattr(df, "empty", True):
         return df
     out = df.copy()
     for c in ["open", "high", "low", "close", "volume"]:
         if c in out.columns:
             out[c] = pd.to_numeric(out[c], errors="coerce")
-    # drop rows where price is unusable
     price_cols = [c for c in ["open", "high", "low", "close"] if c in out.columns]
     if price_cols:
         out = out.dropna(subset=price_cols)
@@ -463,10 +460,12 @@ def _live_msgs_to_df(rows: List[Any]) -> pd.DataFrame:
 # ---------------------------
 # Data loading (Alpaca preferred; Yahoo fallback)
 # ---------------------------
+
+# ✅ UPDATED: return df + dbg, and accept force_refresh so refresh is real
 @st.cache_data(ttl=15 * 60, show_spinner=False)
-def _cached_load_alpaca(symbol: str, api_key: str, sec_key: str) -> pd.DataFrame:
-    df, _dbg = load_historical(symbol, api_key, sec_key)
-    return df
+def _cached_load_alpaca(symbol: str, api_key: str, sec_key: str, force_refresh: int) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    df, dbg = load_historical(symbol, api_key, sec_key, force_refresh=force_refresh)
+    return df, dbg
 
 
 @st.cache_data(ttl=30 * 60, show_spinner=False)
@@ -484,26 +483,39 @@ def _cached_load_yahoo(symbol: str, period: str = "5y", interval: str = "1d") ->
     return hist
 
 
-def _load_and_prepare(symbol: str, api_key: str, sec_key: str, yahoo_fallback: bool, yahoo_period: str) -> None:
+def _load_and_prepare(
+    symbol: str,
+    api_key: str,
+    sec_key: str,
+    yahoo_fallback: bool,
+    yahoo_period: str,
+    *,
+    force_refresh: int,
+) -> None:
     st.session_state["load_error"] = None
     st.session_state["ind_error"] = None
     st.session_state["data_source"] = None
+    st.session_state["alpaca_dbg"] = None
 
     df: Optional[pd.DataFrame] = None
     err_alpaca: Optional[str] = None
 
+    # Alpaca first if keys exist
     if has_keys(api_key, sec_key):
         try:
-            df = _cached_load_alpaca(symbol, api_key, sec_key)
-            st.session_state["data_source"] = "Alpaca"
+            df, dbg = _cached_load_alpaca(symbol, api_key, sec_key, force_refresh=force_refresh)
+            st.session_state["alpaca_dbg"] = dbg
+            feed = dbg.get("feed", "default")
+            st.session_state["data_source"] = f"Alpaca ({feed})"
         except Exception as e:
             err_alpaca = f"{type(e).__name__}: {e}"
             df = None
 
-    if df is None and yahoo_fallback:
+    # Yahoo fallback
+    if (df is None or getattr(df, "empty", True)) and yahoo_fallback:
         try:
             df = _cached_load_yahoo(symbol, period=yahoo_period, interval="1d")
-            st.session_state["data_source"] = "Yahoo"
+            st.session_state["data_source"] = f"Yahoo ({yahoo_period})"
         except Exception as e:
             err_y = f"{type(e).__name__}: {e}"
             msg = f"Yahoo failed: {err_y}"
@@ -522,7 +534,7 @@ def _load_and_prepare(symbol: str, api_key: str, sec_key: str, yahoo_fallback: b
         st.session_state["load_error"] = st.session_state.get("load_error") or (f"Alpaca failed: {err_alpaca}" if err_alpaca else "No data.")
         return
 
-    # ✅ normalize and coerce numeric
+    # normalize and coerce numeric
     df = _ensure_ohlcv_cols(df)
     df = _coerce_ohlcv_numeric(df)
 
@@ -588,13 +600,10 @@ with st.sidebar:
 
     with st.expander("Data source", expanded=False):
         yahoo_fallback = st.toggle("Use Yahoo fallback (recommended)", value=bool(ss_get("yahoo_fallback", True)))
-
-        # ✅ FIX: safe index
         opts = ["1y", "2y", "5y", "10y", "max"]
         default = str(ss_get("yahoo_period", "5y"))
         idx = opts.index(default) if default in opts else opts.index("5y")
         yahoo_period = st.selectbox("Yahoo history", options=opts, index=idx)
-
         st.caption("If Alpaca load fails (or no keys), app can still run using Yahoo.")
 
     st.divider()
@@ -641,9 +650,19 @@ needs_load = (
 if st.session_state.get("live_stream") is not None and st.session_state.get("live_last_symbol") != symbol:
     _stop_live_stream()
 
+# ✅ cache-bust only on manual refresh
+force_refresh = int(time.time()) if load_btn else 0
+
 if needs_load:
     with st.spinner(f"Loading {symbol}…"):
-        _load_and_prepare(symbol, api_key, sec_key, yahoo_fallback=bool(yahoo_fallback), yahoo_period=str(yahoo_period))
+        _load_and_prepare(
+            symbol,
+            api_key,
+            sec_key,
+            yahoo_fallback=bool(yahoo_fallback),
+            yahoo_period=str(yahoo_period),
+            force_refresh=force_refresh,
+        )
 
 df_raw = st.session_state.get("df_raw")
 df_chart = st.session_state.get("df_chart")
@@ -690,6 +709,19 @@ with tab_signal:
     if jump:
         st.warning("Large price jump detected (possible split/corporate action/data issue).")
         st.caption(f"Max |close-to-close| move: {jump['abs_move']:.1%} at {jump['ts']}")
+
+    # ✅ Minimal beginner-friendly data warnings (not spammy)
+    san = st.session_state.get("sanity")
+    if isinstance(san, dict) and san.get("warnings"):
+        with st.expander("Data quality notes", expanded=False):
+            for w in san["warnings"][:8]:
+                st.write(f"• {w}")
+
+    # ✅ Optional alpaca debug
+    dbg = st.session_state.get("alpaca_dbg")
+    if isinstance(dbg, dict):
+        with st.expander("Alpaca debug (advanced)", expanded=False):
+            st.json(dbg)
 
     score = compute_signal_score(df_chart, float(rsi_min), float(rsi_max), float(rvol_min), float(vol_max))
 
@@ -813,7 +845,7 @@ with tab_backtest:
         st.session_state["bt_error"] = None
         with st.spinner("Running backtest…"):
             try:
-                results, trades = backtest_strategy(
+                df_bt, trades = backtest_strategy(
                     df=df_chart,
                     market_df=None,
                     horizon=int(horizon),
@@ -831,7 +863,7 @@ with tab_backtest:
                     assumed_spread_bps=float(assumed_spread_bps),
                     start_equity=100000.0,
                 )
-                st.session_state["bt_results"] = results
+                st.session_state["bt_results"] = df_bt   # ✅ df_bt
                 st.session_state["bt_trades"] = trades
                 st.session_state["bt_params_sig"] = sig
             except Exception as e:
@@ -845,7 +877,7 @@ with tab_backtest:
         st.caption(st.session_state["bt_error"])
 
     trades = st.session_state.get("bt_trades")
-    results = st.session_state.get("bt_results")
+    df_bt = st.session_state.get("bt_results")
 
     if trades is None or getattr(trades, "empty", True):
         st.info("No backtest results yet. Click **🧪 Run Backtest** in the sidebar.")
@@ -859,25 +891,25 @@ with tab_backtest:
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Trades", f"{len(t)}")
 
-            # Win rate from backtester trades
             p = pd.to_numeric(t.get("pnl_per_share", pd.Series(dtype=float)), errors="coerce")
             win_rate = float((p > 0).sum()) / max(1, len(p)) if len(p) else np.nan
             c2.metric("Win rate", f"{win_rate:.1%}" if np.isfinite(win_rate) else "—")
 
-            if isinstance(results, dict):
-                total_ret = _safe_float(results.get("total_return", np.nan))
-                sharpe = _safe_float(results.get("sharpe", np.nan))
-                maxdd = _safe_float(results.get("max_drawdown", np.nan))
-                c3.metric("Total return", f"{total_ret:.1%}" if np.isfinite(total_ret) else "—")
-                c4.metric("Max drawdown", f"{maxdd:.1%}" if np.isfinite(maxdd) else "—")
-                if np.isfinite(sharpe):
-                    st.caption(f"Sharpe (if provided): {sharpe:.2f}")
-            else:
-                c3.metric("Total return", "—")
-                c4.metric("Max drawdown", "—")
+            # ✅ Derive return/maxDD from equity if available
+            total_ret = np.nan
+            maxdd = np.nan
 
-        # ✅ Use df_bt equity if available (matches backtester)
-        df_bt = results.get("df_bt") if isinstance(results, dict) else None
+            if isinstance(df_bt, pd.DataFrame) and (not df_bt.empty) and ("equity" in df_bt.columns):
+                eq = pd.to_numeric(df_bt["equity"], errors="coerce").dropna()
+                if len(eq) > 2:
+                    total_ret = (eq.iloc[-1] / eq.iloc[0]) - 1.0
+                    dd = (eq / eq.cummax()) - 1.0
+                    maxdd = float(dd.min())
+
+            c3.metric("Total return", f"{total_ret:.1%}" if np.isfinite(total_ret) else "—")
+            c4.metric("Max drawdown", f"{maxdd:.1%}" if np.isfinite(maxdd) else "—")
+
+        # ✅ Equity + DD plots if equity exists
         if isinstance(df_bt, pd.DataFrame) and (not df_bt.empty) and ("equity" in df_bt.columns):
             eq = pd.to_numeric(df_bt["equity"], errors="coerce").dropna()
             if len(eq) > 2:
@@ -904,13 +936,10 @@ with tab_backtest:
                     ),
                     use_container_width=True,
                 )
+            else:
+                st.info("Equity curve exists but is too short to plot.")
         else:
-            st.info("Equity curve not available from backtester; showing trades table only.")
-
-        if isinstance(results, dict) and results.get("notes_for_beginners"):
-            with st.expander("Beginner notes (what these results imply)", expanded=False):
-                for line in results["notes_for_beginners"]:
-                    st.write(f"• {line}")
+            st.info("Equity curve not available (enable sizing/equity tracking in backtester to show it).")
 
         st.divider()
         st.dataframe(t, use_container_width=True, height=560)
@@ -1002,3 +1031,4 @@ with tab_live:
                 st_autorefresh(interval=800, key=f"live_refresh_{symbol}")
             else:
                 st.caption("Tip: install `streamlit-autorefresh` to auto-refresh without manual reruns.")
+
