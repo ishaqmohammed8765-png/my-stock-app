@@ -1,4 +1,4 @@
-## app.py
+# app.py
 from __future__ import annotations
 
 import time
@@ -495,7 +495,6 @@ def _load_and_prepare(
     df: Optional[pd.DataFrame] = None
     err_primary: Optional[str] = None
 
-    # Prefer Alpaca if keys exist; otherwise go straight to Yahoo (if enabled).
     if _has_keys_in_secrets():
         try:
             df = _cached_load_alpaca(symbol, force_refresh=force_refresh)
@@ -508,10 +507,7 @@ def _load_and_prepare(
             df = _cached_load_yahoo(symbol, period=yahoo_period, interval="1d")
         except Exception as e:
             err_y = f"{type(e).__name__}: {e}"
-            if err_primary:
-                st.session_state["load_error"] = f"{err_primary} | {err_y}"
-            else:
-                st.session_state["load_error"] = err_y
+            st.session_state["load_error"] = f"{err_primary} | {err_y}" if err_primary else err_y
             st.session_state["df_raw"] = None
             st.session_state["df_chart"] = None
             st.session_state["last_symbol"] = None
@@ -524,7 +520,6 @@ def _load_and_prepare(
         st.session_state["load_error"] = st.session_state.get("load_error") or err_primary or "No data."
         return
 
-    # normalize and coerce numeric
     df = _ensure_ohlcv_cols(df)
     df = _coerce_ohlcv_numeric(df)
 
@@ -532,13 +527,11 @@ def _load_and_prepare(
     st.session_state["last_symbol"] = symbol
     st.session_state["last_loaded_at"] = pd.Timestamp.utcnow()
 
-    # Keep sanity checks minimal (no walls of text)
     try:
         st.session_state["sanity"] = sanity_check_bars(df) if df is not None else None
     except Exception:
         st.session_state["sanity"] = None
 
-    # indicators
     try:
         df_chart = _as_utc_dtindex(df)
         add_indicators_inplace(df_chart)
@@ -580,7 +573,7 @@ st.caption("Signals • Charts • Backtests • Optional live quotes")
 
 
 # =============================================================================
-# Sidebar controls (clean: no “API detected”, no “data source” banners)
+# Sidebar controls (UPDATED: removed Execution + Charts options)
 # =============================================================================
 with st.sidebar:
     st.header("Controls")
@@ -599,13 +592,11 @@ with st.sidebar:
         rvol_min = st.number_input("RVOL min", 0.0, 10.0, float(ss_get("rvol_min", 1.2)))
         vol_max = st.number_input("Max annual vol", 0.0, 5.0, float(ss_get("vol_max", 1.0)))
 
-    with st.expander("Execution", expanded=False):
-        include_spread_penalty = st.checkbox("Include spread penalty", value=bool(ss_get("include_spread_penalty", True)))
-        assumed_spread_bps = st.number_input("Assumed spread (bps)", 0.0, 200.0, float(ss_get("assumed_spread_bps", 5.0)))
-
-    with st.expander("Charts", expanded=False):
-        sr_lookback = st.number_input("Lookback low/high (bars)", min_value=10, max_value=300, value=int(ss_get("sr_lookback", 50)), step=5)
-        chart_window = st.number_input("Chart window (bars)", min_value=120, max_value=3000, value=int(ss_get("chart_window", 700)), step=50)
+    # ✅ Fixed defaults (no Execution + Charts options)
+    include_spread_penalty = True
+    assumed_spread_bps = 5.0
+    sr_lookback = 50
+    chart_window = 700
 
     with st.expander("Data", expanded=False):
         yahoo_fallback = st.toggle("Use Yahoo fallback", value=bool(ss_get("yahoo_fallback", True)))
@@ -619,7 +610,7 @@ with st.sidebar:
     load_btn = c1.button("🔄 Load / Refresh", use_container_width=True)
     run_backtest_btn = c2.button("🧪 Run Backtest", use_container_width=True)
 
-# Persist inputs
+# Persist inputs (UPDATED: removed execution/chart keys)
 for k, v in {
     "symbol": symbol,
     "horizon": horizon,
@@ -630,10 +621,6 @@ for k, v in {
     "rsi_max": rsi_max,
     "rvol_min": rvol_min,
     "vol_max": vol_max,
-    "include_spread_penalty": include_spread_penalty,
-    "assumed_spread_bps": assumed_spread_bps,
-    "sr_lookback": sr_lookback,
-    "chart_window": chart_window,
     "yahoo_fallback": yahoo_fallback,
     "yahoo_period": yahoo_period,
 }.items():
@@ -642,7 +629,6 @@ for k, v in {
 
 # =============================================================================
 # Auto-load logic
-#   Upgrade: backtest triggers a load if data is missing or ticker changed.
 # =============================================================================
 def _needs_load_for_current(symbol_now: str) -> bool:
     if st.session_state.get("df_raw") is None:
@@ -656,8 +642,8 @@ if st.session_state.get("live_stream") is not None and st.session_state.get("liv
     _stop_live_stream()
 
 force_refresh = int(time.time()) if load_btn else 0
-
 should_load = load_btn or _needs_load_for_current(symbol) or run_backtest_btn
+
 if should_load:
     with st.spinner(f"Loading {symbol}…"):
         _load_and_prepare(
@@ -709,7 +695,6 @@ with tab_signal:
             if st.session_state.get("ind_error"):
                 st.warning("Some indicators failed (signal may be degraded).")
 
-    # Minimal data-quality hint (optional, not spammy)
     jump = detect_big_jump(df_chart, thresh=0.18)
     if jump:
         st.warning("Unusual price jump detected (possible split/corporate action).")
@@ -762,40 +747,34 @@ with tab_signal:
             st.metric("Planned Entry", f"{plan['entry']:.2f}" if np.isfinite(plan.get("entry", np.nan)) else "—")
             st.metric("R:R", f"{rr:.2f}" if np.isfinite(rr) else "—")
 
-    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Lookback Low", f"{lo:.2f}" if np.isfinite(lo) else "—")
     m2.metric("Lookback High", f"{hi:.2f}" if np.isfinite(hi) else "—")
     m3.metric("RSI", f"{rsi:.1f}" if np.isfinite(rsi) else "—")
     m4.metric("RVOL", f"{rvol:.2f}" if np.isfinite(rvol) else "—")
     m5.metric("Ann. Vol", f"{vol_ann:.2f}" if np.isfinite(vol_ann) else "—")
-    m6.metric("Plan type", str(plan.get("entry_type", "—")))
 
     st.divider()
     p = st.container(border=True)
     with p:
         st.subheader("Breakout Plan (ATR-based)")
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3 = st.columns(3)
         c1.metric("Entry", f"{plan['entry']:.2f}" if np.isfinite(plan.get("entry", np.nan)) else "—")
         c2.metric("Stop", f"{plan['stop']:.2f}" if np.isfinite(plan.get("stop", np.nan)) else "—")
         c3.metric("Target", f"{plan['target']:.2f}" if np.isfinite(plan.get("target", np.nan)) else "—")
-        c4.metric("Spread (bps)", f"{assumed_spread_bps:.1f}" if include_spread_penalty else "0.0")
-        st.caption(f"Multiples: entry={atr_entry:.2f}×ATR • stop={atr_stop:.2f}×ATR • target={atr_target:.2f}×ATR")
 
     with st.expander("Why this score?", expanded=False):
         for r in score.reasons[:10]:
             st.write(f"• {r}")
 
-    # Upgrade: lightweight exports (no extra noise)
     st.divider()
-    ex1, ex2 = st.columns([1, 2])
-    with ex1:
-        st.download_button(
-            "⬇️ Download chart data (CSV)",
-            data=df_plot.reset_index().to_csv(index=False).encode("utf-8"),
-            file_name=f"{symbol}_chart_data.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
+    st.download_button(
+        "⬇️ Download chart data (CSV)",
+        data=df_plot.reset_index().to_csv(index=False).encode("utf-8"),
+        file_name=f"{symbol}_chart_data.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
 
 
 # =============================================================================
@@ -925,13 +904,11 @@ with tab_backtest:
             c3.metric("Total return", f"{total_ret:.1%}" if np.isfinite(total_ret) else "—")
             c4.metric("Max drawdown", f"{maxdd:.1%}" if np.isfinite(maxdd) else "—")
 
-        # Upgrade: use real timestamps for equity/drawdown when possible
         if isinstance(df_bt, pd.DataFrame) and (not df_bt.empty) and ("equity" in df_bt.columns):
             eq = pd.to_numeric(df_bt["equity"], errors="coerce").dropna()
             if len(eq) > 2:
                 x = df_bt.index
                 if not isinstance(x, pd.DatetimeIndex):
-                    # try a timestamp column if present
                     if "timestamp" in df_bt.columns:
                         x = pd.to_datetime(df_bt["timestamp"], errors="coerce", utc=True)
                     else:
@@ -962,15 +939,13 @@ with tab_backtest:
                 )
 
         st.divider()
-        d1, d2 = st.columns([1, 2])
-        with d1:
-            st.download_button(
-                "⬇️ Download trades (CSV)",
-                data=t.to_csv(index=False).encode("utf-8"),
-                file_name=f"{symbol}_trades.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
+        st.download_button(
+            "⬇️ Download trades (CSV)",
+            data=t.to_csv(index=False).encode("utf-8"),
+            file_name=f"{symbol}_trades.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
 
         st.dataframe(t, use_container_width=True, height=560)
 
@@ -1024,7 +999,6 @@ with tab_live:
             except Exception:
                 new_msgs = []
             if new_msgs:
-                # Upgrade: store dicts only (lighter + safer)
                 normalized = [_msg_to_dict(x) for x in new_msgs]
                 st.session_state["live_rows"].extend(normalized)
                 st.session_state["live_rows"] = st.session_state["live_rows"][-800:]
