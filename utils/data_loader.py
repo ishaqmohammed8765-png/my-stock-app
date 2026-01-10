@@ -1,5 +1,7 @@
+from __future__ import annotations
+
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -18,16 +20,32 @@ except Exception:
     HAS_DATAFEED = False
 
 
+# ---------------------------
+# Key validation (local, no circular imports)
+# ---------------------------
 def validate_keys(api_key: str, secret_key: str) -> bool:
-    """Simple local validation to avoid circular imports."""
-    return bool(api_key and secret_key and str(api_key).strip() and str(secret_key).strip())
+    """
+    Best-effort local validation.
+    This does NOT prove entitlements; only an API call can.
+    """
+    if not api_key or not secret_key:
+        return False
+    k = str(api_key).strip()
+    s = str(secret_key).strip()
+    # Alpaca key id is often ~20 chars, secret is much longer, but keep soft
+    if len(k) < 12 or len(s) < 20:
+        return False
+    return True
 
 
+# ---------------------------
+# Dataframe normalization
+# ---------------------------
 def _normalize_bars_df(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     """
     Alpaca bars often come back as a MultiIndex df with (symbol, timestamp) index.
     This normalizes into a flat df with columns:
-      timestamp, open, high, low, close, volume, trade_count, vwap (if present)
+      timestamp, open, high, low, close, volume, trade_count, vwap (if present), symbol (if present)
     """
     if df is None or df.empty:
         return df
@@ -36,15 +54,18 @@ def _normalize_bars_df(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     if isinstance(df.index, pd.MultiIndex):
         df = df.reset_index()
 
-    # Common Alpaca column names after reset_index:
-    # symbol, timestamp, open, high, low, close, volume, trade_count, vwap
-    # Some versions: "time" instead of "timestamp"
+    # Standardize column names to lowercase strings for easier matching
+    df = df.rename(columns={c: str(c).lower() for c in df.columns})
+
+    # Common variants
     if "time" in df.columns and "timestamp" not in df.columns:
         df = df.rename(columns={"time": "timestamp"})
+    if "date" in df.columns and "timestamp" not in df.columns:
+        df = df.rename(columns={"date": "timestamp"})
 
     # If still missing timestamp, try to find any datetime-ish column
     if "timestamp" not in df.columns:
-        for c in df.columns:
+        for c in list(df.columns):
             if "time" in c.lower() or "date" in c.lower():
                 df = df.rename(columns={c: "timestamp"})
                 break
@@ -53,28 +74,20 @@ def _normalize_bars_df(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
         df = df.dropna(subset=["timestamp"])
     else:
-        # If we truly can't find a timestamp column, just return as-is
+        # Can't normalize without a timestamp; return as-is (caller will handle)
         return df
 
-    # Ensure standard OHLCV columns exist if present under weird casing
-    rename_map = {}
-    for col in ["open", "high", "low", "close", "volume", "trade_count", "vwap", "symbol"]:
-        if col not in df.columns:
-            # try case-insensitive match
-            matches = [c for c in df.columns if c.lower() == col]
-            if matches:
-                rename_map[matches[0]] = col
-    if rename_map:
-        df = df.rename(columns=rename_map)
+    # Ensure symbol column exists if provided by Alpaca
+    if "symbol" not in df.columns:
+        # some versions may use 's'
+        if "s" in df.columns:
+            df["symbol"] = df["s"]
 
     # Filter to ticker (sometimes multiple symbols can sneak in)
     if "symbol" in df.columns:
         df = df[df["symbol"].astype(str).str.upper() == ticker.upper()]
 
-    # Sort, drop duplicates
-    df = df.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
-
-    # Keep numeric columns numeric
+    # Coerce numeric columns
     for c in ["open", "high", "low", "close", "volume", "trade_count", "vwap"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -84,20 +97,63 @@ def _normalize_bars_df(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     if core:
         df = df.dropna(subset=core)
 
-    df = df.reset_index(drop=True)
+    # Sort + dedupe timestamps
+    df = df.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last").reset_index(drop=True)
+
     return df
 
 
+def _fetch_bars_df(
+    *,
+    ticker: str,
+    api_key: str,
+    secret_key: str,
+    request_params: Dict[str, Any],
+) -> pd.DataFrame:
+    client = StockHistoricalDataClient(api_key, secret_key)
+    bars = client.get_stock_bars(StockBarsRequest(**request_params))
+    return bars.df
+
+
+# ---------------------------
+# Cached loader
+# ---------------------------
 @st.cache_data(ttl=21600, show_spinner="Fetching market data...")
 def load_historical(
     ticker: str,
     api_key: str,
     secret_key: str,
-    days_back: int = 1200,
+    days_back: int = 900,
+    *,
+    prefer_iex: bool = True,
+    force_refresh: int = 0,
 ) -> Tuple[Optional[pd.DataFrame], Dict[str, Any]]:
-    """Fetch historical daily bars from Alpaca."""
+    """
+    Fetch historical daily bars from Alpaca.
+
+    Parameters
+    ----------
+    ticker : str
+        Stock ticker (e.g., AAPL)
+    api_key/secret_key : str
+        Alpaca credentials
+    days_back : int
+        How many calendar days back to request (daily bars). 900 ~= ~3.5 years.
+    prefer_iex : bool
+        If True and DataFeed is supported by installed alpaca-py, try IEX first.
+    force_refresh : int
+        Cache-buster knob. Pass a changing int (e.g., int(time.time())) to bypass cache on demand.
+
+    Returns
+    -------
+    (df, dbg)
+        df: normalized dataframe or None
+        dbg: debug metadata for UI display
+    """
+    _ = force_refresh  # used only for cache keying
+
     ticker = (ticker or "").upper().strip()
-    dbg: Dict[str, Any] = {"ticker": ticker, "status": "init"}
+    dbg: Dict[str, Any] = {"ticker": ticker, "status": "init", "feed": "default"}
 
     if not ticker:
         dbg["status"] = "error"
@@ -106,35 +162,50 @@ def load_historical(
 
     if not validate_keys(api_key, secret_key):
         dbg["status"] = "error"
-        dbg["error"] = "Invalid/missing keys"
+        dbg["error"] = "Invalid/missing keys (format check)."
         return None, dbg
 
-    start = datetime.utcnow() - timedelta(days=int(days_back))
-    end = datetime.utcnow()
+    # Use timezone-aware UTC datetimes
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=int(days_back))
+    end = now
 
-    request_params: Dict[str, Any] = {
+    base_params: Dict[str, Any] = {
         "symbol_or_symbols": [ticker],
         "timeframe": TimeFrame.Day,
         "start": start,
         "end": end,
     }
 
-    # Use IEX feed for free-tier users if supported by installed SDK
-    if HAS_DATAFEED:
-        try:
-            request_params["feed"] = DataFeed.IEX
-            dbg["feed"] = "IEX"
-        except Exception:
-            dbg["feed"] = "default"
-    else:
-        dbg["feed"] = "default"
+    # Decide whether to try IEX first
+    try_iex = bool(prefer_iex and HAS_DATAFEED)
 
     t0 = time.time()
+
     try:
-        client = StockHistoricalDataClient(api_key, secret_key)
-        bars = client.get_stock_bars(StockBarsRequest(**request_params))
-        raw_df = bars.df
-        df = _normalize_bars_df(raw_df, ticker)
+        # Attempt #1: IEX feed (if available)
+        if try_iex:
+            req1 = dict(base_params)
+            try:
+                req1["feed"] = DataFeed.IEX  # type: ignore[name-defined]
+                dbg["feed"] = "IEX"
+            except Exception:
+                dbg["feed"] = "default"
+                req1 = base_params
+
+            raw_df = _fetch_bars_df(ticker=ticker, api_key=api_key, secret_key=secret_key, request_params=req1)
+            df = _normalize_bars_df(raw_df, ticker)
+
+            # Retry if empty (common entitlement/version edge cases)
+            if df is None or df.empty:
+                dbg["retry"] = "no_feed"
+                dbg["feed"] = "default"
+                raw_df = _fetch_bars_df(ticker=ticker, api_key=api_key, secret_key=secret_key, request_params=base_params)
+                df = _normalize_bars_df(raw_df, ticker)
+        else:
+            # Attempt #1: default feed
+            raw_df = _fetch_bars_df(ticker=ticker, api_key=api_key, secret_key=secret_key, request_params=base_params)
+            df = _normalize_bars_df(raw_df, ticker)
 
         dbg["status"] = "success"
         dbg["rows"] = int(len(df)) if df is not None else 0
@@ -147,15 +218,22 @@ def load_historical(
 
     except Exception as e:
         dbg["status"] = "error"
-        dbg["error"] = str(e)
+        dbg["error"] = f"{type(e).__name__}: {e}"
         dbg["elapsed_sec"] = round(time.time() - t0, 3)
         return None, dbg
 
 
+# ---------------------------
+# Sanity checks
+# ---------------------------
 def sanity_check_bars(df: pd.DataFrame) -> Dict[str, Any]:
     """
     Returns a dict that app.py can display:
       {"ok": bool, "warnings": [...], "stats": {...}}
+
+    Notes for beginners:
+    - Warnings do not always mean "bad data" — holidays, IPOs, halts can create gaps.
+    - This is a lightweight safety net, not a perfect validator.
     """
     out: Dict[str, Any] = {"ok": True, "warnings": [], "stats": {}}
 
@@ -164,7 +242,6 @@ def sanity_check_bars(df: pd.DataFrame) -> Dict[str, Any]:
         out["warnings"].append("No data returned.")
         return out
 
-    # Required columns check
     required = ["timestamp", "open", "high", "low", "close"]
     missing = [c for c in required if c not in df.columns]
     if missing:
@@ -172,7 +249,10 @@ def sanity_check_bars(df: pd.DataFrame) -> Dict[str, Any]:
         out["warnings"].append(f"Missing required columns: {missing}")
         return out
 
-    # Basic validity
+    # Numeric checks
+    for c in ["open", "high", "low", "close"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
     if (df["close"] <= 0).any():
         out["ok"] = False
         out["warnings"].append("Found zero or negative close prices.")
@@ -180,29 +260,26 @@ def sanity_check_bars(df: pd.DataFrame) -> Dict[str, Any]:
         out["warnings"].append("Found non-positive OHLC values (may indicate bad data).")
 
     # Timestamp monotonicity / duplicates
-    if not df["timestamp"].is_monotonic_increasing:
-        out["warnings"].append("Timestamps not strictly increasing (sorting applied or source issue).")
-    dupes = int(df["timestamp"].duplicated().sum())
-    if dupes > 0:
-        out["warnings"].append(f"Duplicate timestamps found: {dupes}")
-
-    # Simple gap check (daily bars): look for > 7 day gaps (to avoid flagging weekends/holidays too aggressively)
     ts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce").dropna()
-    if len(ts) >= 2:
+    if len(ts) < 2:
+        out["warnings"].append("Very few rows; indicators/backtest may not work yet.")
+    else:
+        if not ts.is_monotonic_increasing:
+            out["warnings"].append("Timestamps not increasing (source issue; app will sort).")
+        dupes = int(ts.duplicated().sum())
+        if dupes > 0:
+            out["warnings"].append(f"Duplicate timestamps found: {dupes}")
+
+        # Gap check: > 7 day gaps (informational)
         gaps = ts.diff().dt.days.fillna(0)
         big_gaps = int((gaps > 7).sum())
         if big_gaps > 0:
-            out["warnings"].append(f"Detected {big_gaps} large time gaps (>7 days).")
+            out["warnings"].append(f"Detected {big_gaps} large time gaps (>7 days). (Often normal: IPO/halts/holidays)")
 
-    # Stats
     out["stats"] = {
         "rows": int(len(df)),
-        "start": str(df["timestamp"].min()),
-        "end": str(df["timestamp"].max()),
+        "start": str(ts.min()) if len(ts) else None,
+        "end": str(ts.max()) if len(ts) else None,
     }
-
-    if out["warnings"]:
-        # ok can still be True if warnings are mild, but here keep ok True unless we explicitly set False above
-        pass
 
     return out
