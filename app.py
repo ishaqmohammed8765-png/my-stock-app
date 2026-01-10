@@ -91,128 +91,15 @@ def tail_for_plot(df: pd.DataFrame, n: int) -> pd.DataFrame:
 
 
 def bt_params_signature(d: dict[str, Any]) -> str:
-    # stable signature so we can warn if UI has changed since last run
-    return "|".join([f"{k}={v}" for k, v in sorted((k, str(v)) for k, v in d.items())])
+    # Make a stable signature string so you can warn if params changed
+    def _val(v: Any) -> str:
+        if isinstance(v, float):
+            if np.isnan(v):
+                return "nan"
+            return f"{v:.8g}"
+        return str(v)
 
-
-# =============================================================================
-# Small formatting helpers
-# =============================================================================
-def fmt_pct(x: Any) -> str:
-    v = safe_float(x)
-    return "—" if not np.isfinite(v) else f"{v * 100:.1f}%"
-
-
-def fmt_num(x: Any, nd: int = 2) -> str:
-    v = safe_float(x)
-    return "—" if not np.isfinite(v) else f"{v:.{nd}f}"
-
-
-# =============================================================================
-# Backtest interpretation (beginner friendly)
-# =============================================================================
-def interpret_backtest(results: dict, trades_df: pd.DataFrame) -> dict[str, Any]:
-    """
-    Turn raw backtest stats into a beginner-friendly verdict.
-
-    We intentionally keep this simple:
-      - sample size (trades)
-      - avg R (edge proxy)
-      - max drawdown (pain)
-      - sharpe (risk-adjusted quality)
-    """
-    n = int(results.get("trades", 0) or 0)
-    avg_r = safe_float(results.get("avg_r_multiple", np.nan))
-    dd = safe_float(results.get("max_drawdown", np.nan))
-    sh = safe_float(results.get("sharpe", np.nan))
-
-    score = 0
-    bullets: list[str] = []
-
-    # sample size
-    if n < 20:
-        bullets.append("❌ Too few trades (<20). Results are mostly noise.")
-        score -= 3
-    elif n < 50:
-        bullets.append("⚠️ Only 20–49 trades. Treat results cautiously.")
-        score -= 1
-    else:
-        bullets.append("✅ 50+ trades. More reliable signal than noise.")
-        score += 2
-
-    # edge proxy
-    if np.isfinite(avg_r):
-        if avg_r <= 0:
-            bullets.append("❌ Avg R ≤ 0. This setup is not showing an edge (after your rules).")
-            score -= 3
-        elif avg_r < 0.15:
-            bullets.append("⚠️ Avg R is small (<0.15). Edge may be fragile.")
-            score -= 1
-        else:
-            bullets.append("✅ Avg R suggests a positive edge for this ticker/time period.")
-            score += 2
-    else:
-        bullets.append("⚠️ Avg R unavailable (often happens when there are too few trades).")
-
-    # drawdown
-    if np.isfinite(dd):
-        if dd <= -0.35:
-            bullets.append("❌ Drawdown worse than −35%. Most beginners quit during this.")
-            score -= 3
-        elif dd <= -0.25:
-            bullets.append("⚠️ Drawdown −25% to −35%. Needs discipline and smaller sizing.")
-            score -= 1
-        else:
-            bullets.append("✅ Drawdown is more manageable.")
-            score += 1
-
-    # sharpe
-    if np.isfinite(sh):
-        if sh < 0.5:
-            bullets.append("⚠️ Sharpe < 0.5 (weak risk-adjusted performance).")
-            score -= 1
-        elif sh < 1.0:
-            bullets.append("✅ Sharpe 0.5–1.0 (okay).")
-            score += 1
-        elif sh <= 2.0:
-            bullets.append("✅ Sharpe 1.0–2.0 (good).")
-            score += 2
-        else:
-            bullets.append("⚠️ Sharpe > 2.0 can be overfit on one ticker/time window.")
-            score += 1
-
-    if score >= 3:
-        verdict = "✅ Looks promising (test more tickers / longer history)"
-        kind = "success"
-    elif score >= 0:
-        verdict = "⚠️ Mixed / fragile (tweak + retest)"
-        kind = "warning"
-    else:
-        verdict = "❌ Not convincing (likely noise or negative edge)"
-        kind = "error"
-
-    return {"kind": kind, "verdict": verdict, "bullets": bullets}
-
-
-def render_interpretation(results: dict, trades_df: pd.DataFrame) -> None:
-    info = interpret_backtest(results, trades_df)
-
-    if info["kind"] == "success":
-        st.success(info["verdict"])
-    elif info["kind"] == "warning":
-        st.warning(info["verdict"])
-    else:
-        st.error(info["verdict"])
-
-    with st.expander("How to read these results (beginner guide)", expanded=False):
-        st.markdown(
-            "- **Trades**: <20 is mostly noise; 50+ is more trustworthy.\n"
-            "- **Avg R**: per-trade edge proxy; >0.15 is decent.\n"
-            "- **Max drawdown**: worst pain; if you can’t handle it, you won’t follow the system.\n"
-            "- **Sharpe**: risk-adjusted quality; >1 is good, >2 can be overfit.\n"
-        )
-        for b in info["bullets"]:
-            st.markdown(f"- {b}")
+    return "|".join([f"{k}={_val(v)}" for k, v in sorted(d.items(), key=lambda kv: kv[0])])
 
 
 # =============================================================================
@@ -393,10 +280,7 @@ def load_and_prepare(symbol: str, *, force_refresh: int) -> None:
 # Support/Resistance + Trade Plan
 # =============================================================================
 def compute_support_resistance(df_ind: pd.DataFrame, lookback: int) -> tuple[float, float]:
-    """
-    Beginner-friendly, robust S/R:
-    Uses percentiles instead of raw min/max so a single wick doesn't dominate.
-    """
+    """Robust S/R: uses percentiles so a single wick doesn't dominate."""
     lb = int(max(20, lookback))
     tail = df_ind.tail(lb)
     if tail.empty or ("low" not in tail.columns) or ("high" not in tail.columns):
@@ -420,7 +304,7 @@ def compute_trade_plan(
     atr_stop: float,
     atr_target: float,
 ) -> dict[str, float]:
-    """Simple long-only plan (educational)."""
+    """Simple long-only plan (for beginners)."""
     last = df_ind.iloc[-1]
     close = safe_float(last.get("close", np.nan))
     atr = safe_float(last.get("atr14", np.nan))
@@ -630,7 +514,7 @@ def compute_signal_score(
 
     score = int(np.clip(score, 0, 100))
 
-    # Long-only labels
+    # Long-only labels (beginner friendly)
     if score >= 70 and uptrend:
         return SignalScore("BUY", score, "Favorable trend + filters supportive.", reasons)
     if score <= 30 and downtrend:
@@ -639,7 +523,7 @@ def compute_signal_score(
 
 
 def get_current_price(symbol: str, df_chart: pd.DataFrame) -> tuple[float, str]:
-    """Best-effort current price: Yahoo quick price (cached) -> last historical close."""
+    """Best-effort current price: Yahoo (cached) else last close."""
     px, src = cached_current_price_yahoo(symbol)
     if np.isfinite(px) and px > 0:
         return float(px), src
@@ -671,22 +555,11 @@ ss_init(
         "bt_params_sig": None,
         "cfg_export_json": "",
         "cfg_import_json": "",
-        # UI defaults
-        "symbol": "AAPL",
-        "mode_label": "Breakout",
-        "atr_entry": 1.0,
-        "atr_stop": 2.0,
-        "atr_target": 3.0,
-        "rsi_min": 30.0,
-        "rsi_max": 70.0,
-        "rvol_min": 1.2,
-        "vol_max": 1.0,
-        "sr_lookback": 80,
-        "enable_position_sizing": False,
-        "account_capital": 100.0,
-        "risk_per_trade_pct": 1.0,
-        "max_alloc_pct": 10.0,
-        "mark_to_market": False,
+        # Backtest UI state
+        "use_cash_ledger": True,
+        "gate_ui": "soft",
+        "sizing_ui": "Fixed £ per trade",
+        "invest_amount": 25.0,
         "horizon_bars": 20,
     }
 )
@@ -727,41 +600,17 @@ with st.sidebar:
 
         sr_lookback = st.number_input("Support/Resistance lookback (bars)", 20, 300, int(ss_get("sr_lookback", 80)), 5)
 
-    with st.expander("Risk & Sizing", expanded=False):
-        enable_position_sizing = st.toggle("Enable Position Sizing", value=bool(ss_get("enable_position_sizing", False)))
-
+    with st.expander("Account", expanded=False):
         # ✅ allow < £100
         account_capital = st.number_input(
-            "Account Capital (£)",
+            "Starting account (£)",
             min_value=1.0,
             max_value=100_000_000.0,
             value=float(ss_get("account_capital", 100.0)),
             step=1.0,
             format="%.2f",
-            help="Used for sizing in the backtest. Does not place real trades.",
+            help="Used for backtest starting equity. Does not place real trades.",
         )
-
-        if enable_position_sizing:
-            risk_per_trade_pct = st.number_input(
-                "Risk per Trade (%)",
-                min_value=0.1,
-                max_value=10.0,
-                value=float(ss_get("risk_per_trade_pct", 1.0)),
-                step=0.1,
-                format="%.1f",
-            )
-            max_alloc_pct = st.number_input(
-                "Max Allocation (%)",
-                min_value=1.0,
-                max_value=100.0,
-                value=float(ss_get("max_alloc_pct", 10.0)),
-                step=1.0,
-                format="%.0f",
-            )
-        else:
-            risk_per_trade_pct = float(ss_get("risk_per_trade_pct", 1.0))
-            max_alloc_pct = float(ss_get("max_alloc_pct", 10.0))
-
         mark_to_market = st.toggle("Mark-to-market equity (smoother curve)", value=bool(ss_get("mark_to_market", False)))
 
     with st.expander("Save / Load Configuration", expanded=False):
@@ -777,12 +626,8 @@ with st.sidebar:
                 "rvol_min": float(rvol_min),
                 "vol_max": float(vol_max),
                 "sr_lookback": int(sr_lookback),
-                "enable_position_sizing": bool(enable_position_sizing),
                 "account_capital": float(account_capital),
-                "risk_per_trade_pct": float(risk_per_trade_pct),
-                "max_alloc_pct": float(max_alloc_pct),
                 "mark_to_market": bool(mark_to_market),
-                "horizon_bars": int(ss_get("horizon_bars", 20)),
             }
             st.session_state["cfg_export_json"] = json.dumps(cfg, indent=2)
 
@@ -811,12 +656,8 @@ with st.sidebar:
                     "rvol_min",
                     "vol_max",
                     "sr_lookback",
-                    "enable_position_sizing",
                     "account_capital",
-                    "risk_per_trade_pct",
-                    "max_alloc_pct",
                     "mark_to_market",
-                    "horizon_bars",
                 }
                 for k, v in parsed.items():
                     if k in allowed:
@@ -829,7 +670,7 @@ with st.sidebar:
     st.divider()
     load_btn = st.button("🔄 Load / Refresh", use_container_width=True)
 
-# Persist inputs
+# Persist sidebar inputs
 for k, v in {
     "symbol": symbol,
     "mode_label": mode_label,
@@ -841,10 +682,7 @@ for k, v in {
     "rvol_min": rvol_min,
     "vol_max": vol_max,
     "sr_lookback": sr_lookback,
-    "enable_position_sizing": enable_position_sizing,
     "account_capital": account_capital,
-    "risk_per_trade_pct": risk_per_trade_pct,
-    "max_alloc_pct": max_alloc_pct,
     "mark_to_market": mark_to_market,
 }.items():
     st.session_state[k] = v
@@ -935,7 +773,7 @@ with tab_signal:
         if np.isfinite(support) and np.isfinite(resistance):
             st.write(f"• **Support zone** ~ **{support:.2f}** → many traders place a stop a little *below* this.")
             st.write(f"• **Resistance zone** ~ **{resistance:.2f}** → many traders take profit or get cautious near this.")
-            st.caption("These are percentile-based levels from the last lookback window (less sensitive to wicks).")
+            st.caption("These are percentile-based levels from the lookback window (less sensitive to single wicks).")
         else:
             st.info("Not enough data to compute stable support/resistance yet.")
 
@@ -947,7 +785,7 @@ with tab_signal:
         c2.metric("Stop", f"{plan['stop']:.2f}" if np.isfinite(plan["stop"]) else "—")
         c3.metric("Target", f"{plan['target']:.2f}" if np.isfinite(plan["target"]) else "—")
         c4.metric("R:R", f"{plan['rr']:.2f}" if np.isfinite(plan["rr"]) else "—")
-        st.caption(f"Mode: {mode_label} • Long-only plan (for beginners)")
+        st.caption(f"Mode: {mode_label} • Long-only plan")
 
     with st.expander("Why this score?", expanded=False):
         for r in score.reasons[:12]:
@@ -987,34 +825,94 @@ with tab_charts:
 
 
 # =============================================================================
-# Backtest tab (IMPROVED: aligned button + interpretation + cash ledger)
+# Backtest tab
 # =============================================================================
 with tab_backtest:
     st.subheader("Backtest")
 
-    # ✅ Fix alignment: put inputs + button in one form row
+    # Clean, aligned "controls row" using a form
     with st.form("bt_form", clear_on_submit=False):
-        c1, c2, c3, c4 = st.columns([1.25, 1.25, 1.2, 1.6])
+        c1, c2, c3, c4, c5 = st.columns(
+            [1.25, 1.15, 1.25, 1.35, 1.6],
+            vertical_alignment="bottom",  # ✅ aligns the button with the inputs
+        )
+
         horizon_bars = c1.number_input("Max hold (bars)", 1, 200, int(ss_get("horizon_bars", 20)), 1)
+        st.session_state["horizon_bars"] = int(horizon_bars)
+
         use_cash_ledger = c2.toggle(
-            "Realistic cash (recommended)",
-            value=True,
-            help="When ON, the backtest won't buy shares you can't afford. Best for small accounts.",
+            "Realistic cash",
+            value=bool(ss_get("use_cash_ledger", True)),
+            help="If ON: you can’t buy shares you can’t afford (recommended for small accounts).",
         )
-        gate_mode = c3.selectbox(
-            "Gating",
+        st.session_state["use_cash_ledger"] = bool(use_cash_ledger)
+
+        gate_ui = c3.selectbox(
+            "Probability gating",
             ["soft", "hard", "off"],
-            index=0,
-            help="Soft = size down weak setups. Hard = skip weak setups. Off = no gating.",
+            index={"soft": 0, "hard": 1, "off": 2}.get(str(ss_get("gate_ui", "soft")), 0),
+            help="Soft = take weaker setups smaller. Hard = skip weak setups. Off = no gating.",
         )
-        run_backtest_btn = c4.form_submit_button("🧪 Run Backtest", use_container_width=True)
+        st.session_state["gate_ui"] = gate_ui
 
-    st.session_state["horizon_bars"] = int(horizon_bars)
+        sizing_ui = c4.selectbox(
+            "Position sizing",
+            ["Fixed £ per trade", "% of account"],
+            index=0 if str(ss_get("sizing_ui", "Fixed £ per trade")) == "Fixed £ per trade" else 1,
+            help="Fixed £ is easiest: each trade uses about the same money.",
+        )
+        st.session_state["sizing_ui"] = sizing_ui
 
-    prob_gating = (gate_mode != "off")
-    gate_mode_val = "soft" if gate_mode == "soft" else "hard"
+        run_backtest_btn = c5.form_submit_button("🧪 Run Backtest", use_container_width=True)
 
-    # Keep parameter names aligned with your backtester signature.
+    # Extra controls (outside the form so the row stays aligned)
+    if sizing_ui == "Fixed £ per trade":
+        invest_amount = st.number_input(
+            "Amount invested per trade (£)",
+            min_value=1.0,
+            value=float(ss_get("invest_amount", 25.0)),
+            step=1.0,
+            format="%.2f",
+            help="If this is too small to buy 1 share, trades may be skipped.",
+        )
+        st.session_state["invest_amount"] = float(invest_amount)
+        sizing_mode = "fixed_amount"
+        # risk cap (still applied) - keep moderate default
+        risk_pct = 0.02
+        max_alloc_pct_frac = 1.0  # not used in fixed_amount mode (kept for signature completeness)
+    else:
+        invest_amount = float(ss_get("invest_amount", 25.0))
+        sizing_mode = "percent"
+
+        risk_per_trade_pct = st.number_input(
+            "Risk per trade (%)",
+            min_value=0.1,
+            max_value=10.0,
+            value=float(ss_get("risk_per_trade_pct", 1.0)),
+            step=0.1,
+            format="%.1f",
+            help="How much of your account you’re willing to lose if the stop is hit.",
+        )
+        st.session_state["risk_per_trade_pct"] = float(risk_per_trade_pct)
+
+        max_alloc_pct_ui = st.number_input(
+            "Max allocation (%)",
+            min_value=1.0,
+            max_value=100.0,
+            value=float(ss_get("max_alloc_pct", 10.0)),
+            step=1.0,
+            format="%.0f",
+            help="Caps the position size as a % of account.",
+        )
+        st.session_state["max_alloc_pct"] = float(max_alloc_pct_ui)
+
+        risk_pct = float(risk_per_trade_pct) / 100.0
+        max_alloc_pct_frac = float(max_alloc_pct_ui) / 100.0
+
+    prob_gating = (gate_ui != "off")
+    gate_mode = "soft" if gate_ui == "soft" else "hard"
+
+    # Build params for your NEW backtester
     bt_params = dict(
         mode=mode,
         horizon=int(horizon_bars),
@@ -1031,7 +929,7 @@ with tab_backtest:
         assumed_spread_bps=5.0,
         start_equity=float(account_capital),
 
-        # execution realism (keep simple defaults)
+        # execution realism (simple defaults)
         slippage_bps=5.0,
         commission_per_order=0.0,
         spread_mode="taker_only",
@@ -1039,12 +937,14 @@ with tab_backtest:
         time_exit_price="open",
 
         # sizing
-        enable_position_sizing=bool(enable_position_sizing),
-        risk_pct=float(risk_per_trade_pct) / 100.0,
-        max_alloc_pct=float(max_alloc_pct) / 100.0,
+        enable_position_sizing=True,
+        sizing_mode=str(sizing_mode),          # NEW
+        invest_amount=float(invest_amount),    # NEW (used in fixed_amount mode)
+        risk_pct=float(risk_pct),
+        max_alloc_pct=float(max_alloc_pct_frac),
         min_risk_per_share=1e-6,
 
-        # accounting
+        # realism for small accounts
         use_cash_ledger=bool(use_cash_ledger),
         allow_margin=False,
 
@@ -1057,8 +957,9 @@ with tab_backtest:
         prob_min=0.50,
         min_bucket_trades=6,
         min_avg_r=-0.05,
-        gate_mode=gate_mode_val,
+        gate_mode=str(gate_mode),
     )
+
     sig = bt_params_signature(bt_params)
 
     if run_backtest_btn:
@@ -1092,29 +993,31 @@ with tab_backtest:
         df_bt = results.get("df_bt", pd.DataFrame())
         ntr = int(results.get("trades", 0) or 0)
 
-        # ✅ Interpretation panel
-        render_interpretation(results, trades if isinstance(trades, pd.DataFrame) else pd.DataFrame())
-
         st.markdown("### Performance")
         pwrap = st.container(border=True)
         with pwrap:
-            c1, c2, c3, c4, c5, c6 = st.columns(6)
-            c1.metric("Trades", f"{ntr}")
-            c2.metric("Win rate", fmt_pct(results.get("win_rate", np.nan)))
-            c3.metric("Total return", fmt_pct(results.get("total_return", np.nan)))
-            c4.metric("Max drawdown", fmt_pct(results.get("max_drawdown", np.nan)))
-            c5.metric("Sharpe", fmt_num(results.get("sharpe", np.nan), 2))
-            c6.metric("Avg R", fmt_num(results.get("avg_r_multiple", np.nan), 2))
+            m1, m2, m3, m4, m5 = st.columns(5)
+            m1.metric("Trades", f"{ntr}")
+            m2.metric("Win rate", f"{results.get('win_rate', float('nan')):.1%}" if np.isfinite(results.get("win_rate", np.nan)) else "—")
+            m3.metric("Total return", f"{results.get('total_return', float('nan')):.1%}" if np.isfinite(results.get("total_return", np.nan)) else "—")
+            m4.metric("Max drawdown", f"{results.get('max_drawdown', float('nan')):.1%}" if np.isfinite(results.get("max_drawdown", np.nan)) else "—")
+            m5.metric("Sharpe", f"{results.get('sharpe', float('nan')):.2f}" if np.isfinite(results.get("sharpe", np.nan)) else "—")
 
-        # Equity / Drawdown charts
+        with st.expander("How to interpret this", expanded=False):
+            st.write(
+                "- **Trades**: too few trades = stats can be noisy.\n"
+                "- **Win rate**: you can still lose money with a high win rate if losses are larger than wins.\n"
+                "- **Total return**: result over this historical period with these settings.\n"
+                "- **Max drawdown**: worst peak-to-trough drop. Lower is generally better.\n"
+                "- **Sharpe**: risk-adjusted return. Higher is better, but not very meaningful with few trades.\n"
+                "- **Fixed £ per trade**: if £ is too small to buy 1 share, trades may be skipped.\n"
+                "- **Realistic cash**: ON means the backtest won’t magically buy what you can’t afford."
+            )
+
         if isinstance(df_bt, pd.DataFrame) and (not df_bt.empty) and ("equity" in df_bt.columns):
             eq = pd.to_numeric(df_bt["equity"], errors="coerce").dropna()
             if len(eq) > 2:
-                ts = pd.to_datetime(
-                    df_bt.get("timestamp", pd.Series(index=df_bt.index, dtype="datetime64[ns]")),
-                    errors="coerce",
-                    utc=True,
-                )
+                ts = pd.to_datetime(df_bt.get("timestamp", pd.Series(index=df_bt.index, dtype="datetime64[ns]")), errors="coerce", utc=True)
                 x = np.arange(len(eq)) if (not isinstance(ts, pd.Series) or ts.isna().all()) else ts.iloc[-len(eq):]
 
                 peak = eq.cummax()
@@ -1142,25 +1045,8 @@ with tab_backtest:
                     use_container_width=True,
                 )
 
-            # Optional cash curve if enabled and present
-            if "cash" in df_bt.columns and df_bt["cash"].notna().any():
-                cash_s = pd.to_numeric(df_bt["cash"], errors="coerce").dropna()
-                if len(cash_s) > 2:
-                    st.plotly_chart(
-                        go.Figure([go.Scatter(x=df_bt.index, y=cash_s.values, mode="lines")]).update_layout(
-                            title="Cash (ledger)",
-                            height=240,
-                            margin=dict(l=10, r=10, t=45, b=10),
-                            hovermode="x unified",
-                            showlegend=False,
-                        ),
-                        use_container_width=True,
-                    )
-
-        # Trades table + download
         if not isinstance(trades, pd.DataFrame) or trades.empty:
             st.warning("Backtest completed but produced no trades.")
-            st.caption("Tip: switch gating to **soft** or **off**, widen RSI/RVOL filters, or try a different ticker.")
         else:
             st.download_button(
                 "⬇️ Download trades (CSV)",
@@ -1171,5 +1057,5 @@ with tab_backtest:
             )
             st.dataframe(trades, use_container_width=True, height=560)
 
-        with st.expander("Assumptions (advanced)", expanded=False):
+        with st.expander("Assumptions", expanded=False):
             st.json(results.get("assumptions", {}))
