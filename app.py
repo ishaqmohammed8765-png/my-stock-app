@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from typing import Any, Optional, Tuple
 
@@ -336,6 +337,69 @@ def cached_current_price_yahoo(symbol: str) -> Tuple[float, str]:
     return np.nan, "Unavailable"
 
 
+@st.cache_data(ttl=CACHE_TTL_YAHOO_HIST_SEC, show_spinner=False)
+def cached_watchlist_history(symbol: str, *, period: str, interval: str) -> pd.DataFrame:
+    return cached_load_yahoo(symbol, period=period, interval=interval)
+
+
+def prepare_opportunity_df(symbol: str) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
+    try:
+        df = cached_watchlist_history(symbol, period="3y", interval="1d")
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+
+    df = ensure_ohlcv_cols(df)
+    df = coerce_ohlcv_numeric(df)
+    if df is None or getattr(df, "empty", True):
+        return None, "No data returned."
+
+    try:
+        df_chart = as_utc_dtindex(df)
+        add_indicators_inplace(df_chart)
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+
+    return df_chart, None
+
+
+@st.cache_data(ttl=CACHE_TTL_YAHOO_HIST_SEC, show_spinner=False)
+def cached_news_snapshot(symbol: str, *, limit: int = 3) -> list[dict[str, str]]:
+    if not YF_AVAILABLE:
+        return []
+
+    try:
+        t = yf.Ticker(symbol)
+        items = getattr(t, "news", None)
+    except Exception:
+        return []
+
+    if not items:
+        return []
+
+    snapshot: list[dict[str, str]] = []
+    for item in items[:limit]:
+        title = str(item.get("title") or "").strip()
+        link = str(item.get("link") or "").strip()
+        publisher = str(item.get("publisher") or "").strip()
+        published = item.get("providerPublishTime")
+        ts = ""
+        if isinstance(published, (int, float)):
+            try:
+                ts = datetime.fromtimestamp(published, tz=timezone.utc).strftime("%Y-%m-%d")
+            except Exception:
+                ts = ""
+        snapshot.append(
+            {
+                "title": title or "Untitled",
+                "link": link,
+                "publisher": publisher or "Unknown",
+                "date": ts or "Unknown",
+            }
+        )
+
+    return snapshot
+
+
 def load_and_prepare(symbol: str, *, force_refresh: int) -> None:
     st.session_state["load_error"] = None
     st.session_state["ind_error"] = None
@@ -578,6 +642,15 @@ class SignalScore:
     reasons: list[str]
 
 
+@dataclass(frozen=True)
+class OpportunityScore:
+    label: str
+    score: int
+    timeframe: str
+    summary: str
+    reasons: list[str]
+
+
 def compute_signal_score(df_ind: pd.DataFrame, rsi_min: float, rsi_max: float, rvol_min: float, vol_max: float) -> SignalScore:
     need = ["close", "ma50", "ma200", "rsi14", "rvol", "vol_ann", "atr14"]
     missing = [c for c in need if c not in df_ind.columns]
@@ -654,6 +727,134 @@ def compute_signal_score(df_ind: pd.DataFrame, rsi_min: float, rsi_max: float, r
     if score <= SCORE_AVOID_MAX and downtrend:
         return SignalScore("AVOID", score, "Bearish conditions dominate (avoid long).", reasons)
     return SignalScore("HOLD", score, "Mixed/neutral conditions.", reasons)
+
+
+def compute_opportunity_score(
+    df_ind: pd.DataFrame,
+    *,
+    news_score: int,
+    market_cap_m: float,
+    float_m: float,
+    short_interest: float,
+    catalyst_days: int,
+) -> OpportunityScore:
+    need = ["close", "ma50", "ma200", "rvol", "vol_ann", "atr14"]
+    missing = [c for c in need if c not in df_ind.columns]
+    if missing:
+        return OpportunityScore("WAIT", 0, "Unknown", "Indicators not ready.", [f"Missing: {', '.join(missing[:6])}"])
+
+    if "ind_ready" in df_ind.columns and not bool(df_ind["ind_ready"].iloc[-1]):
+        return OpportunityScore(
+            "WAIT",
+            0,
+            "Unknown",
+            "Waiting for enough history.",
+            ["Indicators not ready (need more bars for stable values)."],
+        )
+
+    last = df_ind.iloc[-1]
+    close = safe_float(last.get("close"))
+    ma50 = safe_float(last.get("ma50"))
+    ma200 = safe_float(last.get("ma200"))
+    rvol = safe_float(last.get("rvol"))
+    vol_ann = safe_float(last.get("vol_ann"))
+    atr = safe_float(last.get("atr14"))
+
+    vals = np.array([close, ma50, ma200, rvol, vol_ann, atr], dtype="float64")
+    if not np.isfinite(vals).all():
+        return OpportunityScore("WAIT", 0, "Unknown", "Waiting for enough history.", ["Non-finite indicator values"])
+
+    reasons: list[str] = []
+    score = 45
+
+    uptrend = close > ma50 > ma200
+    if uptrend:
+        score += 12
+        reasons.append("Price in uptrend (close > MA50 > MA200)")
+    else:
+        reasons.append("Trend not fully aligned")
+
+    if rvol >= 1.5:
+        score += 10
+        reasons.append(f"Unusual volume (RVOL {rvol:.2f})")
+    elif rvol >= 1.1:
+        score += 5
+        reasons.append(f"Above-average volume (RVOL {rvol:.2f})")
+    else:
+        reasons.append(f"Quiet volume (RVOL {rvol:.2f})")
+
+    if vol_ann >= 0.6:
+        score += 8
+        reasons.append(f"High volatility (ann. vol {vol_ann:.2f})")
+    elif vol_ann >= 0.35:
+        score += 4
+        reasons.append(f"Moderate volatility (ann. vol {vol_ann:.2f})")
+    else:
+        reasons.append(f"Low volatility (ann. vol {vol_ann:.2f})")
+
+    if market_cap_m <= 300:
+        score += 12
+        reasons.append("Micro/small cap (market cap ≤ $300M)")
+    elif market_cap_m <= 1000:
+        score += 6
+        reasons.append("Small cap (market cap ≤ $1B)")
+    else:
+        reasons.append("Larger cap (market cap > $1B)")
+
+    if float_m <= 50:
+        score += 8
+        reasons.append("Low float (≤ 50M shares)")
+    elif float_m <= 150:
+        score += 4
+        reasons.append("Moderate float (≤ 150M shares)")
+    else:
+        reasons.append("Higher float (> 150M shares)")
+
+    if short_interest >= 15:
+        score += 8
+        reasons.append(f"Elevated short interest ({short_interest:.1f}%)")
+    elif short_interest >= 7:
+        score += 4
+        reasons.append(f"Moderate short interest ({short_interest:.1f}%)")
+    else:
+        reasons.append(f"Low short interest ({short_interest:.1f}%)")
+
+    if news_score >= 30:
+        score += 12
+        reasons.append("Strong positive news tone")
+    elif news_score >= 10:
+        score += 6
+        reasons.append("Mild positive news tone")
+    elif news_score <= -20:
+        score -= 8
+        reasons.append("Negative news tone")
+    else:
+        reasons.append("Neutral news tone")
+
+    score = int(np.clip(score, 0, 100))
+
+    timeframe = "3-6 months"
+    if catalyst_days <= 7:
+        timeframe = "1-3 weeks"
+    elif catalyst_days <= 30:
+        timeframe = "1-2 months"
+    elif catalyst_days <= 90:
+        timeframe = "1-3 months"
+
+    if news_score >= 40 and rvol >= 2.0:
+        timeframe = "Days to 2 weeks"
+
+    if score >= 75:
+        label = "HIGH"
+        summary = "Speculative opportunity setup with multiple catalysts."
+    elif score >= 55:
+        label = "WATCH"
+        summary = "Some ingredients are present; needs confirmation."
+    else:
+        label = "LOW"
+        summary = "Limited near-term opportunity signals."
+
+    return OpportunityScore(label, score, timeframe, summary, reasons)
 
 
 def get_latest_price(symbol: str, df_chart: pd.DataFrame) -> Tuple[float, str]:
@@ -868,7 +1069,9 @@ support_level, resistance_level = compute_support_resistance(df_chart, int(sr_lo
 # =============================================================================
 # Tabs
 # =============================================================================
-tab_signal, tab_charts, tab_backtest = st.tabs(["✅ Signal", "📊 Charts", "🧪 Backtest"])
+tab_signal, tab_opportunity, tab_charts, tab_backtest = st.tabs(
+    ["✅ Signal", "🚀 Opportunity", "📊 Charts", "🧪 Backtest"]
+)
 
 
 # =============================================================================
@@ -937,6 +1140,136 @@ with tab_signal:
         for r in score.reasons[:12]:
             st.write(f"• {r}")
         st.caption("Label rules: BUY requires both a high score and an uptrend; AVOID requires low score and downtrend.")
+
+
+# =============================================================================
+# Opportunity tab
+# =============================================================================
+with tab_opportunity:
+    st.subheader(f"{symbol} — Opportunity radar")
+    st.caption("Blend of small-cap fundamentals, news tone, and momentum. Educational only, not financial advice.")
+
+    left, right = st.columns([1.1, 1], gap="large")
+    with left:
+        st.markdown("### Inputs")
+        market_cap_m = st.number_input("Market cap (USD, millions)", min_value=10.0, max_value=20000.0, value=300.0, step=10.0)
+        float_m = st.number_input("Float (millions of shares)", min_value=1.0, max_value=2000.0, value=60.0, step=5.0)
+        short_interest = st.number_input("Short interest (% of float)", min_value=0.0, max_value=100.0, value=8.0, step=0.5)
+        news_score = st.slider("News tone (subjective)", min_value=-100, max_value=100, value=15, step=5)
+        catalyst_days = st.number_input(
+            "Next catalyst in (days)",
+            min_value=1,
+            max_value=365,
+            value=30,
+            step=1,
+            help="Earnings, product launch, FDA decision, contract award, etc.",
+        )
+        st.caption("Tip: use estimates from filings, reputable news, or your broker's data.")
+
+    with right:
+        st.markdown("### Opportunity score")
+        opp = compute_opportunity_score(
+            df_chart,
+            news_score=int(news_score),
+            market_cap_m=float(market_cap_m),
+            float_m=float(float_m),
+            short_interest=float(short_interest),
+            catalyst_days=int(catalyst_days),
+        )
+
+        badge = st.container(border=True)
+        with badge:
+            if opp.label == "HIGH":
+                st.success(f"**HIGH** • Score {opp.score}/100")
+            elif opp.label == "WATCH":
+                st.warning(f"**WATCH** • Score {opp.score}/100")
+            else:
+                st.info(f"**LOW** • Score {opp.score}/100")
+            st.caption(opp.summary)
+
+        st.metric("Estimated timeframe", opp.timeframe)
+        st.caption("Shorter timeframes imply higher volatility and higher risk.")
+
+        with st.expander("Why this score?", expanded=False):
+            for r in opp.reasons[:12]:
+                st.write(f"• {r}")
+            st.caption("Opportunity scores are heuristic and do not guarantee outcomes.")
+
+    st.markdown("### News snapshot")
+    news_items = cached_news_snapshot(symbol, limit=3)
+    if news_items:
+        for item in news_items:
+            label = f"{item['title']} ({item['publisher']} • {item['date']})"
+            if item["link"]:
+                st.markdown(f"- [{label}]({item['link']})")
+            else:
+                st.markdown(f"- {label}")
+    else:
+        st.info("News snapshot unavailable. Add a source or try again later.")
+
+    st.markdown("### Optional watchlist scan")
+    enable_watchlist = st.checkbox("Enable watchlist scan", value=False)
+    watchlist_input = st.text_area(
+        "Tickers (comma or newline separated)",
+        value="",
+        placeholder="e.g. AAPL, SOFI, PLTR",
+        disabled=not enable_watchlist,
+        height=80,
+    )
+    run_watchlist = st.button("Run watchlist scan", disabled=not enable_watchlist)
+    if run_watchlist:
+        raw_items = [x.strip().upper() for x in watchlist_input.replace("\n", ",").split(",")]
+        tickers = [x for x in raw_items if x]
+        tickers = list(dict.fromkeys(tickers))[:20]
+
+        if not tickers:
+            st.warning("Add at least one ticker to scan.")
+        else:
+            results: list[dict[str, Any]] = []
+            details: dict[str, OpportunityScore] = {}
+            errors: list[str] = []
+            with st.spinner("Scanning watchlist..."):
+                for item in tickers:
+                    df_watch, err = prepare_opportunity_df(item)
+                    if err:
+                        errors.append(f"{item}: {err}")
+                        continue
+
+                    opp_watch = compute_opportunity_score(
+                        df_watch,
+                        news_score=int(news_score),
+                        market_cap_m=float(market_cap_m),
+                        float_m=float(float_m),
+                        short_interest=float(short_interest),
+                        catalyst_days=int(catalyst_days),
+                    )
+                    details[item] = opp_watch
+                    top_news = cached_news_snapshot(item, limit=1)
+                    headline = top_news[0]["title"] if top_news else "News unavailable"
+                    results.append(
+                        {
+                            "Ticker": item,
+                            "Score": opp_watch.score,
+                            "Label": opp_watch.label,
+                            "Timeframe": opp_watch.timeframe,
+                            "Headline": headline,
+                        }
+                    )
+
+            if results:
+                st.dataframe(pd.DataFrame(results).sort_values(["Score", "Ticker"], ascending=[False, True]), use_container_width=True)
+                for item, opp_watch in details.items():
+                    with st.expander(f"{item} details", expanded=False):
+                        st.write(f"**{opp_watch.label}** • Score {opp_watch.score}/100")
+                        st.caption(opp_watch.summary)
+                        st.write("**Timeframe:**", opp_watch.timeframe)
+                        for r in opp_watch.reasons[:10]:
+                            st.write(f"• {r}")
+
+            if errors:
+                with st.expander("Watchlist errors", expanded=False):
+                    for err in errors:
+                        st.write(f"• {err}")
 
 
 # =============================================================================
