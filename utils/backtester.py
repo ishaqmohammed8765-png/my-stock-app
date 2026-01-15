@@ -894,6 +894,8 @@ def backtest_strategy(
                 continue
 
         row = df_bt.iloc[i]
+        if "ind_ready" in df_bt.columns and not bool(row.get("ind_ready", True)):
+            continue
         rsi = float(row["rsi14"])
         rvol = float(row["rvol"])
         vol_ann = float(row["vol_ann"])
@@ -912,7 +914,7 @@ def backtest_strategy(
 
         gate_mult = 1.0
         gate_reason = "ok"
-        if prob_gating:
+        if prob_gating and i >= int(is_end_i):
             gm, gr = _gate_multiplier(
                 row,
                 bucket_stats,
@@ -935,6 +937,9 @@ def backtest_strategy(
 
             if gate_mode_l == "hard" and gate_mult <= 0.0:
                 continue
+        elif prob_gating:
+            gate_mult = 1.0
+            gate_reason = "pre_in_sample_window"
 
         nxt = df_bt.iloc[i + 1]
         o = float(nxt["open"])
@@ -1122,6 +1127,7 @@ def backtest_strategy(
         "mode": str(gate_mode_l),
         "is_frac": float(prob_is_frac),
         "is_end_i": int(is_end_i) if prob_gating else 0,
+        "applied_after_index": int(is_end_i) if prob_gating else 0,
         "prob_min": float(prob_min),
         "min_bucket_trades": int(min_bucket_trades),
         "min_avg_r": float(min_avg_r),
@@ -1139,7 +1145,9 @@ def backtest_strategy(
     if exit_priority_l != "worst_case":
         warnings.append("Daily OHLC cannot determine stop vs target order within a bar; results depend on exit_priority.")
     if prob_gating:
-        warnings.append("probability_gating uses in-sample bucket performance (heuristic), not a true probability model.")
+        warnings.append(
+            "probability_gating uses in-sample bucket performance (heuristic) and is applied only after the in-sample window."
+        )
     if forced_negative_cash_on_exit > 0 and use_cash_ledger and not allow_margin:
         warnings.append("Some exits forced cash negative to pay commissions (real brokers would debit your account).")
     if sizing_mode_l == "fixed_amount" and skipped_qty_amt_zero > 0:
