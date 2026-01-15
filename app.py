@@ -87,13 +87,60 @@ st.set_page_config(
 st.markdown(
     """
 <style>
-.block-container { padding-top: 0.9rem; padding-bottom: 1.1rem; max-width: 1320px; }
-[data-testid="stSidebar"] .block-container { padding-top: 0.8rem; }
-h1 { margin-bottom: 0.15rem; letter-spacing: -0.3px; }
-[data-testid="stMetric"] { padding: 0.1rem 0.15rem; border-radius: 12px; }
-div[data-testid="stVerticalBlockBorderWrapper"]{ border-radius: 16px; }
-.stButton button { border-radius: 14px; }
-.stDownloadButton button { border-radius: 14px; }
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+:root {
+  --bg: #0f1117;
+  --surface: #151923;
+  --surface-2: #1b2130;
+  --border: rgba(255, 255, 255, 0.06);
+  --text: #f5f7ff;
+  --muted: #a6b0c3;
+  --accent: #6ea8fe;
+  --radius: 16px;
+}
+html, body, [class*="stApp"] { font-family: "Inter", sans-serif; background: var(--bg); color: var(--text); }
+.block-container { padding-top: 1.2rem; padding-bottom: 1.2rem; max-width: 1320px; }
+[data-testid="stSidebar"] { background: var(--surface); border-right: 1px solid var(--border); }
+[data-testid="stSidebar"] .block-container { padding-top: 1rem; }
+h1, h2, h3, h4 { letter-spacing: -0.3px; color: var(--text); }
+h1 { margin-bottom: 0.15rem; font-weight: 700; }
+p, label, span { color: var(--muted); }
+[data-testid="stMetric"] {
+  background: var(--surface-2);
+  padding: 0.75rem 0.9rem;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  box-shadow: 0 8px 20px rgba(10, 14, 23, 0.35);
+}
+div[data-testid="stVerticalBlockBorderWrapper"]{
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  padding: 0.65rem;
+}
+.stButton button, .stDownloadButton button {
+  border-radius: 14px;
+  background: linear-gradient(135deg, #5b8dff, #7b5bff);
+  color: #fff;
+  border: none;
+  font-weight: 600;
+  padding: 0.5rem 1.1rem;
+  box-shadow: 0 10px 24px rgba(80, 112, 255, 0.25);
+}
+.stButton button:hover, .stDownloadButton button:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 14px 28px rgba(80, 112, 255, 0.3);
+}
+.stSelectbox, .stNumberInput, .stTextInput, .stDateInput, .stSlider {
+  background: transparent;
+}
+input, textarea, select {
+  background: var(--surface-2) !important;
+  color: var(--text) !important;
+  border-radius: 12px !important;
+  border: 1px solid var(--border) !important;
+}
+[data-testid="stDataFrame"] { border-radius: var(--radius); border: 1px solid var(--border); }
 footer { visibility: hidden; }
 </style>
 """,
