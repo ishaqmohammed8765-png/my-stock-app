@@ -693,6 +693,7 @@ def backtest_strategy(
     # Other skip counters (useful for honest diagnostics)
     skipped_qty_amt_zero = 0
     forced_negative_cash_on_exit = 0
+    forced_end_exit = 0
 
     def ts_at(i: int) -> str:
         if 0 <= i < len(df_bt):
@@ -1037,6 +1038,68 @@ def backtest_strategy(
         df_bt.loc[entry_i, "equity"] = float(eq_e)
         df_bt.loc[entry_i, "cash"] = float(cash_e)
 
+    # If still in position, force a final exit at the last bar (prevents hidden open PnL).
+    if in_pos and len(df_bt) > 0:
+        last_i = int(len(df_bt) - 1)
+        last_bar = df_bt.iloc[last_i]
+        last_open = float(last_bar["open"])
+        last_close = float(last_bar["close"])
+        raw_exit = float(last_close if time_exit_price_l == "close" else last_open)
+
+        exit_px_eff = _apply_costs_px(
+            float(raw_exit),
+            "sell",
+            slippage_bps=float(slip_bps),
+            spread_bps=float(spread_bps),
+            spread_mode=spread_mode_l,          # type: ignore[arg-type]
+            fill_type="time",
+        )
+        if np.isfinite(exit_px_eff):
+            forced_end_exit += 1
+            _do_charge("exit")
+
+            eff_qty = int(qty) if enable_position_sizing else 1
+            pnl_per_share = float(exit_px_eff - float(entry_px))
+            pnl = float(pnl_per_share * eff_qty)
+
+            risk_per_share = float(float(entry_px) - float(stop_px))
+            r_mult = float(pnl_per_share / risk_per_share) if risk_per_share > float(min_risk_per_share) else np.nan
+
+            equity_before = float(_equity_at_bar(last_i)[0])
+
+            if use_cash_ledger:
+                cash += float(exit_px_eff) * eff_qty
+            else:
+                equity_base = float(equity_base + pnl)
+
+            in_pos = False
+            exit_i = int(last_i)
+
+            eq_after, cash_after = _equity_at_bar(exit_i)
+            df_bt.loc[exit_i, "equity"] = float(eq_after)
+            df_bt.loc[exit_i, "cash"] = float(cash_after)
+
+            trades.append(
+                {
+                    "entry_i": int(entry_i),
+                    "exit_i": int(exit_i),
+                    "entry_ts": ts_at(entry_i),
+                    "exit_ts": ts_at(exit_i),
+                    "entry_px": float(entry_px),
+                    "exit_px": float(exit_px_eff),
+                    "stop_px": float(stop_px),
+                    "target_px": float(target_px),
+                    "reason": "time",
+                    "bars_held": int(exit_i - entry_i),
+                    "pnl_per_share": float(pnl_per_share),
+                    "r_multiple": float(r_mult) if np.isfinite(r_mult) else np.nan,
+                    "qty": int(eff_qty),
+                    "pnl": float(pnl),
+                    "equity_before": float(equity_before),
+                    "equity_after": float(eq_after),
+                }
+            )
+
     # Final fill-forward (equity/cash)
     df_bt["equity"] = df_bt["equity"].ffill()
     df_bt["cash"] = df_bt["cash"].ffill()
@@ -1071,6 +1134,8 @@ def backtest_strategy(
         warnings.append("Some exits forced cash negative to pay commissions (real brokers would debit your account).")
     if sizing_mode_l == "fixed_amount" and skipped_qty_amt_zero > 0:
         warnings.append("Some signals were skipped because invest_amount was too small to buy 1 share at entry price.")
+    if forced_end_exit > 0:
+        warnings.append("A position was still open at the end of the data; it was closed on the final bar.")
 
     # Summary stats
     assumptions = {
@@ -1109,6 +1174,7 @@ def backtest_strategy(
                 "diagnostics": {
                     "skipped_qty_amt_zero": int(skipped_qty_amt_zero),
                     "forced_negative_cash_on_exit": int(forced_negative_cash_on_exit),
+                    "forced_end_exit": int(forced_end_exit),
                 },
                 "notes_for_beginners": [
                     "No trades were taken. This can happen if filters or gating are strict for this ticker/time period.",
@@ -1151,6 +1217,7 @@ def backtest_strategy(
             "diagnostics": {
                 "skipped_qty_amt_zero": int(skipped_qty_amt_zero),
                 "forced_negative_cash_on_exit": int(forced_negative_cash_on_exit),
+                "forced_end_exit": int(forced_end_exit),
             },
         }
     )

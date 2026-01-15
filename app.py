@@ -122,8 +122,11 @@ def safe_float(x: Any) -> float:
 
 
 def has_alpaca_keys() -> bool:
-    k = str(st.secrets.get("ALPACA_KEY", "")).strip()
-    s = str(st.secrets.get("ALPACA_SECRET", "")).strip()
+    try:
+        k = str(st.secrets.get("ALPACA_KEY", "")).strip()
+        s = str(st.secrets.get("ALPACA_SECRET", "")).strip()
+    except Exception:
+        return False
     return bool(k and s)
 
 
@@ -226,8 +229,11 @@ def df_for_backtest(df_chart: pd.DataFrame) -> pd.DataFrame:
 # =============================================================================
 @st.cache_data(ttl=CACHE_TTL_ALPACA_SEC, show_spinner=False)
 def cached_load_alpaca(symbol: str, force_refresh: int) -> pd.DataFrame:
-    api_key = str(st.secrets.get("ALPACA_KEY", "")).strip()
-    sec_key = str(st.secrets.get("ALPACA_SECRET", "")).strip()
+    try:
+        api_key = str(st.secrets.get("ALPACA_KEY", "")).strip()
+        sec_key = str(st.secrets.get("ALPACA_SECRET", "")).strip()
+    except Exception as exc:
+        raise RuntimeError("Missing Alpaca keys in Streamlit secrets.") from exc
     if not api_key or not sec_key:
         raise RuntimeError("Missing Alpaca keys in Streamlit secrets.")
     df, _dbg = load_historical(symbol, api_key, sec_key, force_refresh=force_refresh)
@@ -1162,6 +1168,12 @@ with tab_backtest:
                 "- **Realistic cash**: ON means the backtest won’t magically buy what you can’t afford.\n"
                 "- **Execution assumptions**: slippage/spread/commission can materially change results."
             )
+
+        warnings = results.get("warnings", [])
+        if warnings:
+            with st.expander("Backtest warnings", expanded=False):
+                for w in warnings:
+                    st.write(f"• {w}")
 
         if isinstance(df_bt, pd.DataFrame) and (not df_bt.empty) and ("equity" in df_bt.columns):
             eq = pd.to_numeric(df_bt["equity"], errors="coerce").dropna()
