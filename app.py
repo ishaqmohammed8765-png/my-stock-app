@@ -33,6 +33,7 @@ APP_CAPTION = "Beginner-friendly signals • charts • backtests (educational, 
 CACHE_TTL_ALPACA_SEC = 15 * 60
 CACHE_TTL_YAHOO_HIST_SEC = 30 * 60
 CACHE_TTL_YAHOO_PRICE_SEC = 30
+CACHE_TTL_YAHOO_NEWS_SEC = 10 * 60
 
 PLOT_TAIL_MIN_BARS = 120
 PLOT_TAIL_DEFAULT_BARS = 700
@@ -334,6 +335,35 @@ def cached_current_price_yahoo(symbol: str) -> Tuple[float, str]:
         pass
 
     return np.nan, "Unavailable"
+
+
+@st.cache_data(ttl=CACHE_TTL_YAHOO_NEWS_SEC, show_spinner=False)
+def cached_news_yahoo(symbol: str) -> list[dict[str, Any]]:
+    if not YF_AVAILABLE:
+        return []
+
+    try:
+        t = yf.Ticker(symbol)
+        items = getattr(t, "news", None)
+        if isinstance(items, list):
+            return items
+    except Exception:
+        return []
+
+    return []
+
+
+def format_news_timestamp(ts: Any) -> str:
+    try:
+        dt = pd.to_datetime(ts, unit="s", utc=True)
+    except Exception:
+        try:
+            dt = pd.to_datetime(ts, utc=True)
+        except Exception:
+            return "Unknown time"
+    if pd.isna(dt):
+        return "Unknown time"
+    return dt.strftime("%Y-%m-%d %H:%M UTC")
 
 
 def load_and_prepare(symbol: str, *, force_refresh: int) -> None:
@@ -832,6 +862,8 @@ ss_init(
         "sizing_ui": "Fixed £ per trade",
         "invest_amount": 25.0,
         "horizon_bars": 20,
+        "show_news": True,
+        "include_news_tone": True,
     }
 )
 
@@ -882,6 +914,9 @@ with st.sidebar:
             help="Used for backtest starting equity. Does not place real trades.",
         )
         mark_to_market = st.toggle("Mark-to-market equity (smoother curve)", value=bool(ss_get("mark_to_market", False)))
+
+    with st.expander("News", expanded=False):
+        show_news = st.toggle("Show news panel", value=bool(ss_get("show_news", True)))
 
     with st.expander("Save / Load Configuration", expanded=False):
         if st.button("Export Settings", use_container_width=True):
@@ -954,6 +989,7 @@ for k, v in {
     "sr_lookback": sr_lookback,
     "account_capital": account_capital,
     "mark_to_market": mark_to_market,
+    "show_news": show_news,
 }.items():
     st.session_state[k] = v
 
@@ -1005,9 +1041,13 @@ support_level, resistance_level = compute_support_resistance(df_chart, int(sr_lo
 # =============================================================================
 # Tabs
 # =============================================================================
-tab_signal, tab_opportunity, tab_charts, tab_backtest = st.tabs(
-    ["✅ Signal", "🚀 Opportunity", "📊 Charts", "🧪 Backtest"]
-)
+tab_labels = ["✅ Signal", "🚀 Opportunity", "📊 Charts", "🧪 Backtest"]
+show_news_tab = bool(ss_get("show_news", True))
+if show_news_tab:
+    tab_labels.append("🗞️ News")
+tabs = st.tabs(tab_labels)
+tab_signal, tab_opportunity, tab_charts, tab_backtest = tabs[:4]
+tab_news = tabs[4] if show_news_tab else None
 
 
 # =============================================================================
@@ -1091,7 +1131,13 @@ with tab_opportunity:
         market_cap_m = st.number_input("Market cap (USD, millions)", min_value=10.0, max_value=20000.0, value=300.0, step=10.0)
         float_m = st.number_input("Float (millions of shares)", min_value=1.0, max_value=2000.0, value=60.0, step=5.0)
         short_interest = st.number_input("Short interest (% of float)", min_value=0.0, max_value=100.0, value=8.0, step=0.5)
-        news_score = st.slider("News tone (subjective)", min_value=-100, max_value=100, value=15, step=5)
+        include_news_tone = st.toggle("Include news tone", value=bool(ss_get("include_news_tone", True)))
+        st.session_state["include_news_tone"] = bool(include_news_tone)
+        if include_news_tone:
+            news_score = st.slider("News tone (subjective)", min_value=-100, max_value=100, value=15, step=5)
+        else:
+            news_score = 0
+            st.caption("News tone set to neutral.")
         catalyst_days = st.number_input(
             "Next catalyst in (days)",
             min_value=1,
@@ -1272,7 +1318,7 @@ with tab_backtest:
         st.markdown("**Execution assumptions (affects results)**")
         a, b, c = st.columns(3)
         a.metric("Slippage", f"{DEFAULT_SLIPPAGE_BPS:.1f} bps")
-        b.metric("Spread", f"{DEFAULT_SPREAD_BPS:.1f} bps" if True else "—")
+        b.metric("Spread", f"{DEFAULT_SPREAD_BPS:.1f} bps")
         c.metric("Commission", f"£{DEFAULT_COMMISSION:.2f} / order")
         st.caption("These are simplified costs. Real fills can be better or worse depending on liquidity and volatility.")
         st.caption("Probability gating is applied only after an initial in-sample window to reduce look-ahead bias.")
@@ -1433,3 +1479,37 @@ with tab_backtest:
 
         with st.expander("Assumptions", expanded=False):
             st.json(results.get("assumptions", {}))
+
+
+# =============================================================================
+# News tab
+# =============================================================================
+if tab_news is not None:
+    with tab_news:
+        st.subheader(f"{symbol} — News")
+        if not YF_AVAILABLE:
+            st.info("Yahoo news requires the yfinance package.")
+        else:
+            with st.spinner("Loading news..."):
+                items = cached_news_yahoo(symbol)
+
+            if not items:
+                st.info("No news items available right now.")
+            else:
+                for item in items[:15]:
+                    title = str(item.get("title", "Untitled"))
+                    link = item.get("link") or item.get("url")
+                    publisher = item.get("publisher") or item.get("source")
+                    ts = format_news_timestamp(item.get("providerPublishTime"))
+                    summary = str(item.get("summary", "")).strip()
+
+                    header = f"**{title}**"
+                    if link:
+                        header = f"**[{title}]({link})**"
+                    st.markdown(header)
+                    meta_parts = [p for p in [publisher, ts] if p]
+                    if meta_parts:
+                        st.caption(" • ".join(meta_parts))
+                    if summary:
+                        st.write(summary)
+                    st.divider()
