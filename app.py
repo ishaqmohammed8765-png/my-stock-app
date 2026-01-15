@@ -584,6 +584,14 @@ def compute_signal_score(df_ind: pd.DataFrame, rsi_min: float, rsi_max: float, r
     if missing:
         return SignalScore("WAIT", 0, "Indicators not ready.", [f"Missing: {', '.join(missing[:6])}"])
 
+    if "ind_ready" in df_ind.columns and not bool(df_ind["ind_ready"].iloc[-1]):
+        return SignalScore(
+            "WAIT",
+            0,
+            "Waiting for enough history.",
+            ["Indicators not ready (need more bars for stable values)."],
+        )
+
     last = df_ind.iloc[-1]
     close = safe_float(last.get("close"))
     ma50 = safe_float(last.get("ma50"))
@@ -844,6 +852,14 @@ src = st.session_state.get("data_source")
 if src:
     st.caption(f"Data source: **{src}**")
 
+sanity = st.session_state.get("sanity")
+if isinstance(sanity, dict) and sanity.get("warnings"):
+    with st.expander("Data quality checks", expanded=False):
+        for warning in sanity.get("warnings", []):
+            st.write(f"• {warning}")
+        stats = sanity.get("stats", {})
+        if stats:
+            st.caption(f"Rows: {stats.get('rows')} | Start: {stats.get('start')} | End: {stats.get('end')}")
 
 # Precompute S/R once per rerun (used in multiple tabs)
 support_level, resistance_level = compute_support_resistance(df_chart, int(sr_lookback))
@@ -860,6 +876,7 @@ tab_signal, tab_charts, tab_backtest = st.tabs(["✅ Signal", "📊 Charts", "�
 # =============================================================================
 with tab_signal:
     st.subheader(f"{symbol} — Signal")
+    st.caption("Signals require enough history for indicators (early bars may show WAIT).")
 
     latest_px, latest_src = get_latest_price(symbol, df_chart)
     score = compute_signal_score(df_chart, float(rsi_min), float(rsi_max), float(rvol_min), float(vol_max))
@@ -1065,6 +1082,7 @@ with tab_backtest:
         b.metric("Spread", f"{DEFAULT_SPREAD_BPS:.1f} bps" if True else "—")
         c.metric("Commission", f"£{DEFAULT_COMMISSION:.2f} / order")
         st.caption("These are simplified costs. Real fills can be better or worse depending on liquidity and volatility.")
+        st.caption("Probability gating is applied only after an initial in-sample window to reduce look-ahead bias.")
 
     # Build params for your backtester
     bt_params = dict(
