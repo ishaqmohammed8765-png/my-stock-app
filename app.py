@@ -1,10 +1,16 @@
 # app.py
 from __future__ import annotations
 
+import html
 import json
 import logging
+import re
 import time
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, Optional, Tuple
 
 import numpy as np
@@ -34,6 +40,7 @@ CACHE_TTL_ALPACA_SEC = 15 * 60
 CACHE_TTL_YAHOO_HIST_SEC = 30 * 60
 CACHE_TTL_YAHOO_PRICE_SEC = 30
 CACHE_TTL_YAHOO_NEWS_SEC = 10 * 60
+CACHE_TTL_YAHOO_META_SEC = 6 * 60 * 60
 
 PLOT_TAIL_MIN_BARS = 120
 PLOT_TAIL_DEFAULT_BARS = 700
@@ -167,6 +174,13 @@ def safe_float(x: Any) -> float:
         return v if np.isfinite(v) else np.nan
     except Exception:
         return np.nan
+
+
+def parse_watchlist(raw: str) -> list[str]:
+    if not raw:
+        return []
+    parts = re.split(r"[,\s]+", raw.upper().strip())
+    return [p for p in dict.fromkeys(parts) if p]
 
 
 def has_alpaca_keys() -> bool:
@@ -384,20 +398,109 @@ def cached_current_price_yahoo(symbol: str) -> Tuple[float, str]:
     return np.nan, "Unavailable"
 
 
+@st.cache_data(ttl=CACHE_TTL_YAHOO_META_SEC, show_spinner=False)
+def cached_market_cap_yahoo(symbol: str) -> float:
+    if not YF_AVAILABLE:
+        return np.nan
+
+    try:
+        t = yf.Ticker(symbol)
+
+        fi = getattr(t, "fast_info", None)
+        if fi and isinstance(fi, dict):
+            mc = safe_float(fi.get("market_cap") or fi.get("marketCap"))
+            if np.isfinite(mc) and mc > 0:
+                return float(mc)
+
+        info = getattr(t, "info", None)
+        if isinstance(info, dict):
+            mc = safe_float(info.get("marketCap"))
+            if np.isfinite(mc) and mc > 0:
+                return float(mc)
+    except Exception:
+        return np.nan
+
+    return np.nan
+
+
+def _strip_html(text: str) -> str:
+    cleaned = html.unescape(text or "")
+    while "<" in cleaned and ">" in cleaned:
+        start = cleaned.find("<")
+        end = cleaned.find(">", start + 1)
+        if start == -1 or end == -1:
+            break
+        cleaned = cleaned[:start] + cleaned[end + 1 :]
+    return " ".join(cleaned.split())
+
+
+def fetch_yahoo_rss_news(symbol: str) -> list[dict[str, Any]]:
+    if not symbol:
+        return []
+
+    base = "https://feeds.finance.yahoo.com/rss/2.0/headline"
+    query = urllib.parse.urlencode({"s": symbol, "region": "US", "lang": "en-US"})
+    url = f"{base}?{query}"
+
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            raw = resp.read()
+    except Exception:
+        return []
+
+    try:
+        import xml.etree.ElementTree as ET
+
+        root = ET.fromstring(raw)
+    except Exception:
+        return []
+
+    items = []
+    for item in root.findall(".//item"):
+        title = item.findtext("title") or "Untitled"
+        link = item.findtext("link")
+        pub = item.findtext("pubDate")
+        summary = item.findtext("description") or ""
+
+        ts_val: Optional[int] = None
+        if pub:
+            try:
+                dt = parsedate_to_datetime(pub)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                ts_val = int(dt.timestamp())
+            except Exception:
+                ts_val = None
+
+        items.append(
+            {
+                "title": title,
+                "link": link,
+                "publisher": "Yahoo Finance",
+                "providerPublishTime": ts_val,
+                "summary": _strip_html(summary),
+            }
+        )
+
+    return items
+
+
 @st.cache_data(ttl=CACHE_TTL_YAHOO_NEWS_SEC, show_spinner=False)
 def cached_news_yahoo(symbol: str) -> list[dict[str, Any]]:
     if not YF_AVAILABLE:
-        return []
+        return fetch_yahoo_rss_news(symbol)
 
     try:
         t = yf.Ticker(symbol)
         items = getattr(t, "news", None)
         if isinstance(items, list):
-            return items
+            if items:
+                return items
     except Exception:
-        return []
+        return fetch_yahoo_rss_news(symbol)
 
-    return []
+    return fetch_yahoo_rss_news(symbol)
 
 
 def format_news_timestamp(ts: Any) -> str:
@@ -519,6 +622,133 @@ def compute_trade_plan(
         "target": float(target),
         "rr": float(rr) if np.isfinite(rr) else np.nan,
     }
+
+
+def score_breakout_candidate(
+    df_ind: pd.DataFrame,
+    *,
+    lookback: int,
+) -> dict[str, Any]:
+    if df_ind is None or df_ind.empty:
+        return {
+            "score": 0,
+            "label": "Low",
+            "close": np.nan,
+            "rsi": np.nan,
+            "rvol": np.nan,
+            "adx": np.nan,
+            "trend": "Unknown",
+            "dist_to_res_pct": np.nan,
+            "support": np.nan,
+            "resistance": np.nan,
+        }
+
+    last = df_ind.iloc[-1]
+    close = safe_float(last.get("close", np.nan))
+    rsi = safe_float(last.get("rsi14", np.nan))
+    rvol = safe_float(last.get("rvol", np.nan))
+    adx = safe_float(last.get("adx14", np.nan))
+    trend = str(last.get("trend_state", "Unknown"))
+
+    support, resistance = compute_support_resistance(df_ind, lookback)
+    dist_to_res = (resistance - close) / close if np.isfinite(resistance) and np.isfinite(close) and close > 0 else np.nan
+
+    score = 0
+    if trend == "Up":
+        score += 35
+    elif trend == "Mixed":
+        score += 15
+
+    if np.isfinite(dist_to_res):
+        if dist_to_res <= 0.03:
+            score += 25
+        elif dist_to_res <= 0.07:
+            score += 15
+
+    if np.isfinite(rvol) and rvol >= 1.2:
+        score += 15
+
+    if np.isfinite(rsi) and 45 <= rsi <= 70:
+        score += 15
+
+    if np.isfinite(adx) and adx >= 20:
+        score += 10
+
+    if score >= 70:
+        label = "Breakout"
+    elif score >= 50:
+        label = "Watch"
+    else:
+        label = "Low"
+
+    return {
+        "score": int(score),
+        "label": label,
+        "close": close,
+        "rsi": rsi,
+        "rvol": rvol,
+        "adx": adx,
+        "trend": trend,
+        "dist_to_res_pct": dist_to_res * 100 if np.isfinite(dist_to_res) else np.nan,
+        "support": support,
+        "resistance": resistance,
+    }
+
+
+@st.cache_data(ttl=15 * 60, show_spinner=False)
+def screen_breakout_watchlist(
+    symbols: tuple[str, ...],
+    *,
+    max_market_cap_b: float,
+    lookback: int,
+) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    if not symbols or not YF_AVAILABLE:
+        return pd.DataFrame(rows)
+
+    max_market_cap = float(max_market_cap_b) * 1e9
+
+    for sym in symbols:
+        try:
+            df = cached_load_yahoo(sym, period="1y", interval="1d")
+        except Exception:
+            continue
+
+        if df is None or df.empty:
+            continue
+
+        df = ensure_ohlcv_cols(df)
+        df = coerce_ohlcv_numeric(df)
+        try:
+            add_indicators_inplace(df)
+        except Exception:
+            continue
+
+        mc = cached_market_cap_yahoo(sym)
+        if np.isfinite(mc) and mc > max_market_cap:
+            continue
+
+        metrics = score_breakout_candidate(df, lookback=lookback)
+        rows.append(
+            {
+                "Symbol": sym,
+                "Market Cap (B)": (mc / 1e9) if np.isfinite(mc) else np.nan,
+                "Close": metrics["close"],
+                "To Resistance (%)": metrics["dist_to_res_pct"],
+                "RSI(14)": metrics["rsi"],
+                "RVOL": metrics["rvol"],
+                "ADX(14)": metrics["adx"],
+                "Trend": metrics["trend"],
+                "Score": metrics["score"],
+                "Label": metrics["label"],
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame(rows)
+
+    df_out = pd.DataFrame(rows)
+    return df_out.sort_values(by=["Score", "Symbol"], ascending=[False, True]).reset_index(drop=True)
 
 
 # =============================================================================
@@ -911,6 +1141,10 @@ ss_init(
         "horizon_bars": 20,
         "show_news": True,
         "include_news_tone": True,
+        "op_watchlist": "SOFI, PLTR, IONQ, RKLB, LCID",
+        "op_max_mcap_b": 2.0,
+        "op_sr_lookback": 60,
+        "op_scan_results": None,
     }
 )
 
@@ -1170,11 +1404,71 @@ with tab_signal:
 # =============================================================================
 with tab_opportunity:
     st.subheader(f"{symbol} — Opportunity radar")
-    st.caption("Blend of small-cap fundamentals, news tone, and momentum. Educational only, not financial advice.")
+    st.caption("Small-cap breakout ideas plus a single-stock opportunity score. Educational only, not financial advice.")
+
+    st.markdown("### Small-cap breakout watchlist")
+    wbox = st.container(border=True)
+    with wbox:
+        w1, w2, w3 = st.columns([2.2, 1, 1], gap="large")
+        with w1:
+            watchlist_raw = st.text_area(
+                "Watchlist tickers (comma-separated)",
+                value=str(ss_get("op_watchlist", "")),
+                height=90,
+                placeholder="SOFI, PLTR, IONQ, RKLB",
+            )
+        with w2:
+            max_market_cap_b = st.number_input(
+                "Max market cap (USD, billions)",
+                min_value=0.1,
+                max_value=50.0,
+                value=float(ss_get("op_max_mcap_b", 2.0)),
+                step=0.1,
+            )
+            lookback = st.number_input(
+                "S/R lookback (bars)",
+                min_value=20,
+                max_value=200,
+                value=int(ss_get("op_sr_lookback", 60)),
+                step=5,
+            )
+        with w3:
+            scan_btn = st.button("Scan watchlist", use_container_width=True)
+
+    st.session_state["op_watchlist"] = watchlist_raw
+    st.session_state["op_max_mcap_b"] = float(max_market_cap_b)
+    st.session_state["op_sr_lookback"] = int(lookback)
+
+    symbols = tuple(parse_watchlist(watchlist_raw))
+    if not YF_AVAILABLE:
+        st.info("Watchlist scan requires the yfinance package.")
+    elif scan_btn:
+        if not symbols:
+            st.session_state["op_scan_results"] = None
+        else:
+            with st.spinner("Scanning watchlist..."):
+                st.session_state["op_scan_results"] = screen_breakout_watchlist(
+                    symbols,
+                    max_market_cap_b=float(max_market_cap_b),
+                    lookback=int(lookback),
+                )
+
+    results_df = st.session_state.get("op_scan_results")
+    if not symbols:
+        st.info("Add a few tickers above, then click **Scan watchlist**.")
+    elif results_df is None:
+        st.info("Click **Scan watchlist** to see small-cap breakout candidates.")
+    elif results_df.empty:
+        st.warning("No symbols met the small-cap filter or had enough data.")
+    else:
+        st.dataframe(results_df, use_container_width=True, height=360)
+        st.caption("Scores favor uptrends, strong relative volume, and prices near resistance.")
+
+    st.divider()
 
     left, right = st.columns([1.1, 1], gap="large")
     with left:
-        st.markdown("### Inputs")
+        st.markdown("### Single-stock inputs")
         market_cap_m = st.number_input("Market cap (USD, millions)", min_value=10.0, max_value=20000.0, value=300.0, step=10.0)
         float_m = st.number_input("Float (millions of shares)", min_value=1.0, max_value=2000.0, value=60.0, step=5.0)
         short_interest = st.number_input("Short interest (% of float)", min_value=0.0, max_value=100.0, value=8.0, step=0.5)
