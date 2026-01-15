@@ -24,8 +24,13 @@ SizingMode = Literal["percent", "fixed_amount"]
 # =============================================================================
 
 def fill_limit_buy(open_px: float, low_px: float, limit_px: float) -> Optional[float]:
-    """Limit buy fills if bar low trades through limit. Fill assumed at limit price."""
-    return float(limit_px) if float(low_px) <= float(limit_px) else None
+    """
+    Limit buy fills if bar low trades through limit.
+    If gap down below limit, assume fill at open (better price); else at limit.
+    """
+    if float(low_px) <= float(limit_px):
+        return float(open_px) if float(open_px) < float(limit_px) else float(limit_px)
+    return None
 
 
 def fill_stop_buy(open_px: float, high_px: float, stop_px: float) -> Optional[float]:
@@ -39,8 +44,13 @@ def fill_stop_buy(open_px: float, high_px: float, stop_px: float) -> Optional[fl
 
 
 def fill_limit_sell(open_px: float, high_px: float, limit_px: float) -> Optional[float]:
-    """Limit sell fills if bar high trades through limit. Fill assumed at limit price."""
-    return float(limit_px) if float(high_px) >= float(limit_px) else None
+    """
+    Limit sell fills if bar high trades through limit.
+    If gap up above limit, assume fill at open (better price); else at limit.
+    """
+    if float(high_px) >= float(limit_px):
+        return float(open_px) if float(open_px) > float(limit_px) else float(limit_px)
+    return None
 
 
 def fill_stop_sell(open_px: float, low_px: float, stop_px: float) -> Optional[float]:
