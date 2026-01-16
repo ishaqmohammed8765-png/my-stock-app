@@ -529,6 +529,48 @@ def fetch_yahoo_rss_news(symbol: str) -> list[dict[str, Any]]:
     return items
 
 
+def _normalize_news_items(items: list[Any]) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, Mapping):
+            continue
+
+        title = item.get("title") or item.get("headline") or item.get("name")
+        link = item.get("link") or item.get("url")
+        publisher = item.get("publisher") or item.get("source")
+        summary = item.get("summary") or item.get("description") or ""
+        ts_val = item.get("providerPublishTime") or item.get("pubDate")
+
+        content = item.get("content")
+        if isinstance(content, Mapping):
+            title = title or content.get("title") or content.get("headline")
+            link = link or content.get("canonicalUrl") or content.get("url")
+            publisher = publisher or content.get("provider") or content.get("source")
+            summary = summary or content.get("summary") or content.get("description") or ""
+            ts_val = ts_val or content.get("providerPublishTime") or content.get("pubDate")
+
+        if isinstance(link, Mapping):
+            link = link.get("url") or link.get("href")
+        elif isinstance(link, list):
+            link = next((entry for entry in link if isinstance(entry, str)), None)
+
+        title_text = str(title or "").strip()
+        if not title_text:
+            continue
+
+        normalized.append(
+            {
+                "title": title_text,
+                "link": link,
+                "publisher": publisher,
+                "providerPublishTime": ts_val,
+                "summary": _strip_html(str(summary or "")),
+            }
+        )
+
+    return normalized
+
+
 @st.cache_data(ttl=CACHE_TTL_YAHOO_NEWS_SEC, show_spinner=False)
 def cached_news_yahoo(symbol: str) -> list[dict[str, Any]]:
     if not YF_AVAILABLE:
@@ -538,8 +580,9 @@ def cached_news_yahoo(symbol: str) -> list[dict[str, Any]]:
         t = yf.Ticker(symbol)
         items = getattr(t, "news", None)
         if isinstance(items, list):
-            if items:
-                return items
+            normalized = _normalize_news_items(items)
+            if normalized:
+                return normalized
     except Exception:
         return fetch_yahoo_rss_news(symbol)
 
@@ -548,7 +591,11 @@ def cached_news_yahoo(symbol: str) -> list[dict[str, Any]]:
 
 def format_news_timestamp(ts: Any) -> str:
     try:
-        dt = pd.to_datetime(ts, unit="s", utc=True)
+        if isinstance(ts, (int, float)):
+            unit = "ms" if ts > 10**12 else "s"
+            dt = pd.to_datetime(ts, unit=unit, utc=True)
+        else:
+            dt = pd.to_datetime(ts, unit="s", utc=True)
     except Exception:
         try:
             dt = pd.to_datetime(ts, utc=True)
@@ -1516,103 +1563,54 @@ with tab_opportunity:
 
     st.divider()
 
-    left, right = st.columns([1.1, 1], gap="large")
-    with left:
-        st.markdown("### Quick inputs")
-        market_cap_default = float(ss_get("op_market_cap_m", 300.0))
-        if YF_AVAILABLE:
-            mc_est = cached_market_cap_yahoo(symbol)
-            if np.isfinite(mc_est):
-                market_cap_default = float(mc_est / 1e6)
+    market_cap_m = float(ss_get("op_market_cap_m", 300.0))
+    if YF_AVAILABLE:
+        mc_est = cached_market_cap_yahoo(symbol)
+        if np.isfinite(mc_est):
+            market_cap_m = float(mc_est / 1e6)
 
-        st.metric("Market cap (est.)", f"{market_cap_default:,.0f}M" if np.isfinite(market_cap_default) else "—")
-        short_interest = st.slider(
-            "Short interest (%)",
-            min_value=0.0,
-            max_value=100.0,
-            value=float(ss_get("op_short_interest", 8.0)),
-            step=0.5,
-        )
-        catalyst_days = st.number_input(
-            "Next catalyst (days)",
-            min_value=1,
-            max_value=365,
-            value=int(ss_get("op_catalyst_days", 30)),
-            step=1,
-        )
-        with st.expander("Optional inputs", expanded=False):
-            market_cap_min = 10.0
-            market_cap_max = max(20000.0, market_cap_default)
-            market_cap_value = float(np.clip(market_cap_default, market_cap_min, market_cap_max))
-            market_cap_m = st.number_input(
-                "Market cap (USD, millions)",
-                min_value=market_cap_min,
-                max_value=market_cap_max,
-                value=market_cap_value,
-                step=10.0,
-            )
-            float_m = st.number_input(
-                "Float (millions of shares)",
-                min_value=1.0,
-                max_value=2000.0,
-                value=float(ss_get("op_float_m", 60.0)),
-                step=5.0,
-            )
-            include_news_tone = st.toggle("Include news tone", value=bool(ss_get("include_news_tone", True)))
-            st.session_state["include_news_tone"] = bool(include_news_tone)
-            if include_news_tone:
-                news_score = st.slider(
-                    "News tone (subjective)",
-                    min_value=-100,
-                    max_value=100,
-                    value=int(ss_get("op_news_score", 15)),
-                    step=5,
-                )
-            else:
-                news_score = 0
-                st.caption("News tone set to neutral.")
+    float_m = float(ss_get("op_float_m", 60.0))
+    short_interest = float(ss_get("op_short_interest", 8.0))
+    catalyst_days = int(ss_get("op_catalyst_days", 30))
+    include_news_tone = bool(ss_get("include_news_tone", True))
+    news_score = int(ss_get("op_news_score", 15)) if include_news_tone else 0
 
-        if "market_cap_m" not in locals():
-            market_cap_m = market_cap_default
-        if "float_m" not in locals():
-            float_m = float(ss_get("op_float_m", 60.0))
-        if "news_score" not in locals():
-            news_score = int(ss_get("op_news_score", 15))
+    st.markdown("### Opportunity score")
+    opp = compute_opportunity_score(
+        df_chart,
+        news_score=int(news_score),
+        market_cap_m=float(market_cap_m),
+        float_m=float(float_m),
+        short_interest=float(short_interest),
+        catalyst_days=int(catalyst_days),
+    )
 
-        st.session_state["op_market_cap_m"] = float(market_cap_m)
-        st.session_state["op_float_m"] = float(float_m)
-        st.session_state["op_short_interest"] = float(short_interest)
-        st.session_state["op_catalyst_days"] = int(catalyst_days)
-        st.session_state["op_news_score"] = int(news_score)
+    badge = st.container(border=True)
+    with badge:
+        if opp.label == "HIGH":
+            st.success(f"**HIGH** • Score {opp.score}/100")
+        elif opp.label == "WATCH":
+            st.warning(f"**WATCH** • Score {opp.score}/100")
+        else:
+            st.info(f"**LOW** • Score {opp.score}/100")
+        st.caption(opp.summary)
 
-    with right:
-        st.markdown("### Opportunity score")
-        opp = compute_opportunity_score(
-            df_chart,
-            news_score=int(news_score),
-            market_cap_m=float(market_cap_m),
-            float_m=float(float_m),
-            short_interest=float(short_interest),
-            catalyst_days=int(catalyst_days),
-        )
+    st.metric("Estimated timeframe", opp.timeframe)
+    st.caption("Shorter timeframes imply higher volatility and higher risk.")
 
-        badge = st.container(border=True)
-        with badge:
-            if opp.label == "HIGH":
-                st.success(f"**HIGH** • Score {opp.score}/100")
-            elif opp.label == "WATCH":
-                st.warning(f"**WATCH** • Score {opp.score}/100")
-            else:
-                st.info(f"**LOW** • Score {opp.score}/100")
-            st.caption(opp.summary)
+    with st.expander("Score assumptions", expanded=False):
+        st.write(f"• Market cap (est.): {market_cap_m:,.0f}M")
+        st.write(f"• Float: {float_m:,.0f}M shares")
+        st.write(f"• Short interest: {short_interest:.1f}%")
+        st.write(f"• Next catalyst: {catalyst_days} days")
+        st.write(f"• News tone included: {'Yes' if include_news_tone else 'No'}")
+        if include_news_tone:
+            st.write(f"• News tone score: {news_score}")
 
-        st.metric("Estimated timeframe", opp.timeframe)
-        st.caption("Shorter timeframes imply higher volatility and higher risk.")
-
-        with st.expander("Why this score?", expanded=False):
-            for r in opp.reasons[:12]:
-                st.write(f"• {r}")
-            st.caption("Opportunity scores are heuristic and do not guarantee outcomes.")
+    with st.expander("Why this score?", expanded=False):
+        for r in opp.reasons[:12]:
+            st.write(f"• {r}")
+        st.caption("Opportunity scores are heuristic and do not guarantee outcomes.")
 
 
 # =============================================================================
@@ -1930,6 +1928,7 @@ if tab_news is not None:
             with st.spinner("Loading news..."):
                 items = cached_news_yahoo(symbol)
 
+            items = _normalize_news_items(items) if items else []
             if not items:
                 st.info("No news items available right now.")
             else:
