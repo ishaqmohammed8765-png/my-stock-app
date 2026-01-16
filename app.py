@@ -9,6 +9,7 @@ import re
 import time
 import urllib.parse
 import urllib.request
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import timezone
 from email.utils import parsedate_to_datetime
@@ -402,8 +403,15 @@ def cached_current_price_yahoo(symbol: str) -> Tuple[float, str]:
         t = yf.Ticker(symbol)
 
         fi = getattr(t, "fast_info", None)
-        if fi and isinstance(fi, dict):
-            px = fi.get("last_price") or fi.get("lastPrice") or fi.get("regularMarketPrice")
+        if fi:
+            px = None
+            if isinstance(fi, Mapping):
+                px = fi.get("last_price") or fi.get("lastPrice") or fi.get("regularMarketPrice")
+            else:
+                for key in ("last_price", "lastPrice", "regularMarketPrice"):
+                    if hasattr(fi, key):
+                        px = getattr(fi, key)
+                        break
             px = safe_float(px)
             if np.isfinite(px) and px > 0:
                 return float(px), "Yahoo (fast_info, may be delayed)"
@@ -434,8 +442,16 @@ def cached_market_cap_yahoo(symbol: str) -> float:
         t = yf.Ticker(symbol)
 
         fi = getattr(t, "fast_info", None)
-        if fi and isinstance(fi, dict):
-            mc = safe_float(fi.get("market_cap") or fi.get("marketCap"))
+        if fi:
+            mc = None
+            if isinstance(fi, Mapping):
+                mc = fi.get("market_cap") or fi.get("marketCap")
+            else:
+                for key in ("market_cap", "marketCap"):
+                    if hasattr(fi, key):
+                        mc = getattr(fi, key)
+                        break
+            mc = safe_float(mc)
             if np.isfinite(mc) and mc > 0:
                 return float(mc)
 
