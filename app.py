@@ -1541,11 +1541,14 @@ with tab_opportunity:
             step=1,
         )
         with st.expander("Optional inputs", expanded=False):
+            market_cap_min = 10.0
+            market_cap_max = max(20000.0, market_cap_default)
+            market_cap_value = float(np.clip(market_cap_default, market_cap_min, market_cap_max))
             market_cap_m = st.number_input(
                 "Market cap (USD, millions)",
-                min_value=10.0,
-                max_value=20000.0,
-                value=market_cap_default,
+                min_value=market_cap_min,
+                max_value=market_cap_max,
+                value=market_cap_value,
                 step=10.0,
             )
             float_m = st.number_input(
