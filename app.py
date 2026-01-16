@@ -1564,16 +1564,90 @@ with tab_opportunity:
     st.divider()
 
     market_cap_m = float(ss_get("op_market_cap_m", 300.0))
-    if YF_AVAILABLE:
+    market_cap_hint = None
+    if YF_AVAILABLE and "op_market_cap_m" not in st.session_state:
         mc_est = cached_market_cap_yahoo(symbol)
         if np.isfinite(mc_est):
             market_cap_m = float(mc_est / 1e6)
+            market_cap_hint = "Auto-filled from Yahoo Finance."
 
     float_m = float(ss_get("op_float_m", 60.0))
     short_interest = float(ss_get("op_short_interest", 8.0))
     catalyst_days = int(ss_get("op_catalyst_days", 30))
     include_news_tone = bool(ss_get("include_news_tone", True))
     news_score = int(ss_get("op_news_score", 15)) if include_news_tone else 0
+
+    with st.expander("Adjust opportunity assumptions", expanded=False):
+        c1, c2 = st.columns(2)
+        market_cap_max = max(1_000_000.0, market_cap_m * 1.2)
+        market_cap_value = min(max(market_cap_m, 1.0), market_cap_max)
+        with c1:
+            market_cap_m = st.number_input(
+                "Market cap (USD, millions)",
+                min_value=1.0,
+                max_value=float(market_cap_max),
+                value=float(market_cap_value),
+                step=10.0,
+                format="%.0f",
+                help="Used in the opportunity score model.",
+            )
+            if market_cap_hint:
+                st.caption(market_cap_hint)
+            st.session_state["op_market_cap_m"] = float(market_cap_m)
+
+            float_max = max(100_000.0, float_m * 1.2)
+            float_value = min(max(float_m, 1.0), float_max)
+            float_m = st.number_input(
+                "Float (millions of shares)",
+                min_value=1.0,
+                max_value=float(float_max),
+                value=float(float_value),
+                step=5.0,
+                format="%.0f",
+            )
+            st.session_state["op_float_m"] = float(float_m)
+
+        with c2:
+            short_interest_max = max(100.0, short_interest * 1.2)
+            short_interest_value = min(max(short_interest, 0.0), short_interest_max)
+            short_interest = st.number_input(
+                "Short interest (%)",
+                min_value=0.0,
+                max_value=float(short_interest_max),
+                value=float(short_interest_value),
+                step=0.5,
+                format="%.1f",
+            )
+            st.session_state["op_short_interest"] = float(short_interest)
+
+            catalyst_max = max(365, catalyst_days)
+            catalyst_value = min(max(catalyst_days, 1), catalyst_max)
+            catalyst_days = st.number_input(
+                "Next catalyst (days)",
+                min_value=1,
+                max_value=int(catalyst_max),
+                value=int(catalyst_value),
+                step=1,
+            )
+            st.session_state["op_catalyst_days"] = int(catalyst_days)
+
+            include_news_tone = st.toggle("Include news tone", value=include_news_tone)
+            st.session_state["include_news_tone"] = bool(include_news_tone)
+
+            if include_news_tone:
+                news_score_value = int(news_score)
+                news_max = max(100, news_score_value)
+                news_score = st.number_input(
+                    "News tone score",
+                    min_value=0,
+                    max_value=int(news_max),
+                    value=int(news_score_value),
+                    step=1,
+                )
+                st.session_state["op_news_score"] = int(news_score)
+            else:
+                news_score = 0
+                st.session_state["op_news_score"] = int(news_score)
 
     st.markdown("### Opportunity score")
     opp = compute_opportunity_score(
