@@ -4,6 +4,7 @@ from __future__ import annotations
 import html
 import json
 import logging
+import random
 import re
 import time
 import urllib.parse
@@ -72,6 +73,32 @@ DEFAULT_PROB_IS_FRAC = 0.85
 DEFAULT_PROB_MIN = 0.50
 DEFAULT_MIN_BUCKET_TRADES = 6
 DEFAULT_MIN_AVG_R = -0.05
+
+DEFAULT_OP_MAX_MCAP_B = 5.0
+DEFAULT_OP_SR_LOOKBACK = 60
+
+SMALL_CAP_POOL = [
+    "SOFI",
+    "PLTR",
+    "IONQ",
+    "RKLB",
+    "SOUN",
+    "BBAI",
+    "RUN",
+    "BLNK",
+    "FUBO",
+    "UPST",
+    "ASTS",
+    "MARA",
+    "RIOT",
+    "LCID",
+    "FSLY",
+    "HUT",
+    "TLRY",
+    "JOBY",
+    "DNMR",
+    "CLSK",
+]
 
 
 # =============================================================================
@@ -751,6 +778,23 @@ def screen_breakout_watchlist(
     return df_out.sort_values(by=["Score", "Symbol"], ascending=[False, True]).reset_index(drop=True)
 
 
+def pick_random_breakout_idea(
+    symbols: list[str],
+    *,
+    max_market_cap_b: float,
+    lookback: int,
+) -> tuple[Optional[str], Optional[dict[str, Any]]]:
+    results = screen_breakout_watchlist(tuple(symbols), max_market_cap_b=max_market_cap_b, lookback=lookback)
+    if results is None or results.empty:
+        return None, None
+
+    candidates = results[results["Label"].isin(["Breakout", "Watch"])]
+    source = candidates if not candidates.empty else results
+    pick_symbol = random.choice(source["Symbol"].tolist())
+    pick_row = source.loc[source["Symbol"] == pick_symbol].iloc[0].to_dict()
+    return pick_symbol, pick_row
+
+
 # =============================================================================
 # Plots
 # =============================================================================
@@ -1404,90 +1448,123 @@ with tab_signal:
 # =============================================================================
 with tab_opportunity:
     st.subheader(f"{symbol} — Opportunity radar")
-    st.caption("Small-cap breakout ideas plus a single-stock opportunity score. Educational only, not financial advice.")
+    st.caption("One random small-cap breakout idea plus a quick opportunity score.")
 
-    st.markdown("### Small-cap breakout watchlist")
-    wbox = st.container(border=True)
-    with wbox:
-        w1, w2, w3 = st.columns([2.2, 1, 1], gap="large")
-        with w1:
-            watchlist_raw = st.text_area(
-                "Watchlist tickers (comma-separated)",
-                value=str(ss_get("op_watchlist", "")),
-                height=90,
-                placeholder="SOFI, PLTR, IONQ, RKLB",
-            )
-        with w2:
-            max_market_cap_b = st.number_input(
-                "Max market cap (USD, billions)",
-                min_value=0.1,
-                max_value=50.0,
-                value=float(ss_get("op_max_mcap_b", 2.0)),
-                step=0.1,
-            )
-            lookback = st.number_input(
-                "S/R lookback (bars)",
-                min_value=20,
-                max_value=200,
-                value=int(ss_get("op_sr_lookback", 60)),
-                step=5,
-            )
-        with w3:
-            scan_btn = st.button("Scan watchlist", use_container_width=True)
-
-    st.session_state["op_watchlist"] = watchlist_raw
-    st.session_state["op_max_mcap_b"] = float(max_market_cap_b)
-    st.session_state["op_sr_lookback"] = int(lookback)
-
-    symbols = tuple(parse_watchlist(watchlist_raw))
+    st.markdown("### Random breakout idea")
+    pick_btn = st.button("New random idea", use_container_width=True)
     if not YF_AVAILABLE:
-        st.info("Watchlist scan requires the yfinance package.")
-    elif scan_btn:
-        if not symbols:
-            st.session_state["op_scan_results"] = None
-        else:
-            with st.spinner("Scanning watchlist..."):
-                st.session_state["op_scan_results"] = screen_breakout_watchlist(
-                    symbols,
-                    max_market_cap_b=float(max_market_cap_b),
-                    lookback=int(lookback),
-                )
-
-    results_df = st.session_state.get("op_scan_results")
-    if not symbols:
-        st.info("Add a few tickers above, then click **Scan watchlist**.")
-    elif results_df is None:
-        st.info("Click **Scan watchlist** to see small-cap breakout candidates.")
-    elif results_df.empty:
-        st.warning("No symbols met the small-cap filter or had enough data.")
+        st.info("Random breakout ideas need the yfinance package.")
     else:
-        st.dataframe(results_df, use_container_width=True, height=360)
-        st.caption("Scores favor uptrends, strong relative volume, and prices near resistance.")
+        if pick_btn or not st.session_state.get("op_pick_symbol"):
+            pick_symbol, pick_row = pick_random_breakout_idea(
+                SMALL_CAP_POOL,
+                max_market_cap_b=DEFAULT_OP_MAX_MCAP_B,
+                lookback=DEFAULT_OP_SR_LOOKBACK,
+            )
+            st.session_state["op_pick_symbol"] = pick_symbol
+            st.session_state["op_pick_row"] = pick_row
+
+        pick_symbol = st.session_state.get("op_pick_symbol")
+        pick_row = st.session_state.get("op_pick_row") or {}
+        if not pick_symbol or not pick_row:
+            st.warning("No eligible breakout ideas found right now. Try again later.")
+        else:
+            label = str(pick_row.get("Label", "Low"))
+            score = int(pick_row.get("Score", 0))
+            badge = st.container(border=True)
+            with badge:
+                if label == "Breakout":
+                    st.success(f"**{pick_symbol}** • Breakout candidate • Score {score}/100")
+                elif label == "Watch":
+                    st.warning(f"**{pick_symbol}** • Watchlist candidate • Score {score}/100")
+                else:
+                    st.info(f"**{pick_symbol}** • Low momentum • Score {score}/100")
+
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Trend", pick_row.get("Trend", "—"))
+                dist = safe_float(pick_row.get("To Resistance (%)"))
+                c2.metric("To resistance", f"{dist:.1f}%" if np.isfinite(dist) else "—")
+                close = safe_float(pick_row.get("Close"))
+                c3.metric("Last close", f"{close:.2f}" if np.isfinite(close) else "—")
+                rsi = safe_float(pick_row.get("RSI(14)"))
+                c4.metric("RSI", f"{rsi:.0f}" if np.isfinite(rsi) else "—")
+
+                rvol = safe_float(pick_row.get("RVOL"))
+                adx = safe_float(pick_row.get("ADX(14)"))
+                st.caption(
+                    "Quick read: "
+                    f"RVOL {rvol:.2f} • ADX {adx:.0f}"
+                    if np.isfinite(rvol) and np.isfinite(adx)
+                    else "Quick read: RVOL — • ADX —"
+                )
 
     st.divider()
 
     left, right = st.columns([1.1, 1], gap="large")
     with left:
-        st.markdown("### Single-stock inputs")
-        market_cap_m = st.number_input("Market cap (USD, millions)", min_value=10.0, max_value=20000.0, value=300.0, step=10.0)
-        float_m = st.number_input("Float (millions of shares)", min_value=1.0, max_value=2000.0, value=60.0, step=5.0)
-        short_interest = st.number_input("Short interest (% of float)", min_value=0.0, max_value=100.0, value=8.0, step=0.5)
-        include_news_tone = st.toggle("Include news tone", value=bool(ss_get("include_news_tone", True)))
-        st.session_state["include_news_tone"] = bool(include_news_tone)
-        if include_news_tone:
-            news_score = st.slider("News tone (subjective)", min_value=-100, max_value=100, value=15, step=5)
-        else:
-            news_score = 0
-            st.caption("News tone set to neutral.")
+        st.markdown("### Quick inputs")
+        market_cap_default = float(ss_get("op_market_cap_m", 300.0))
+        if YF_AVAILABLE:
+            mc_est = cached_market_cap_yahoo(symbol)
+            if np.isfinite(mc_est):
+                market_cap_default = float(mc_est / 1e6)
+
+        st.metric("Market cap (est.)", f"{market_cap_default:,.0f}M" if np.isfinite(market_cap_default) else "—")
+        short_interest = st.slider(
+            "Short interest (%)",
+            min_value=0.0,
+            max_value=100.0,
+            value=float(ss_get("op_short_interest", 8.0)),
+            step=0.5,
+        )
         catalyst_days = st.number_input(
-            "Next catalyst in (days)",
+            "Next catalyst (days)",
             min_value=1,
             max_value=365,
-            value=30,
+            value=int(ss_get("op_catalyst_days", 30)),
             step=1,
-            help="Earnings, product launch, FDA decision, contract award, etc.",
         )
-        st.caption("Tip: use estimates from filings, reputable news, or your broker's data.")
+        with st.expander("Optional inputs", expanded=False):
+            market_cap_m = st.number_input(
+                "Market cap (USD, millions)",
+                min_value=10.0,
+                max_value=20000.0,
+                value=market_cap_default,
+                step=10.0,
+            )
+            float_m = st.number_input(
+                "Float (millions of shares)",
+                min_value=1.0,
+                max_value=2000.0,
+                value=float(ss_get("op_float_m", 60.0)),
+                step=5.0,
+            )
+            include_news_tone = st.toggle("Include news tone", value=bool(ss_get("include_news_tone", True)))
+            st.session_state["include_news_tone"] = bool(include_news_tone)
+            if include_news_tone:
+                news_score = st.slider(
+                    "News tone (subjective)",
+                    min_value=-100,
+                    max_value=100,
+                    value=int(ss_get("op_news_score", 15)),
+                    step=5,
+                )
+            else:
+                news_score = 0
+                st.caption("News tone set to neutral.")
+
+        if "market_cap_m" not in locals():
+            market_cap_m = market_cap_default
+        if "float_m" not in locals():
+            float_m = float(ss_get("op_float_m", 60.0))
+        if "news_score" not in locals():
+            news_score = int(ss_get("op_news_score", 15))
+
+        st.session_state["op_market_cap_m"] = float(market_cap_m)
+        st.session_state["op_float_m"] = float(float_m)
+        st.session_state["op_short_interest"] = float(short_interest)
+        st.session_state["op_catalyst_days"] = int(catalyst_days)
+        st.session_state["op_news_score"] = int(news_score)
 
     with right:
         st.markdown("### Opportunity score")
