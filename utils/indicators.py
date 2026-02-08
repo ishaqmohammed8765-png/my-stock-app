@@ -104,6 +104,27 @@ def adx_wilder(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 
     return adx.clip(lower=0.0, upper=100.0)
 
 
+def macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """MACD line, signal line, and histogram."""
+    c = _fs(close, name="close")
+    ema_fast = c.ewm(span=fast, adjust=False, min_periods=fast).mean()
+    ema_slow = c.ewm(span=slow, adjust=False, min_periods=slow).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False, min_periods=signal).mean()
+    histogram = macd_line - signal_line
+    return macd_line, signal_line, histogram
+
+
+def bollinger_bands(close: pd.Series, period: int = 20, num_std: float = 2.0) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """Upper band, middle (SMA), lower band."""
+    c = _fs(close, name="close")
+    middle = c.rolling(period, min_periods=period).mean()
+    std = c.rolling(period, min_periods=period).std()
+    upper = middle + num_std * std
+    lower = middle - num_std * std
+    return upper, middle, lower
+
+
 def add_indicators_inplace(
     df: pd.DataFrame,
     *,
@@ -174,6 +195,18 @@ def add_indicators_inplace(
     adxp = int(params.adx_period)
     df[f"adx{adxp}"] = adx_wilder(h, l, c, adxp)
     df["adx14"] = df[f"adx{adxp}"] if adxp == 14 else adx_wilder(h, l, c, 14)
+
+    # MACD
+    macd_line, macd_signal, macd_hist = macd(c, fast=12, slow=26, signal=9)
+    df["macd"] = macd_line
+    df["macd_signal"] = macd_signal
+    df["macd_hist"] = macd_hist
+
+    # Bollinger Bands
+    bb_upper, bb_middle, bb_lower = bollinger_bands(c, period=20, num_std=2.0)
+    df["bb_upper"] = bb_upper
+    df["bb_middle"] = bb_middle
+    df["bb_lower"] = bb_lower
 
     # Extras
     df["atr_pct"] = (df["atr14"] / c.replace(0.0, np.nan)).clip(lower=0.0)

@@ -208,7 +208,14 @@ def parse_watchlist(raw: str) -> list[str]:
     if not raw:
         return []
     parts = re.split(r"[,\s]+", raw.upper().strip())
-    return [p for p in dict.fromkeys(parts) if p]
+    return [p for p in dict.fromkeys(parts) if p and is_valid_ticker(p)]
+
+
+def is_valid_ticker(symbol: str) -> bool:
+    """Basic ticker validation: 1-5 uppercase letters, optionally with a dot (e.g. BRK.B)."""
+    if not symbol:
+        return False
+    return bool(re.fullmatch(r"[A-Z]{1,5}(\.[A-Z]{1,2})?", symbol.upper().strip()))
 
 
 def has_alpaca_keys() -> bool:
@@ -242,13 +249,12 @@ def bt_params_signature(d: dict[str, Any]) -> str:
 def ensure_ohlcv_cols(df: pd.DataFrame) -> pd.DataFrame:
     """
     Normalize common OHLCV column name variants to: open, high, low, close, volume.
-    Keeps other columns intact.
+    Keeps other columns intact. Only copies if renaming is needed.
     """
     if df is None or getattr(df, "empty", True):
         return df
 
-    out = df.copy()
-    cols_lower = {str(c).lower(): str(c) for c in out.columns}
+    cols_lower = {str(c).lower(): str(c) for c in df.columns}
 
     variants = {
         "open": ["open", "o", "opn"],
@@ -260,47 +266,48 @@ def ensure_ohlcv_cols(df: pd.DataFrame) -> pd.DataFrame:
 
     mapping: dict[str, str] = {}
     for want, keys in variants.items():
-        if want in out.columns:
+        if want in df.columns:
             continue
-        found_original: Optional[str] = None
         for k in keys:
             if k in cols_lower:
-                found_original = cols_lower[k]
+                mapping[cols_lower[k]] = want
                 break
-        if found_original is not None:
-            mapping[found_original] = want
 
-    return out.rename(columns=mapping) if mapping else out
+    return df.rename(columns=mapping) if mapping else df
 
 
 def coerce_ohlcv_numeric(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or getattr(df, "empty", True):
         return df
-    out = df.copy()
-    for c in ["open", "high", "low", "close", "volume"]:
-        if c in out.columns:
-            out[c] = pd.to_numeric(out[c], errors="coerce")
-    price_cols = [c for c in ["open", "high", "low", "close"] if c in out.columns]
-    return out.dropna(subset=price_cols) if price_cols else out
+    needs_coerce = [c for c in ["open", "high", "low", "close", "volume"]
+                    if c in df.columns and not pd.api.types.is_numeric_dtype(df[c])]
+    if needs_coerce:
+        df = df.copy()
+        for c in needs_coerce:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    price_cols = [c for c in ["open", "high", "low", "close"] if c in df.columns]
+    return df.dropna(subset=price_cols) if price_cols else df
 
 
 def as_utc_dtindex(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-
     # If we have a timestamp column, use it.
-    if "timestamp" in out.columns:
+    if "timestamp" in df.columns:
+        out = df.copy()
         out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True, errors="coerce")
         out = out.dropna(subset=["timestamp"]).sort_values("timestamp").set_index("timestamp")
         return out
 
     # If already datetime index, normalize to UTC
-    if isinstance(out.index, pd.DatetimeIndex):
+    if isinstance(df.index, pd.DatetimeIndex):
+        if df.index.tz is not None and str(df.index.tz) == "UTC" and df.index.is_monotonic_increasing:
+            return df  # already sorted UTC — no copy needed
+        out = df.copy()
         out = out.sort_index()
         out.index = out.index.tz_localize("UTC") if out.index.tz is None else out.index.tz_convert("UTC")
         return out
 
     # Otherwise leave unchanged
-    return out
+    return df
 
 
 def df_for_backtest(df_chart: pd.DataFrame) -> pd.DataFrame:
@@ -464,6 +471,42 @@ def cached_market_cap_yahoo(symbol: str) -> float:
         return np.nan
 
     return np.nan
+
+
+@st.cache_data(ttl=CACHE_TTL_YAHOO_META_SEC, show_spinner=False)
+def cached_stock_fundamentals_yahoo(symbol: str) -> dict[str, float]:
+    """Fetch float shares, short interest %, and market cap from Yahoo Finance."""
+    result = {"float_shares_m": np.nan, "short_pct": np.nan, "market_cap_m": np.nan}
+    if not YF_AVAILABLE:
+        return result
+    try:
+        t = yf.Ticker(symbol)
+        info = getattr(t, "info", None)
+        if not isinstance(info, dict):
+            return result
+
+        # Market cap
+        mc = safe_float(info.get("marketCap"))
+        if np.isfinite(mc) and mc > 0:
+            result["market_cap_m"] = mc / 1e6
+
+        # Float shares
+        fs = safe_float(info.get("floatShares"))
+        if np.isfinite(fs) and fs > 0:
+            result["float_shares_m"] = fs / 1e6
+
+        # Short interest (% of float)
+        sp = safe_float(info.get("shortPercentOfFloat"))
+        if np.isfinite(sp) and sp > 0:
+            result["short_pct"] = sp * 100  # convert to percentage
+        else:
+            # Fallback: compute from shares short / float
+            ss = safe_float(info.get("sharesShort"))
+            if np.isfinite(ss) and np.isfinite(fs) and fs > 0:
+                result["short_pct"] = (ss / fs) * 100
+    except Exception:
+        pass
+    return result
 
 
 def _strip_html(text: str) -> str:
@@ -690,6 +733,8 @@ def compute_trade_plan(
     atr_target: float,
 ) -> dict[str, float]:
     """Simple long-only plan (beginner-friendly)."""
+    if df_ind is None or df_ind.empty:
+        return {"entry": np.nan, "stop": np.nan, "target": np.nan, "rr": np.nan}
     last = df_ind.iloc[-1]
     close = safe_float(last.get("close", np.nan))
     atr = safe_float(last.get("atr14", np.nan))
@@ -918,6 +963,14 @@ def plot_price(
         if col in df.columns:
             fig.add_trace(go.Scatter(x=x, y=df[col], mode="lines", name=label))
 
+    # Bollinger Bands overlay
+    if all(c in df.columns for c in ["bb_upper", "bb_middle", "bb_lower"]):
+        fig.add_trace(go.Scatter(x=x, y=df["bb_upper"], mode="lines", name="BB Upper",
+                                 line=dict(width=1, dash="dash", color="rgba(150,150,250,0.5)")))
+        fig.add_trace(go.Scatter(x=x, y=df["bb_lower"], mode="lines", name="BB Lower",
+                                 line=dict(width=1, dash="dash", color="rgba(150,150,250,0.5)"),
+                                 fill="tonexty", fillcolor="rgba(150,150,250,0.07)"))
+
     if support is not None and np.isfinite(support):
         fig.add_hline(y=float(support), line_width=1, line_dash="dot")
     if resistance is not None and np.isfinite(resistance):
@@ -981,6 +1034,42 @@ def plot_indicator(
     return fig
 
 
+def plot_macd(df: pd.DataFrame, height: int = 280) -> go.Figure:
+    x = df.index
+    fig = go.Figure()
+    if "macd" in df.columns:
+        fig.add_trace(go.Scatter(x=x, y=df["macd"], mode="lines", name="MACD", line=dict(color="#6ea8fe")))
+    if "macd_signal" in df.columns:
+        fig.add_trace(go.Scatter(x=x, y=df["macd_signal"], mode="lines", name="Signal", line=dict(color="#ff7eb3")))
+    if "macd_hist" in df.columns:
+        colors = ["#26a69a" if v >= 0 else "#ef5350" for v in df["macd_hist"].fillna(0)]
+        fig.add_trace(go.Bar(x=x, y=df["macd_hist"], name="Histogram", marker_color=colors))
+    fig.add_hline(y=0, line_width=1, line_dash="dot", line_color="gray")
+    fig.update_layout(title="MACD (12, 26, 9)", height=height, margin=dict(l=10, r=10, t=45, b=10),
+                      hovermode="x unified", barmode="overlay")
+    fig.update_xaxes(showgrid=False)
+    fig.update_yaxes(showgrid=True)
+    return fig
+
+
+def plot_volume(df: pd.DataFrame, height: int = 220) -> go.Figure:
+    x = df.index
+    fig = go.Figure()
+    if "volume" in df.columns and "close" in df.columns:
+        close = df["close"]
+        prev_close = close.shift(1)
+        colors = ["#26a69a" if c >= p else "#ef5350"
+                  for c, p in zip(close.fillna(0), prev_close.fillna(close))]
+        fig.add_trace(go.Bar(x=x, y=df["volume"], name="Volume", marker_color=colors))
+    elif "volume" in df.columns:
+        fig.add_trace(go.Bar(x=x, y=df["volume"], name="Volume"))
+    fig.update_layout(title="Volume", height=height, margin=dict(l=10, r=10, t=45, b=10),
+                      hovermode="x unified")
+    fig.update_xaxes(showgrid=False)
+    fig.update_yaxes(showgrid=True)
+    return fig
+
+
 # =============================================================================
 # Signals
 # =============================================================================
@@ -1002,6 +1091,9 @@ class OpportunityScore:
 
 
 def compute_signal_score(df_ind: pd.DataFrame, rsi_min: float, rsi_max: float, rvol_min: float, vol_max: float) -> SignalScore:
+    if df_ind is None or df_ind.empty:
+        return SignalScore("WAIT", 0, "No data available.", ["DataFrame is empty or None."])
+
     need = ["close", "ma50", "ma200", "rsi14", "rvol", "vol_ann", "atr14"]
     missing = [c for c in need if c not in df_ind.columns]
     if missing:
@@ -1088,6 +1180,9 @@ def compute_opportunity_score(
     short_interest: float,
     catalyst_days: int,
 ) -> OpportunityScore:
+    if df_ind is None or df_ind.empty:
+        return OpportunityScore("WAIT", 0, "Unknown", "No data available.", ["DataFrame is empty or None."])
+
     need = ["close", "ma50", "ma200", "rvol", "vol_ann", "atr14"]
     missing = [c for c in need if c not in df_ind.columns]
     if missing:
@@ -1252,6 +1347,7 @@ ss_init(
         "op_max_mcap_b": 2.0,
         "op_sr_lookback": 60,
         "op_scan_results": None,
+        "wl_scan_df": None,
     }
 )
 
@@ -1385,6 +1481,10 @@ for k, v in {
 # =============================================================================
 # Auto-load
 # =============================================================================
+if not is_valid_ticker(symbol):
+    st.error(f"Invalid ticker symbol: `{symbol}`. Use 1-5 letters (e.g. AAPL, MSFT, BRK.B).")
+    st.stop()
+
 needs_load = load_btn or (st.session_state.get("df_raw") is None) or (st.session_state.get("last_symbol") != symbol)
 force_refresh = int(time.time()) if load_btn else 0
 
@@ -1456,9 +1556,26 @@ with tab_signal:
         atr_target=float(atr_target),
     )
 
+    # Compute daily change
+    daily_chg = np.nan
+    daily_chg_pct = np.nan
+    if df_chart is not None and len(df_chart) >= 2 and "close" in df_chart.columns:
+        cur_close = safe_float(df_chart["close"].iloc[-1])
+        prev_close = safe_float(df_chart["close"].iloc[-2])
+        if np.isfinite(cur_close) and np.isfinite(prev_close) and prev_close > 0:
+            daily_chg = cur_close - prev_close
+            daily_chg_pct = (daily_chg / prev_close) * 100
+
+    # Key indicators at a glance
+    last_row_vals = {}
+    if df_chart is not None and not df_chart.empty:
+        _last = df_chart.iloc[-1]
+        for _k in ["rsi14", "rvol", "adx14", "atr14", "vol_ann", "macd", "trend_state"]:
+            last_row_vals[_k] = _last.get(_k, np.nan) if _k in df_chart.columns else np.nan
+
     hero = st.container(border=True)
     with hero:
-        a, b, c = st.columns([1.2, 1, 1], vertical_alignment="center")
+        a, b, c, d = st.columns([1.2, 1, 0.8, 1], vertical_alignment="center")
         with a:
             if score.label == "BUY":
                 st.success(f"**BUY** • Score {score.score}/100")
@@ -1472,12 +1589,23 @@ with tab_signal:
             st.caption("Note: This is a heuristic score, not a guaranteed prediction.")
 
         with b:
-            st.metric("Latest available price", f"{latest_px:.2f}" if np.isfinite(latest_px) else "—")
+            chg_str = f"{daily_chg:+.2f} ({daily_chg_pct:+.2f}%)" if np.isfinite(daily_chg) else None
+            st.metric("Latest available price",
+                      f"{latest_px:.2f}" if np.isfinite(latest_px) else "—",
+                      delta=chg_str)
             st.caption(f"Source: {latest_src}")
 
         with c:
             st.metric("Support", f"{support_level:.2f}" if np.isfinite(support_level) else "—")
             st.metric("Resistance", f"{resistance_level:.2f}" if np.isfinite(resistance_level) else "—")
+
+        with d:
+            _rsi_v = safe_float(last_row_vals.get("rsi14", np.nan))
+            _adx_v = safe_float(last_row_vals.get("adx14", np.nan))
+            _rvol_v = safe_float(last_row_vals.get("rvol", np.nan))
+            _trend_v = str(last_row_vals.get("trend_state", "—"))
+            st.metric("RSI", f"{_rsi_v:.1f}" if np.isfinite(_rsi_v) else "—")
+            st.metric("ADX / Trend", f"{_adx_v:.0f} / {_trend_v}" if np.isfinite(_adx_v) else f"— / {_trend_v}")
 
     st.markdown("### Where to place support / resistance (simple guidance)")
     box = st.container(border=True)
@@ -1504,6 +1632,67 @@ with tab_signal:
         for r in score.reasons[:12]:
             st.write(f"• {r}")
         st.caption("Label rules: BUY requires both a high score and an uptrend; AVOID requires low score and downtrend.")
+
+    # ----- Watchlist Scanner -----
+    st.divider()
+    st.markdown("### Watchlist Scanner")
+    st.caption("Quickly scan multiple tickers for signals. Enter comma-separated symbols.")
+    wl_raw = st.text_input("Watchlist", value="AAPL, MSFT, GOOGL, AMZN, TSLA, NVDA, META",
+                           key="signal_watchlist_input")
+    scan_btn = st.button("Scan Watchlist", use_container_width=True, key="scan_wl_btn")
+
+    if scan_btn and wl_raw:
+        wl_symbols = parse_watchlist(wl_raw)
+        if not wl_symbols:
+            st.warning("No valid symbols in watchlist.")
+        else:
+            scan_rows: list[dict[str, Any]] = []
+            scan_bar = st.progress(0, text="Scanning...")
+            for idx_s, sym_s in enumerate(wl_symbols[:20]):
+                scan_bar.progress((idx_s + 1) / len(wl_symbols[:20]), text=f"Scanning {sym_s}...")
+                try:
+                    df_s = cached_load_yahoo(sym_s, period="2y", interval="1d")
+                    if df_s is None or df_s.empty:
+                        continue
+                    df_s = ensure_ohlcv_cols(df_s)
+                    df_s = coerce_ohlcv_numeric(df_s)
+                    add_indicators_inplace(df_s)
+                    sig_s = compute_signal_score(df_s, float(rsi_min), float(rsi_max), float(rvol_min), float(vol_max))
+                    last_s = df_s.iloc[-1]
+                    close_s = safe_float(last_s.get("close", np.nan))
+                    rsi_s = safe_float(last_s.get("rsi14", np.nan))
+                    adx_s = safe_float(last_s.get("adx14", np.nan))
+                    rvol_s = safe_float(last_s.get("rvol", np.nan))
+                    trend_s = str(last_s.get("trend_state", "—"))
+                    # Daily change
+                    chg_pct_s = np.nan
+                    if len(df_s) >= 2:
+                        prev_s = safe_float(df_s["close"].iloc[-2])
+                        if np.isfinite(close_s) and np.isfinite(prev_s) and prev_s > 0:
+                            chg_pct_s = ((close_s - prev_s) / prev_s) * 100
+                    scan_rows.append({
+                        "Symbol": sym_s,
+                        "Signal": sig_s.label,
+                        "Score": sig_s.score,
+                        "Close": round(close_s, 2) if np.isfinite(close_s) else None,
+                        "Chg %": round(chg_pct_s, 2) if np.isfinite(chg_pct_s) else None,
+                        "RSI": round(rsi_s, 1) if np.isfinite(rsi_s) else None,
+                        "ADX": round(adx_s, 0) if np.isfinite(adx_s) else None,
+                        "RVOL": round(rvol_s, 2) if np.isfinite(rvol_s) else None,
+                        "Trend": trend_s,
+                    })
+                except Exception:
+                    continue
+            scan_bar.empty()
+
+            if scan_rows:
+                df_scan = pd.DataFrame(scan_rows).sort_values("Score", ascending=False).reset_index(drop=True)
+                st.session_state["wl_scan_df"] = df_scan
+            else:
+                st.warning("Could not fetch data for any of the symbols.")
+
+    if st.session_state.get("wl_scan_df") is not None:
+        st.dataframe(st.session_state["wl_scan_df"], use_container_width=True, height=400)
 
 
 # =============================================================================
@@ -1564,15 +1753,26 @@ with tab_opportunity:
     st.divider()
 
     market_cap_m = float(ss_get("op_market_cap_m", 300.0))
-    market_cap_hint = None
-    if YF_AVAILABLE and "op_market_cap_m" not in st.session_state:
-        mc_est = cached_market_cap_yahoo(symbol)
-        if np.isfinite(mc_est):
-            market_cap_m = float(mc_est / 1e6)
-            market_cap_hint = "Auto-filled from Yahoo Finance."
-
     float_m = float(ss_get("op_float_m", 60.0))
     short_interest = float(ss_get("op_short_interest", 8.0))
+    fundamentals_hint = None
+
+    # Auto-fill from Yahoo if not already set by user
+    if YF_AVAILABLE and "op_fundamentals_fetched" not in st.session_state:
+        fund = cached_stock_fundamentals_yahoo(symbol)
+        auto_parts = []
+        if np.isfinite(fund["market_cap_m"]) and "op_market_cap_m" not in st.session_state:
+            market_cap_m = float(fund["market_cap_m"])
+            auto_parts.append("market cap")
+        if np.isfinite(fund["float_shares_m"]) and "op_float_m" not in st.session_state:
+            float_m = float(fund["float_shares_m"])
+            auto_parts.append("float")
+        if np.isfinite(fund["short_pct"]) and "op_short_interest" not in st.session_state:
+            short_interest = float(fund["short_pct"])
+            auto_parts.append("short interest")
+        if auto_parts:
+            fundamentals_hint = f"Auto-filled {', '.join(auto_parts)} from Yahoo Finance."
+        st.session_state["op_fundamentals_fetched"] = True
     catalyst_days = int(ss_get("op_catalyst_days", 30))
     include_news_tone = bool(ss_get("include_news_tone", True))
     news_score = int(ss_get("op_news_score", 15)) if include_news_tone else 0
@@ -1591,8 +1791,8 @@ with tab_opportunity:
                 format="%.0f",
                 help="Used in the opportunity score model.",
             )
-            if market_cap_hint:
-                st.caption(market_cap_hint)
+            if fundamentals_hint:
+                st.caption(fundamentals_hint)
             st.session_state["op_market_cap_m"] = float(market_cap_m)
 
             float_max = max(100_000.0, float_m * 1.2)
@@ -1700,6 +1900,14 @@ with tab_charts:
         use_container_width=True,
     )
 
+    # Volume chart
+    if "volume" in df_plot.columns:
+        st.plotly_chart(plot_volume(df_plot), use_container_width=True)
+
+    # MACD chart
+    if "macd" in df_plot.columns:
+        st.plotly_chart(plot_macd(df_plot), use_container_width=True)
+
     c1, c2, c3 = st.columns(3, gap="large")
     with c1:
         if "rsi14" in df_plot.columns:
@@ -1715,10 +1923,13 @@ with tab_charts:
         else:
             st.info("RVOL not available.")
     with c3:
-        if "vol_ann" in df_plot.columns:
-            st.plotly_chart(plot_indicator(df_plot, "vol_ann", "Annualized Volatility"), use_container_width=True)
+        if "adx14" in df_plot.columns:
+            st.plotly_chart(
+                plot_indicator(df_plot, "adx14", "ADX(14) — Trend Strength", hlines=[20, 40], ymin=0, ymax=60),
+                use_container_width=True,
+            )
         else:
-            st.info("Volatility not available.")
+            st.info("ADX not available.")
 
 
 # =============================================================================
@@ -1923,6 +2134,21 @@ with tab_backtest:
             m4.metric("Max drawdown", f"{results.get('max_drawdown', float('nan')):.1%}" if np.isfinite(results.get("max_drawdown", np.nan)) else "—")
             m5.metric("Sharpe", f"{results.get('sharpe', float('nan')):.2f}" if np.isfinite(results.get("sharpe", np.nan)) else "—")
 
+        st.markdown("### Edge Analysis")
+        ewrap = st.container(border=True)
+        with ewrap:
+            e1, e2, e3, e4, e5 = st.columns(5)
+            pf = results.get("profit_factor", np.nan)
+            e1.metric("Profit Factor", f"{pf:.2f}" if np.isfinite(pf) else "—")
+            aw = results.get("avg_win", np.nan)
+            e2.metric("Avg Win", f"£{aw:.2f}" if np.isfinite(aw) else "—")
+            al = results.get("avg_loss", np.nan)
+            e3.metric("Avg Loss", f"£{al:.2f}" if np.isfinite(al) else "—")
+            exp = results.get("expectancy", np.nan)
+            e4.metric("Expectancy / Trade", f"£{exp:.2f}" if np.isfinite(exp) else "—")
+            mcl = results.get("max_consecutive_losses", 0)
+            e5.metric("Max Consec. Losses", f"{mcl}")
+
         with st.expander("How to interpret this", expanded=False):
             st.write(
                 "- **Trades**: too few trades = stats can be noisy.\n"
@@ -1930,8 +2156,12 @@ with tab_backtest:
                 "- **Total return**: result over this historical period with these settings.\n"
                 "- **Max drawdown**: worst peak-to-trough drop. Lower is generally better.\n"
                 "- **Sharpe**: risk-adjusted return. Higher is better, but not very meaningful with few trades.\n"
+                "- **Profit factor**: gross profits / gross losses. Above 1.5 is decent, above 2.0 is strong.\n"
+                "- **Avg Win / Avg Loss**: compare these — ideally avg win > avg loss.\n"
+                "- **Expectancy**: average £ profit per trade. Positive = edge exists over the sample.\n"
+                "- **Max consec. losses**: longest losing streak — helps size positions to survive drawdowns.\n"
                 "- **Fixed £ per trade**: if £ is too small to buy 1 share, trades may be skipped.\n"
-                "- **Realistic cash**: ON means the backtest won’t magically buy what you can’t afford.\n"
+                "- **Realistic cash**: ON means the backtest won't magically buy what you can't afford.\n"
                 "- **Execution assumptions**: slippage/spread/commission can materially change results."
             )
 
