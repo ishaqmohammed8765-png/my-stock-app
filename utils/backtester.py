@@ -996,7 +996,7 @@ def backtest_strategy(
 
             rpct = max(0.0, float(risk_pct))
             risk_budget = account_base * rpct
-            qty_risk = int(np.floor(risk_budget / risk_per_share)) if rpct > 0 else 10**9
+            qty_risk = int(np.floor(risk_budget / risk_per_share)) if (rpct > 0 and risk_per_share > 0) else 10**9
 
             if sizing_mode_l == "fixed_amount":
                 qty_amt = int(np.floor(float(invest_amount_f) / max(1e-12, float(entry_px_eff))))
@@ -1208,8 +1208,33 @@ def backtest_strategy(
             ]
         )
 
+    pnl_series = pd.to_numeric(trades_df["pnl"], errors="coerce")
     pnlps = pd.to_numeric(trades_df["pnl_per_share"], errors="coerce")
+    wins = pnl_series[pnl_series > 0]
+    losses = pnl_series[pnl_series <= 0]
     win_rate = float((pnlps > 0).sum()) / max(1, len(pnlps))
+
+    # Profit factor: gross profits / gross losses
+    gross_profit = float(wins.sum()) if len(wins) else 0.0
+    gross_loss = float(losses.abs().sum()) if len(losses) else 0.0
+    profit_factor = float(gross_profit / gross_loss) if gross_loss > 0 else float("inf") if gross_profit > 0 else float("nan")
+
+    # Average win / loss
+    avg_win = float(wins.mean()) if len(wins) else float("nan")
+    avg_loss = float(losses.mean()) if len(losses) else float("nan")
+
+    # Expectancy per trade
+    expectancy = float(pnl_series.mean()) if len(pnl_series) else float("nan")
+
+    # Max consecutive losses
+    max_consec_losses = 0
+    _cur_streak = 0
+    for _pnl_val in pnl_series:
+        if _pnl_val <= 0:
+            _cur_streak += 1
+            max_consec_losses = max(max_consec_losses, _cur_streak)
+        else:
+            _cur_streak = 0
 
     eq_series = pd.to_numeric(df_bt["equity"], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
     eq0 = float(start_eq) if start_eq > 0 else float("nan")
@@ -1230,6 +1255,11 @@ def backtest_strategy(
             "max_drawdown": float(max_dd) if np.isfinite(max_dd) else float("nan"),
             "sharpe": float(sharpe) if np.isfinite(sharpe) else float("nan"),
             "avg_r_multiple": float(avg_r) if np.isfinite(avg_r) else float("nan"),
+            "profit_factor": float(profit_factor) if np.isfinite(profit_factor) else float("nan"),
+            "avg_win": float(avg_win) if np.isfinite(avg_win) else float("nan"),
+            "avg_loss": float(avg_loss) if np.isfinite(avg_loss) else float("nan"),
+            "expectancy": float(expectancy) if np.isfinite(expectancy) else float("nan"),
+            "max_consecutive_losses": int(max_consec_losses),
             "assumptions": assumptions,
             "warnings": warnings,
             "diagnostics": {
