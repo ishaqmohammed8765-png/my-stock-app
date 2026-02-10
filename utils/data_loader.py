@@ -6,11 +6,11 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-import streamlit as st
 
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
+from .config import validate_keys
 
 # Try to handle different Alpaca versions for DataFeed
 try:
@@ -18,25 +18,6 @@ try:
     HAS_DATAFEED = True
 except Exception:
     HAS_DATAFEED = False
-
-
-# ---------------------------
-# Key validation (local, no circular imports)
-# ---------------------------
-def validate_keys(api_key: str, secret_key: str) -> bool:
-    """
-    Best-effort local validation.
-    This does NOT prove entitlements; only an API call can.
-    """
-    if not api_key or not secret_key:
-        return False
-    k = str(api_key).strip()
-    s = str(secret_key).strip()
-    if len(k) < 8 or len(s) < 12:
-        return False
-    if any(ch.isspace() for ch in k) or any(ch.isspace() for ch in s):
-        return False
-    return True
 
 
 # ---------------------------
@@ -147,10 +128,6 @@ def _fetch_bars_df(
     raise RuntimeError(f"Failed to fetch bars: {last_err}")
 
 
-# ---------------------------
-# Cached loader
-# ---------------------------
-@st.cache_data(ttl=21600, show_spinner="Fetching market data...")
 def load_historical(
     ticker: str,
     api_key: str,

@@ -140,6 +140,7 @@ html, body, [class*="stApp"] { font-family: "Inter", sans-serif; background: var
 h1, h2, h3, h4 { letter-spacing: -0.3px; color: var(--text); }
 h1 { margin-bottom: 0.15rem; font-weight: 700; }
 p, label, span { color: var(--muted); }
+[data-testid="stCaptionContainer"] { color: var(--muted); }
 [data-testid="stMetric"] {
   background: var(--surface-2);
   padding: 0.75rem 0.9rem;
@@ -153,6 +154,33 @@ div[data-testid="stVerticalBlockBorderWrapper"]{
   background: var(--surface);
   padding: 0.65rem;
 }
+.hero {
+  border-radius: calc(var(--radius) + 6px);
+  border: 1px solid var(--border);
+  background:
+    radial-gradient(900px 220px at 20% -10%, rgba(110,168,254,0.18), transparent 55%),
+    radial-gradient(700px 220px at 85% 10%, rgba(123,91,255,0.14), transparent 55%),
+    linear-gradient(180deg, rgba(27,33,48,0.72), rgba(21,25,35,0.85));
+  padding: 14px 16px;
+  box-shadow: 0 14px 40px rgba(10, 14, 23, 0.35);
+}
+.hero-top { display:flex; align-items:baseline; justify-content:space-between; gap:12px; flex-wrap:wrap; }
+.hero h1 { font-size: 1.8rem; margin:0; }
+.hero .sub { margin-top: 2px; font-size: 0.95rem; color: var(--muted); }
+.chips { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+.chip {
+  display:inline-flex; align-items:center;
+  padding: 6px 10px; border-radius: 999px;
+  border: 1px solid var(--border);
+  background: rgba(15,17,23,0.55);
+  font-weight: 600; font-size: 0.85rem; color: var(--text);
+}
+.chip-ok { border-color: rgba(70,200,140,0.35); background: rgba(70,200,140,0.10); }
+.chip-warn { border-color: rgba(255,200,80,0.35); background: rgba(255,200,80,0.10); }
+.chip-bad { border-color: rgba(255,90,90,0.35); background: rgba(255,90,90,0.10); }
+.chip-err { border-color: rgba(255,120,160,0.35); background: rgba(255,120,160,0.10); }
+.chip-na { border-color: rgba(255,255,255,0.12); background: rgba(255,255,255,0.05); }
+.muted { color: var(--muted); }
 .stButton button, .stDownloadButton button {
   border-radius: 14px;
   background: linear-gradient(135deg, #5b8dff, #7b5bff);
@@ -854,6 +882,9 @@ def screen_breakout_watchlist(
 
         df = ensure_ohlcv_cols(df)
         df = coerce_ohlcv_numeric(df)
+        # cached_load_yahoo is cached; add_indicators_inplace mutates in-place.
+        # Copy to avoid mutating cached objects across reruns.
+        df = df.copy()
         try:
             add_indicators_inplace(df)
         except Exception:
@@ -892,7 +923,11 @@ def pick_random_breakout_idea(
     max_market_cap_b: float,
     lookback: int,
 ) -> tuple[Optional[str], Optional[dict[str, Any]]]:
-    results = screen_breakout_watchlist(tuple(symbols), max_market_cap_b=max_market_cap_b, lookback=lookback)
+    results = screen_breakout_watchlist(
+        tuple(symbols),
+        max_market_cap_b=max_market_cap_b,
+        lookback=lookback,
+    )
     if results is None or results.empty:
         return None, None
 
@@ -1355,8 +1390,21 @@ ss_init(
 # =============================================================================
 # Header
 # =============================================================================
-st.title(APP_TITLE)
-st.caption(APP_CAPTION)
+st.markdown(
+    f"""
+<div class="hero">
+  <div class="hero-top">
+    <h1>{html.escape(APP_TITLE)}</h1>
+    <div class="chips">
+      <span class="chip chip-na">Educational</span>
+      <span class="chip chip-na">No financial advice</span>
+    </div>
+  </div>
+  <div class="sub">{html.escape(APP_CAPTION)}</div>
+</div>
+""",
+    unsafe_allow_html=True,
+)
 
 
 # =============================================================================
@@ -1509,9 +1557,32 @@ if df_chart is None or getattr(df_chart, "empty", True):
 
 df_plot = tail_for_plot(df_chart, PLOT_TAIL_DEFAULT_BARS)
 
-src = st.session_state.get("data_source")
-if src:
-    st.caption(f"Data source: **{src}**")
+latest_px, latest_src = get_latest_price(symbol, df_chart)
+st.session_state["latest_px"] = float(latest_px) if np.isfinite(latest_px) else np.nan
+st.session_state["latest_src"] = str(latest_src or "")
+
+src = st.session_state.get("data_source") or "—"
+px_txt = f"{latest_px:.2f}" if np.isfinite(latest_px) and latest_px > 0 else "—"
+px_chip = f'<span class="chip chip-na">Last: {html.escape(px_txt)}</span>'
+src_chip = f'<span class="chip chip-na">Source: {html.escape(str(src))}</span>'
+
+st.markdown(
+    f"""
+<div class="hero" style="margin-top: 10px;">
+  <div class="hero-top">
+    <h1>{html.escape(symbol)}</h1>
+    <div class="chips">
+      {src_chip}
+      {px_chip}
+    </div>
+  </div>
+  <div class="sub">
+    <span class="muted">Price source:</span> {html.escape(str(latest_src or '—'))}
+  </div>
+</div>
+""",
+    unsafe_allow_html=True,
+)
 
 sanity = st.session_state.get("sanity")
 if isinstance(sanity, dict) and sanity.get("warnings"):
@@ -1656,6 +1727,8 @@ with tab_signal:
                         continue
                     df_s = ensure_ohlcv_cols(df_s)
                     df_s = coerce_ohlcv_numeric(df_s)
+                    # cached_load_yahoo is cached; add_indicators_inplace mutates in-place.
+                    df_s = df_s.copy()
                     add_indicators_inplace(df_s)
                     sig_s = compute_signal_score(df_s, float(rsi_min), float(rsi_max), float(rvol_min), float(vol_max))
                     last_s = df_s.iloc[-1]
@@ -1749,6 +1822,64 @@ with tab_opportunity:
                     if np.isfinite(rvol) and np.isfinite(adx)
                     else "Quick read: RVOL — • ADX —"
                 )
+    st.markdown("### Small-cap breakout screener")
+    st.caption("Screens a pool of small caps for breakout-style momentum.")
+    if not YF_AVAILABLE:
+        st.info("The screener needs the yfinance package.")
+    else:
+        with st.expander("Screener settings", expanded=False):
+            pool_default = str(ss_get("op_watchlist", "SOFI, PLTR, IONQ, RKLB, LCID"))
+            pool_raw = st.text_input(
+                "Ticker pool (comma-separated)",
+                value=pool_default,
+                help="Tip: keep this list short to speed up the scan.",
+            )
+            st.session_state["op_watchlist"] = pool_raw
+
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                max_mcap_b = st.number_input(
+                    "Max market cap (B)",
+                    min_value=0.1,
+                    max_value=50.0,
+                    value=float(ss_get("op_max_mcap_b", DEFAULT_OP_MAX_MCAP_B)),
+                    step=0.1,
+                    format="%.1f",
+                )
+                st.session_state["op_max_mcap_b"] = float(max_mcap_b)
+            with c2:
+                sr_lb = st.number_input(
+                    "S/R lookback (bars)",
+                    min_value=20,
+                    max_value=260,
+                    value=int(ss_get("op_sr_lookback", DEFAULT_OP_SR_LOOKBACK)),
+                    step=5,
+                )
+                st.session_state["op_sr_lookback"] = int(sr_lb)
+            with c3:
+                top_n = st.number_input("Show top N", min_value=5, max_value=50, value=15, step=5)
+
+            run_scan = st.button("Run screener", use_container_width=True)
+
+        if run_scan:
+            syms = parse_watchlist(pool_raw)
+            if not syms:
+                st.warning("No valid tickers in the pool.")
+            else:
+                with st.spinner("Screening..."):
+                    df_scan = screen_breakout_watchlist(
+                        tuple(syms[:60]),
+                        max_market_cap_b=float(max_mcap_b),
+                        lookback=int(sr_lb),
+                    )
+                st.session_state["op_scan_results"] = df_scan
+
+        df_scan = st.session_state.get("op_scan_results")
+        if isinstance(df_scan, pd.DataFrame) and not df_scan.empty:
+            df_show = df_scan.head(int(top_n)).copy()
+            st.dataframe(df_show, use_container_width=True, height=420)
+        else:
+            st.caption("No screener results yet.")
 
     st.divider()
 
