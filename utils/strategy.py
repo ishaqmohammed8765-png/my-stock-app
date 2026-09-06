@@ -1,7 +1,10 @@
 """One rule set shared by the current setup, screener and simulator."""
-from dataclasses import dataclass
+
 import math
+from dataclasses import dataclass
+
 import pandas as pd
+
 from .config import Strategy
 
 
@@ -28,9 +31,19 @@ def assess(row: pd.Series, cfg: Strategy) -> Setup:
         (row.adx14 >= cfg.adx_min, f"ADX must be at least {cfg.adx_min:g}."),
     ]
     direction = 1 if cfg.mode == "breakout" else -1
-    entry = float(row.close + direction*cfg.atr_entry*row.atr14)
-    stop, target = float(entry-cfg.atr_stop*row.atr14), float(entry+cfg.atr_target*row.atr14)
+    entry = float(row.close + direction * cfg.atr_entry * row.atr14)
+    stop, target = (
+        float(entry - cfg.atr_stop * row.atr14),
+        float(entry + cfg.atr_target * row.atr14),
+    )
     reasons = tuple(message for passed, message in checks if not passed)
     if stop <= 0 or entry <= 0:
         return Setup(False, reasons + ("The proposed stop or entry is not positive.",))
-    return Setup(not reasons, reasons or ("All configured rules pass. This is a conditional setup, not a profit forecast.",), entry, stop, target)
+    return Setup(
+        not reasons,
+        reasons
+        or ("All configured rules pass. This is a conditional setup, not a profit forecast.",),
+        entry,
+        stop,
+        target,
+    )

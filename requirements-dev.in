@@ -1,0 +1,4 @@
+-c requirements.txt
+-r requirements.in
+pytest>=8,<9
+ruff>=0.11,<1

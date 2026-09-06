@@ -1,280 +1,260 @@
-from __future__ import annotations
+"""Provider adapters, completed-session policy and strict bar validation."""
 
-import time
+import json
+import re
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any
 
 import numpy as np
 import pandas as pd
 
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
-from .config import validate_keys
 
-# Try to handle different Alpaca versions for DataFeed
-try:
-    from alpaca.data.enums import DataFeed  # type: ignore
-    HAS_DATAFEED = True
-except Exception:
-    HAS_DATAFEED = False
+@dataclass
+class MarketData:
+    symbol: str
+    bars: pd.DataFrame
+    source: str
+    currency: str | None
+    fetched_at: str
+    metadata: dict = field(default_factory=dict)
+    warnings: list[str] = field(default_factory=list)
+    demo: bool = False
 
 
-# ---------------------------
-# Dataframe normalization
-# ---------------------------
-def _normalize_bars_df(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
-    """
-    Normalize Alpaca bars into a flat df with columns:
-      timestamp, open, high, low, close, volume, trade_count, vwap (if present), symbol (if present)
+def valid_symbol(symbol):
+    return bool(re.fullmatch(r"[A-Z][A-Z0-9]{0,9}(?:[.-][A-Z0-9]{1,3})?", symbol))
 
-    Handles:
-    - MultiIndex (symbol, timestamp)
-    - DatetimeIndex
-    - various timestamp column names
-    """
-    if df is None or df.empty:
-        return df
 
-    out = df.copy()
+def parse_symbols(raw):
+    symbols = list(dict.fromkeys(re.split(r"[,\s]+", raw.upper().strip())))
+    if not symbols or any(not valid_symbol(s) for s in symbols):
+        raise ValueError(
+            "Enter valid ticker symbols separated by commas, such as AAPL, MSFT, BRK-B."
+        )
+    if len(symbols) > 20:
+        raise ValueError("Please scan at most 20 symbols at a time.")
+    return symbols
 
-    # If MultiIndex -> reset to columns
-    if isinstance(out.index, pd.MultiIndex):
-        out = out.reset_index()
 
-    # If DatetimeIndex and no timestamp column, promote index
-    if isinstance(out.index, pd.DatetimeIndex) and "timestamp" not in [str(c).lower() for c in out.columns]:
-        out = out.reset_index().rename(columns={"index": "timestamp"})
+def normalise_bars(raw, *, now=None):
+    if raw is None or raw.empty:
+        raise ValueError("The provider returned no historical bars.")
+    df = raw.copy()
+    df.columns = [str(c).lower() for c in df.columns]
+    if "timestamp" in df:
+        df.index = pd.to_datetime(df.pop("timestamp"), utc=True, errors="coerce")
+    elif not isinstance(df.index, pd.DatetimeIndex):
+        raise ValueError("Historical bars do not have valid session dates.")
+    if df.index.isna().any():
+        raise ValueError("Historical data contains invalid dates.")
+    df.index = pd.DatetimeIndex([str(t.date()) for t in df.index], tz="UTC", name="date")
+    required = ["open", "high", "low", "close", "volume"]
+    if set(required) - set(df):
+        raise ValueError("Historical data is missing price or volume columns.")
+    df = df[required].apply(pd.to_numeric, errors="coerce").sort_index()
+    warnings = []
+    if df.index.duplicated().any():
+        warnings.append("Duplicate sessions were removed; the last provider value was retained.")
+        df = df.loc[~df.index.duplicated(keep="last")]
+    today = pd.Timestamp(now if now is not None else datetime.now(timezone.utc))
+    today = today.tz_localize("UTC") if today.tzinfo is None else today.tz_convert("UTC")
+    incomplete = df.index >= today.normalize()
+    if incomplete.any():
+        warnings.append(
+            "Current-day or future bars excluded. Signals use completed prior sessions only."
+        )
+        df = df.loc[~incomplete]
+    if df.empty:
+        raise ValueError("No completed historical sessions were returned.")
+    if (
+        not np.isfinite(df.to_numpy()).all()
+        or (df[["open", "high", "low", "close"]] <= 0).any().any()
+        or (df.volume < 0).any()
+    ):
+        raise ValueError(
+            "Invalid or missing prices/volume detected; analysis is blocked rather than silently repaired."
+        )
+    if (
+        (df.high < df[["open", "close", "low"]].max(axis=1))
+        | (df.low > df[["open", "close", "high"]].min(axis=1))
+    ).any():
+        raise ValueError("Inconsistent daily high/low prices detected; analysis is blocked.")
+    if (today.normalize() - df.index[-1]).days > 5:
+        warnings.append(
+            "The last available session is more than five calendar days old; current setups are blocked."
+        )
+    if (df.index.to_series().diff().dt.days > 7).any():
+        warnings.append(
+            "History has gaps longer than seven days; halts or missing data may affect results."
+        )
+    return df, warnings
 
-    # Standardize column names to lowercase strings for easier matching
-    out = out.rename(columns={c: str(c).lower() for c in out.columns})
 
-    # Common variants -> timestamp
-    for alt in ("time", "date", "datetime"):
-        if alt in out.columns and "timestamp" not in out.columns:
-            out = out.rename(columns={alt: "timestamp"})
+def is_stale(data, now=None):
+    if data.demo:
+        return False
+    today = pd.Timestamp(now or datetime.now(timezone.utc))
+    today = today.tz_localize("UTC") if today.tzinfo is None else today.tz_convert("UTC")
+    return (today.normalize() - data.bars.index[-1]).days > 5
 
-    # If still missing timestamp, try to find any datetime-ish column
-    if "timestamp" not in out.columns:
-        for c in list(out.columns):
-            if "time" in c or "date" in c:
-                out = out.rename(columns={c: "timestamp"})
-                break
 
-    if "timestamp" not in out.columns:
-        return out
+def _yahoo(symbol, years):
+    import yfinance as yf
 
-    out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True, errors="coerce")
-    out = out.dropna(subset=["timestamp"])
+    ticker = yf.Ticker(symbol)
+    raw = ticker.history(
+        period=f"{years}y", interval="1d", auto_adjust=True, actions=False, timeout=12
+    )
+    warnings, info = [], {}
+    try:
+        info = ticker.get_info() or {}
+    except Exception:
+        warnings.append(
+            "Company metadata could not be verified; unavailable fields remain unknown."
+        )
+    currency = info.get("currency")
+    if info.get("quoteType") not in {None, "EQUITY", "ETF"}:
+        warnings.append("Only stocks and ETFs are supported; this asset type cannot be evaluated.")
+        return raw, None, info, warnings
+    if not currency:
+        try:
+            currency = (ticker.get_history_metadata() or {}).get("currency")
+        except Exception:
+            warnings.append("Quote currency could not be verified.")
+    return raw, currency, info, warnings
 
-    # Ensure symbol exists if available
-    if "symbol" not in out.columns and "s" in out.columns:
-        out["symbol"] = out["s"]
 
-    # Filter to ticker if symbol is present
-    tkr = ticker.upper().strip()
-    if "symbol" in out.columns:
-        out = out[out["symbol"].astype(str).str.upper() == tkr]
-
-    # Coerce numeric columns
-    for c in ["open", "high", "low", "close", "volume", "trade_count", "vwap"]:
-        if c in out.columns:
-            out[c] = pd.to_numeric(out[c], errors="coerce")
-
-    # Drop rows missing core OHLC
-    core = [c for c in ["open", "high", "low", "close"] if c in out.columns]
-    if core:
-        out = out.dropna(subset=core)
-
-    # Sort + dedupe timestamps
-    out = (
-        out.sort_values("timestamp")
-        .drop_duplicates(subset=["timestamp"], keep="last")
-        .reset_index(drop=True)
+def _alpaca(symbol, years, key, secret):
+    if not key or not secret:
+        raise ValueError("Alpaca credentials are missing.")
+    now = datetime.now(timezone.utc)
+    params = {
+        "timeframe": "1Day",
+        "start": (now - timedelta(days=365 * years + 10)).isoformat(),
+        "end": now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat(),
+        "adjustment": "all",
+        "feed": "iex",
+        "limit": 10000,
+        "sort": "asc",
+    }
+    rows = []
+    while True:
+        url = f"https://data.alpaca.markets/v2/stocks/{urllib.parse.quote(symbol, safe='')}/bars?{urllib.parse.urlencode(params)}"
+        req = urllib.request.Request(
+            url, headers={"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret}
+        )
+        with urllib.request.urlopen(req, timeout=15) as response:
+            payload = json.load(response)
+        rows.extend(payload.get("bars") or [])
+        token = payload.get("next_page_token")
+        if not token:
+            break
+        params["page_token"] = token
+    return pd.DataFrame(rows).rename(
+        columns={
+            "t": "timestamp",
+            "o": "open",
+            "h": "high",
+            "l": "low",
+            "c": "close",
+            "v": "volume",
+        }
     )
 
-    return out
 
-
-def _fetch_bars_df(
-    *,
-    ticker: str,
-    api_key: str,
-    secret_key: str,
-    request_params: dict[str, Any],
-    retries: int = 2,
-    backoff_sec: float = 1.0,
-) -> pd.DataFrame:
-    """
-    Fetch bars with light retry for transient issues (e.g., 429 rate limit).
-    """
-    client = StockHistoricalDataClient(api_key, secret_key)
-
-    last_err: Exception | None = None
-    for i in range(max(1, int(retries) + 1)):
+def load_market(symbol, years=5, provider="Yahoo", key="", secret=""):
+    if not valid_symbol(symbol) or years not in {2, 5, 10}:
+        raise ValueError("Unsupported ticker or historical period.")
+    warnings, info, currency, raw, source = [], {}, None, None, "Yahoo Finance"
+    if provider == "Alpaca":
         try:
-            bars = client.get_stock_bars(StockBarsRequest(**request_params))
-            return bars.df
-        except Exception as e:
-            last_err = e
-            msg = str(e).lower()
-            is_rate = ("429" in msg) or ("rate" in msg and "limit" in msg)
-            if i < retries and is_rate:
-                time.sleep(backoff_sec * (i + 1))
-                continue
-            raise
+            raw = _alpaca(symbol, years, key, secret)
+            currency, source = "USD", "Alpaca IEX"
+            warnings.append(
+                "IEX is a single exchange feed; volume signals can differ from consolidated data."
+            )
+        except Exception:
+            warnings.append("Alpaca was unavailable. Yahoo Finance was used instead.")
+    if raw is None or raw.empty:
+        if provider == "Alpaca" and raw is not None:
+            warnings.append("Alpaca returned no bars. Yahoo Finance was used instead.")
+        raw, currency, info, extra = _yahoo(symbol, years)
+        source = "Yahoo Finance"
+        warnings.extend(extra)
+    bars, checks = normalise_bars(raw)
+    return MarketData(
+        symbol,
+        bars,
+        source,
+        currency,
+        datetime.now(timezone.utc).isoformat(),
+        info,
+        warnings + checks,
+    )
 
-    # Should never reach here
-    raise RuntimeError(f"Failed to fetch bars: {last_err}")
 
+def load_news(symbol):
+    from xml.etree import ElementTree
 
-def load_historical(
-    ticker: str,
-    api_key: str,
-    secret_key: str,
-    days_back: int = 900,
-    *,
-    prefer_iex: bool = True,
-    force_refresh: int = 0,
-) -> tuple[pd.DataFrame | None, dict[str, Any]]:
-    """
-    Fetch historical daily bars from Alpaca.
-    Returns (df, dbg).
-    """
-    _ = force_refresh  # used only for cache keying
-
-    ticker = (ticker or "").upper().strip()
-    dbg: dict[str, Any] = {"ticker": ticker, "status": "init", "feed": "default"}
-
-    if not ticker:
-        dbg["status"] = "error"
-        dbg["error"] = "Empty ticker"
-        return None, dbg
-
-    if not validate_keys(api_key, secret_key):
-        dbg["status"] = "error"
-        dbg["error"] = "Invalid/missing keys (format check)."
-        return None, dbg
-
-    now = datetime.now(timezone.utc)
-    start = now - timedelta(days=int(days_back))
-    end = now
-
-    base_params: dict[str, Any] = {
-        "symbol_or_symbols": [ticker],
-        "timeframe": TimeFrame.Day,
-        "start": start,
-        "end": end,
-    }
-
-    try_iex = bool(prefer_iex and HAS_DATAFEED)
-    t0 = time.time()
+    import yfinance as yf
 
     try:
-        if try_iex:
-            req1 = dict(base_params)
-            try:
-                req1["feed"] = DataFeed.IEX  # type: ignore[name-defined]
-                dbg["feed"] = "IEX"
-            except Exception:
-                req1 = base_params
-                dbg["feed"] = "default"
-
-            raw_df = _fetch_bars_df(
-                ticker=ticker,
-                api_key=api_key,
-                secret_key=secret_key,
-                request_params=req1,
-            )
-            df = _normalize_bars_df(raw_df, ticker)
-
-            if df is None or df.empty:
-                dbg["retry"] = "fallback_default_feed"
-                dbg["feed"] = "default"
-                raw_df = _fetch_bars_df(
-                    ticker=ticker,
-                    api_key=api_key,
-                    secret_key=secret_key,
-                    request_params=base_params,
+        result = []
+        for row in yf.Ticker(symbol).get_news(count=12) or []:
+            item = row.get("content", row)
+            url = (item.get("canonicalUrl") or {}).get("url") or item.get("link", "")
+            if url.startswith("https://"):
+                result.append(
+                    {
+                        "title": item.get("title", "News"),
+                        "url": url,
+                        "publisher": (item.get("provider") or {}).get(
+                            "displayName", item.get("publisher", "")
+                        ),
+                        "date": str(item.get("pubDate", item.get("providerPublishTime", ""))),
+                    }
                 )
-                df = _normalize_bars_df(raw_df, ticker)
-        else:
-            raw_df = _fetch_bars_df(
-                ticker=ticker,
-                api_key=api_key,
-                secret_key=secret_key,
-                request_params=base_params,
-            )
-            df = _normalize_bars_df(raw_df, ticker)
-
-        dbg["status"] = "success"
-        dbg["rows"] = int(len(df)) if df is not None else 0
-        if df is not None and not df.empty and "timestamp" in df.columns:
-            dbg["from"] = str(df["timestamp"].min())
-            dbg["to"] = str(df["timestamp"].max())
-
-        dbg["elapsed_sec"] = round(time.time() - t0, 3)
-        return df, dbg
-
-    except Exception as e:
-        dbg["status"] = "error"
-        dbg["error"] = f"{type(e).__name__}: {e}"
-        dbg["elapsed_sec"] = round(time.time() - t0, 3)
-        return None, dbg
+        if result:
+            return result
+    except Exception:
+        pass  # The separate RSS request below supplies the documented fallback.
+    req = urllib.request.Request(
+        f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={urllib.parse.quote(symbol)}&region=US&lang=en-US",
+        headers={"User-Agent": "stock-research/2.0"},
+    )
+    with urllib.request.urlopen(req, timeout=12) as response:
+        root = ElementTree.fromstring(response.read())
+    return [
+        {
+            "title": i.findtext("title", "News"),
+            "url": i.findtext("link", ""),
+            "publisher": "Yahoo RSS",
+            "date": i.findtext("pubDate", ""),
+        }
+        for i in root.findall(".//item")
+        if i.findtext("link", "").startswith("https://")
+    ][:12]
 
 
-# ---------------------------
-# Sanity checks
-# ---------------------------
-def sanity_check_bars(df: pd.DataFrame) -> dict[str, Any]:
-    """
-    Lightweight checks. Does NOT mutate the input df.
-    Returns: {"ok": bool, "warnings": [...], "stats": {...}}
-    """
-    out: dict[str, Any] = {"ok": True, "warnings": [], "stats": {}}
-
-    if df is None or df.empty:
-        out["ok"] = False
-        out["warnings"].append("No data returned.")
-        return out
-
-    required = ["timestamp", "open", "high", "low", "close"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        out["ok"] = False
-        out["warnings"].append(f"Missing required columns: {missing}")
-        return out
-
-    # Work on local series (don’t mutate original df)
-    close = pd.to_numeric(df["close"], errors="coerce")
-    o = pd.to_numeric(df["open"], errors="coerce")
-    h = pd.to_numeric(df["high"], errors="coerce")
-    l = pd.to_numeric(df["low"], errors="coerce")
-
-    if (close <= 0).any():
-        out["ok"] = False
-        out["warnings"].append("Found zero or negative close prices.")
-    if ((pd.concat([o, h, l, close], axis=1) <= 0).any().any()):
-        out["warnings"].append("Found non-positive OHLC values (may indicate bad data).")
-
-    ts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce").dropna()
-    if len(ts) < 2:
-        out["warnings"].append("Very few rows; indicators/backtest may not work yet.")
-    else:
-        if not ts.is_monotonic_increasing:
-            out["warnings"].append("Timestamps not increasing (source issue; caller should sort).")
-        dupes = int(ts.duplicated().sum())
-        if dupes > 0:
-            out["warnings"].append(f"Duplicate timestamps found: {dupes}")
-
-        gaps = ts.diff().dt.days.fillna(0)
-        big_gaps = int((gaps > 7).sum())
-        if big_gaps > 0:
-            out["warnings"].append(f"Detected {big_gaps} large time gaps (>7 days). (Often normal: IPO/halts/holidays)")
-
-    out["stats"] = {
-        "rows": int(len(df)),
-        "start": str(ts.min()) if len(ts) else None,
-        "end": str(ts.max()) if len(ts) else None,
-    }
-    return out
+def demo_market(symbol="DEMO"):
+    rng = np.random.default_rng(17)
+    dates = pd.bdate_range(
+        end=(datetime.now(timezone.utc) - timedelta(days=1)).date(), periods=1500, tz="UTC"
+    )
+    close = 60 * np.exp(np.cumsum(rng.normal(0.00045, 0.016, len(dates))))
+    opens = np.r_[close[0], close[:-1]] * np.exp(rng.normal(0, 0.003, len(dates)))
+    bars = pd.DataFrame(
+        {
+            "open": opens,
+            "high": np.maximum(opens, close) * 1.012,
+            "low": np.minimum(opens, close) * 0.988,
+            "close": close,
+            "volume": rng.integers(1000000, 6000000, len(dates)),
+        },
+        index=dates,
+    )
+    return MarketData(
+        symbol, bars, "Synthetic demo", "USD", datetime.now(timezone.utc).isoformat(), demo=True
+    )

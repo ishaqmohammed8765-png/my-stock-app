@@ -1,7 +1,8 @@
 """Validated immutable research settings; cash is USD throughout."""
-from dataclasses import asdict, dataclass, fields
+
 import json
 import math
+from dataclasses import asdict, dataclass, fields
 
 
 @dataclass(frozen=True)
@@ -21,15 +22,27 @@ class Strategy:
         if self.mode not in {"breakout", "pullback"}:
             raise ValueError("Choose breakout or pullback.")
         for name, value in asdict(self).items():
-            if name != "mode" and (isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)):
+            if name != "mode" and (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+            ):
                 raise ValueError(f"{name} must be a finite number.")
             if name not in {"mode", "horizon"}:
                 object.__setattr__(self, name, float(value))
         if not 0 <= self.rsi_min < self.rsi_max <= 100:
             raise ValueError("RSI minimum must be below maximum, within 0–100.")
-        if not 0 <= self.rvol_min <= 10 or not .01 <= self.vol_max <= 5 or not 0 <= self.adx_min <= 100:
+        if (
+            not 0 <= self.rvol_min <= 10
+            or not 0.01 <= self.vol_max <= 5
+            or not 0 <= self.adx_min <= 100
+        ):
             raise ValueError("Volume, volatility or ADX setting is outside its supported range.")
-        if not 0 <= self.atr_entry <= 5 or not .1 <= self.atr_stop <= 20 or not .1 <= self.atr_target <= 50:
+        if (
+            not 0 <= self.atr_entry <= 5
+            or not 0.1 <= self.atr_stop <= 20
+            or not 0.1 <= self.atr_target <= 50
+        ):
             raise ValueError("ATR entry must be 0–5; stop 0.1–20 and target 0.1–50.")
         if type(self.horizon) is not int or not 1 <= self.horizon <= 200:
             raise ValueError("Maximum holding period must be 1–200 whole sessions.")
@@ -38,8 +51,8 @@ class Strategy:
 @dataclass(frozen=True)
 class Execution:
     capital: float = 10000.0
-    risk_pct: float = .01
-    allocation_pct: float = .20
+    risk_pct: float = 0.01
+    allocation_pct: float = 0.20
     fixed_amount: float = 0.0
     slippage_bps: float = 5.0
     spread_bps: float = 5.0
@@ -47,10 +60,18 @@ class Execution:
 
     def __post_init__(self):
         for name, value in asdict(self).items():
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+            ):
                 raise ValueError(f"{name} must be a finite number.")
             object.__setattr__(self, name, float(value))
-        if not 1 <= self.capital <= 1e8 or not .001 <= self.risk_pct <= .10 or not .01 <= self.allocation_pct <= 1:
+        if (
+            not 1 <= self.capital <= 1e8
+            or not 0.001 <= self.risk_pct <= 0.10
+            or not 0.01 <= self.allocation_pct <= 1
+        ):
             raise ValueError("Use positive capital, risk 0.1–10%, and allocation 1–100%.")
         if not 0 <= self.fixed_amount <= 1e8 or not 0 <= self.commission <= 1000:
             raise ValueError("Investment amount or commission is outside its supported range.")
@@ -59,12 +80,18 @@ class Execution:
 
 
 def export_settings(strategy: Strategy, execution: Execution) -> str:
-    return json.dumps({"version": 2, "strategy": asdict(strategy), "execution": asdict(execution)}, indent=2)
+    return json.dumps(
+        {"version": 2, "strategy": asdict(strategy), "execution": asdict(execution)}, indent=2
+    )
 
 
 def import_settings(raw: str) -> tuple[Strategy, Execution]:
     payload = json.loads(raw)
-    if not isinstance(payload, dict) or set(payload) != {"version", "strategy", "execution"} or payload["version"] != 2:
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"version", "strategy", "execution"}
+        or payload["version"] != 2
+    ):
         raise ValueError("Use a version 2 settings export from this app.")
     result = []
     for name, cls in (("strategy", Strategy), ("execution", Execution)):
