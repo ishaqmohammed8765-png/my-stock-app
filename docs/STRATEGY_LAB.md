@@ -19,7 +19,7 @@ Training selection maximizes CAGR / max(5%, absolute maximum drawdown), requirin
 
 ## Execution and interpretation
 
-Signals use prior closes; monthly rebalances fill at next opens. Whole shares, a shared cash ledger, commissions, half-spread and slippage apply. Rebalancing sells precede buys in alphabetical order. Final positions liquidate at the last close with costs; no new position opens on the final session. Target caps apply at rebalances, not continuously between them. Cash earns zero; no margin, tax model, market impact, liquidity model or borrow trades. Adjusted OHLC is a total-return approximation, not a literal historical share ledger.
+Signals use prior closes; monthly rebalances fill at next opens. Whole shares, a shared cash ledger, commissions, half-spread and slippage apply. Rebalancing sells precede buys in alphabetical order. Buys reserve cash for liquidation commissions; partial sells that would consume this reserve are skipped. Final positions liquidate at the last close with costs; no new position opens on the final session. Target caps apply at rebalances, not continuously between them. Cash earns zero; no margin, tax model, market impact, liquidity model or borrow trades. Adjusted OHLC is a total-return approximation, not a literal historical share ledger.
 
 A 20% closing drawdown triggers liquidation at the following open and permanently halts that simulation window. It is not a guaranteed loss cap. The equal-weight benchmark remains fully invested and does not use this filter. Each independent fold and final experiment starts with a fresh risk state.
 

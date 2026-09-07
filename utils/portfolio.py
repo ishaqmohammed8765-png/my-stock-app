@@ -167,6 +167,10 @@ def run_portfolio(
             qty = min(qty, max(0, int(math.floor((cash - fee - fee * len(holdings)) / price))))
         if qty <= 0:
             return
+        if side == "sell" and qty < holdings[symbol]:
+            reserve = fee * int((holdings > 0).sum())
+            if cash + qty * price - fee < reserve:
+                return
         signed = qty if side == "buy" else -qty
         cash -= signed * price + fee
         holdings[symbol] += signed
