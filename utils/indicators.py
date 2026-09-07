@@ -1,268 +1,52 @@
-from __future__ import annotations
-
-from dataclasses import dataclass
-from typing import Optional
+"""Causal daily indicators; no future rows or default-filled readiness."""
 
 import numpy as np
 import pandas as pd
 
-TRADING_DAYS_DEFAULT = 252
 
-VOL_FLOOR_DEFAULT = 0.05
-VOL_CAP_DEFAULT = 2.00
-VOL_DEFAULT_DEFAULT = 0.30
-
-
-@dataclass(frozen=True)
-class IndicatorParams:
-    ma_fast: int = 50
-    ma_slow: int = 200
-    rsi_period: int = 14
-    atr_period: int = 14
-    rvol_lookback: int = 20
-    vol_ewm_span: int = 20
-
-    # ADX gate (automatic, used by backtester if present)
-    adx_period: int = 14
-
-    # beginner-friendly behavior
-    rvol_neutral_fill: Optional[float] = 1.0  # set None for raw NaN until ready
+def wilder(series: pd.Series, period: int = 14) -> pd.Series:
+    values = pd.to_numeric(series, errors="coerce").to_numpy(dtype=float)
+    out = np.full(len(values), np.nan)
+    previous = np.nan
+    for i, value in enumerate(values):
+        if not np.isfinite(value):
+            previous = np.nan
+        elif np.isfinite(previous):
+            previous = (previous * (period - 1) + value) / period
+        elif i >= period - 1 and np.isfinite(values[i - period + 1 : i + 1]).all():
+            previous = float(values[i - period + 1 : i + 1].mean())
+        out[i] = previous
+    return pd.Series(out, index=series.index)
 
 
-def _fs(s: pd.Series, *, name: str = "series", strict: bool = False, max_nan_frac: float = 0.25) -> pd.Series:
-    out = pd.to_numeric(s, errors="coerce").astype(float)
-    if strict:
-        n = len(out)
-        if n > 0:
-            nan_frac = float(out.isna().mean())
-            if nan_frac > max_nan_frac:
-                raise ValueError(f"{name}: too many NaNs after coercion ({nan_frac:.0%} > {max_nan_frac:.0%})")
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    c, h, low, v = (out[k] for k in ("close", "high", "low", "volume"))
+    out["ma50"], out["ma200"] = c.rolling(50).mean(), c.rolling(200).mean()
+    delta = c.diff()
+    up, down = wilder(delta.clip(lower=0)), wilder(-delta.clip(upper=0))
+    out["rsi14"] = 100 * up / (up + down).replace(0, np.nan)
+    out.loc[(up == 0) & (down == 0), "rsi14"] = 50.0
+    tr = pd.concat([h - low, (h - c.shift()).abs(), (low - c.shift()).abs()], axis=1).max(axis=1)
+    out["atr14"] = wilder(tr)
+    out["rvol"] = v / v.shift().rolling(20).mean().replace(0, np.nan)
+    out["vol_ann"] = np.log(c / c.shift()).ewm(
+        span=20, min_periods=20, adjust=False
+    ).std() * np.sqrt(252)
+    up_move, down_move = h.diff(), -low.diff()
+    plus = wilder(up_move.where((up_move > down_move) & (up_move > 0), 0.0))
+    minus = wilder(down_move.where((down_move > up_move) & (down_move > 0), 0.0))
+    dx = 100 * (plus - minus).abs() / (plus + minus).replace(0, np.nan)
+    out["adx14"] = wilder(dx.mask((plus == 0) & (minus == 0), 0.0))
+    out["macd"] = (
+        c.ewm(span=12, adjust=False, min_periods=12).mean()
+        - c.ewm(span=26, adjust=False, min_periods=26).mean()
+    )
+    out["macd_signal"] = out.macd.ewm(span=9, adjust=False, min_periods=9).mean()
+    out["macd_hist"] = out.macd - out.macd_signal
+    mid, sd = c.rolling(20).mean(), c.rolling(20).std()
+    out["bb_upper"], out["bb_lower"] = mid + 2 * sd, mid - 2 * sd
+    out["ind_ready"] = np.isfinite(
+        out[["ma200", "ma50", "rsi14", "atr14", "rvol", "vol_ann", "adx14"]]
+    ).all(axis=1) & (out.atr14 > 0)
     return out
-
-
-def rsi_wilder(close: pd.Series, period: int = 14) -> pd.Series:
-    c = _fs(close, name="close")
-    d = c.diff()
-    up = d.clip(lower=0.0)
-    dn = (-d).clip(lower=0.0)
-
-    roll_up = up.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
-    roll_dn = dn.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
-
-    rs = roll_up / (roll_dn + 1e-12)
-    rsi = 100.0 - (100.0 / (1.0 + rs))
-    return rsi.clip(0.0, 100.0)
-
-
-def atr_wilder(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
-    h = _fs(high, name="high")
-    l = _fs(low, name="low")
-    c = _fs(close, name="close")
-    prev = c.shift(1)
-
-    tr = pd.concat([(h - l).abs(), (h - prev).abs(), (l - prev).abs()], axis=1).max(axis=1)
-    return tr.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
-
-
-def rvol_ratio(volume: pd.Series, lookback: int = 20, *, neutral_fill: Optional[float] = 1.0) -> pd.Series:
-    v = _fs(volume, name="volume").fillna(0.0)
-    avg = v.shift(1).rolling(lookback, min_periods=lookback).mean()
-
-    out = v / avg.replace(0.0, np.nan)
-    out = out.replace([np.inf, -np.inf], np.nan).clip(lower=0.0)
-
-    if neutral_fill is not None:
-        out = out.fillna(float(neutral_fill))
-
-    return out
-
-
-def adx_wilder(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
-    """
-    ADX (Wilder): trend strength indicator.
-    Output is 0..100-ish. Higher = stronger trend.
-    """
-    h = _fs(high, name="high")
-    l = _fs(low, name="low")
-    c = _fs(close, name="close")
-
-    up_move = h.diff()
-    down_move = (-l.diff())
-
-    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-
-    prev_close = c.shift(1)
-    tr = pd.concat([(h - l).abs(), (h - prev_close).abs(), (l - prev_close).abs()], axis=1).max(axis=1)
-
-    atr = tr.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
-    plus_di = 100.0 * pd.Series(plus_dm, index=c.index).ewm(alpha=1 / period, adjust=False, min_periods=period).mean() / (atr + 1e-12)
-    minus_di = 100.0 * pd.Series(minus_dm, index=c.index).ewm(alpha=1 / period, adjust=False, min_periods=period).mean() / (atr + 1e-12)
-
-    dx = 100.0 * (plus_di - minus_di).abs() / ((plus_di + minus_di) + 1e-12)
-    adx = dx.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
-    return adx.clip(lower=0.0, upper=100.0)
-
-
-def macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> tuple[pd.Series, pd.Series, pd.Series]:
-    """MACD line, signal line, and histogram."""
-    c = _fs(close, name="close")
-    ema_fast = c.ewm(span=fast, adjust=False, min_periods=fast).mean()
-    ema_slow = c.ewm(span=slow, adjust=False, min_periods=slow).mean()
-    macd_line = ema_fast - ema_slow
-    signal_line = macd_line.ewm(span=signal, adjust=False, min_periods=signal).mean()
-    histogram = macd_line - signal_line
-    return macd_line, signal_line, histogram
-
-
-def bollinger_bands(close: pd.Series, period: int = 20, num_std: float = 2.0) -> tuple[pd.Series, pd.Series, pd.Series]:
-    """Upper band, middle (SMA), lower band."""
-    c = _fs(close, name="close")
-    middle = c.rolling(period, min_periods=period).mean()
-    std = c.rolling(period, min_periods=period).std()
-    upper = middle + num_std * std
-    lower = middle - num_std * std
-    return upper, middle, lower
-
-
-def add_indicators_inplace(
-    df: pd.DataFrame,
-    *,
-    params: IndicatorParams = IndicatorParams(),
-    trading_days: int = TRADING_DAYS_DEFAULT,
-    vol_floor: float = VOL_FLOOR_DEFAULT,
-    vol_cap: float = VOL_CAP_DEFAULT,
-    vol_default: float = VOL_DEFAULT_DEFAULT,
-    strict: bool = False,
-) -> None:
-    """
-    Expected base columns: high, low, close, volume
-    Adds canonical columns:
-      - ma50, ma200
-      - rsi14
-      - atr14
-      - rvol
-      - vol_ann
-      - adx14   (NEW)
-    Extras:
-      - atr_pct, range_pct
-      - trend_state (Up / Down / Mixed)
-      - ind_ready (NEW: if enough history for core indicators)
-    """
-    required = {"high", "low", "close", "volume"}
-    missing = required - set(df.columns)
-    if missing:
-        raise KeyError(f"add_indicators_inplace missing required columns: {sorted(missing)}")
-
-    c = _fs(df["close"], name="close", strict=strict)
-    h = _fs(df["high"], name="high", strict=strict)
-    l = _fs(df["low"], name="low", strict=strict)
-
-    # Defensive HL cleanup (keep series consistent)
-    bad_hl = (h < l) & np.isfinite(h) & np.isfinite(l)
-    if bad_hl.any():
-        hh = h.copy()
-        h[bad_hl] = l[bad_hl]
-        l[bad_hl] = hh[bad_hl]
-        # optionally sync back to df so plots match indicators
-        df.loc[bad_hl, "high"] = h[bad_hl]
-        df.loc[bad_hl, "low"] = l[bad_hl]
-
-    fast, slow = int(params.ma_fast), int(params.ma_slow)
-    df[f"ma{fast}"] = c.rolling(fast, min_periods=fast).mean()
-    df[f"ma{slow}"] = c.rolling(slow, min_periods=slow).mean()
-
-    df["ma50"] = df[f"ma{fast}"] if fast == 50 else c.rolling(50, min_periods=50).mean()
-    df["ma200"] = df[f"ma{slow}"] if slow == 200 else c.rolling(200, min_periods=200).mean()
-
-    rp = int(params.rsi_period)
-    df[f"rsi{rp}"] = rsi_wilder(c, rp)
-    df["rsi14"] = df[f"rsi{rp}"] if rp == 14 else rsi_wilder(c, 14)
-
-    df["rvol"] = rvol_ratio(df["volume"], int(params.rvol_lookback), neutral_fill=params.rvol_neutral_fill)
-
-    r = np.log(c / c.shift(1)).replace([np.inf, -np.inf], np.nan)
-    span = int(params.vol_ewm_span)
-    v = r.ewm(span=span, adjust=False, min_periods=span).std()
-    v = v * np.sqrt(float(trading_days))
-    df["vol_ann"] = v.clip(lower=float(vol_floor), upper=float(vol_cap)).fillna(float(vol_default))
-
-    ap = int(params.atr_period)
-    df[f"atr{ap}"] = atr_wilder(h, l, c, ap)
-    df["atr14"] = df[f"atr{ap}"] if ap == 14 else atr_wilder(h, l, c, 14)
-
-    # NEW: ADX
-    adxp = int(params.adx_period)
-    df[f"adx{adxp}"] = adx_wilder(h, l, c, adxp)
-    df["adx14"] = df[f"adx{adxp}"] if adxp == 14 else adx_wilder(h, l, c, 14)
-
-    # MACD
-    macd_line, macd_signal, macd_hist = macd(c, fast=12, slow=26, signal=9)
-    df["macd"] = macd_line
-    df["macd_signal"] = macd_signal
-    df["macd_hist"] = macd_hist
-
-    # Bollinger Bands
-    bb_upper, bb_middle, bb_lower = bollinger_bands(c, period=20, num_std=2.0)
-    df["bb_upper"] = bb_upper
-    df["bb_middle"] = bb_middle
-    df["bb_lower"] = bb_lower
-
-    # Extras
-    df["atr_pct"] = (df["atr14"] / c.replace(0.0, np.nan)).clip(lower=0.0)
-    df["range_pct"] = ((h - l).abs() / c.replace(0.0, np.nan)).clip(lower=0.0)
-
-    ma50 = pd.to_numeric(df["ma50"], errors="coerce")
-    ma200 = pd.to_numeric(df["ma200"], errors="coerce")
-    trend = np.where((c > ma50) & (ma50 > ma200), "Up",
-             np.where((c < ma50) & (ma50 < ma200), "Down", "Mixed"))
-    df["trend_state"] = pd.Series(trend, index=df.index, dtype="object")
-
-    # NEW: readiness (avoids trading on default-filled early indicators)
-    ready_cols = [
-        pd.to_numeric(df["ma200"], errors="coerce").notna(),
-        pd.to_numeric(df["rsi14"], errors="coerce").notna(),
-        pd.to_numeric(df["atr14"], errors="coerce").notna(),
-        pd.to_numeric(df["vol_ann"], errors="coerce").notna(),
-        pd.to_numeric(df["adx14"], errors="coerce").notna(),
-    ]
-    df["ind_ready"] = pd.concat(ready_cols, axis=1).all(axis=1)
-
-
-def market_regime_series(
-    market_df: pd.DataFrame,
-    *,
-    ma_len: int = 200,
-    price_col: str = "close",
-) -> pd.Series:
-    if market_df is None or market_df.empty:
-        return pd.Series(dtype=bool)
-
-    m = market_df.copy()
-    if price_col not in m.columns:
-        raise KeyError(f"market_regime_series expected market_df['{price_col}']")
-
-    if isinstance(m.index, pd.DatetimeIndex):
-        m = m.sort_index()
-
-    close = _fs(m[price_col], name=f"market_{price_col}")
-    ma = close.rolling(int(ma_len), min_periods=int(ma_len)).mean()
-    regime = close > ma
-    return regime.fillna(True)
-
-
-def market_regime_at(
-    market_df: pd.DataFrame,
-    idx: int,
-    ma_len: int = 200,
-    price_col: str = "close",
-) -> bool:
-    if market_df is None or market_df.empty:
-        return True
-    if idx < 0 or idx >= len(market_df):
-        return True
-
-    regime = market_regime_series(market_df, ma_len=ma_len, price_col=price_col)
-    if regime.empty:
-        return True
-    return bool(regime.iloc[idx])

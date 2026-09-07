@@ -1,1 +1,1 @@
-
+"""Stock research utilities."""
