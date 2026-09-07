@@ -5,6 +5,7 @@ import time
 
 import streamlit as st
 
+from ui.lab import strategy_lab
 from ui.settings import settings
 from ui.theme import apply_theme
 from ui.views import charts, news_view, number, overview, research, screener
@@ -39,7 +40,7 @@ st.caption(
 )
 page = st.radio(
     "Workspace",
-    ["Overview", "Charts", "Evaluate", "Screener", "News"],
+    ["Overview", "Charts", "Evaluate", "Strategy Lab", "Screener", "News"],
     horizontal=True,
     label_visibility="collapsed",
     key="page",
@@ -53,6 +54,9 @@ if st.session_state.get("market_request") != request or load:
 if load:
     st.session_state["refresh"] = time.time_ns()
 refresh = st.session_state.get("refresh", 0)
+if page == "Strategy Lab":
+    strategy_lab(demo, provider, credential("ALPACA_KEY"), credential("ALPACA_SECRET"))
+    st.stop()
 if page == "Screener":
     screener(strategy, zoya_key, refresh, demo)
     st.stop()

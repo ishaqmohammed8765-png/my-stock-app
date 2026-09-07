@@ -73,3 +73,17 @@ def test_failed_provider_clears_previous_stock(monkeypatch):
     button(app, "Load / refresh data").click().run()
     assert not app.exception and "market" not in app.session_state
     assert any("could not be loaded" in e.value for e in app.error)
+
+
+def test_lab_demo_freeze_and_reveal():
+    app = demo()
+    app.radio(key="page").set_value("Strategy Lab").run(timeout=30)
+    button(app, "Prepare and freeze study").click().run(timeout=60)
+    assert not app.exception
+    assert "lab_study" in app.session_state
+    assert "lab_result" not in app.session_state
+    button(app, "Reveal final test once").click().run(timeout=60)
+    assert not app.exception
+    assert "lab_result" in app.session_state
+    app.number_input(key="lab_fee").set_value(2.0).run()
+    assert "lab_result" not in app.session_state

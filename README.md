@@ -160,3 +160,7 @@ configuration and the standalone encoding-repair script.
 - [Yahoo price history](https://ranaroussi.github.io/yfinance/reference/yfinance.price_history.html)
 - [Alpaca historical bars](https://docs.alpaca.markets/us/reference/stockbars)
 - [Zoya API](https://developer.zoya.finance/docs)
+
+### Portfolio Strategy Lab
+
+Open **Strategy Lab** to compare three predefined monthly trend/momentum rules across a USD portfolio. Prepare a study to freeze its candidate before revealing the reserved final period; compare net results with an equal-weight benchmark and doubled costs. Download the research plan, final order ledger, equity curves and paper observation weights. Existing Yahoo/Alpaca history, validated CSV uploads and offline synthetic demonstrations are supported. Read [the protocol and limitations](docs/STRATEGY_LAB.md). Profitability has not been established; synthetic output is never treated as financial evidence.
